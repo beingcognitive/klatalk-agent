@@ -1,0 +1,2312 @@
+#!/usr/bin/env python3
+"""klatalk — KLATalk agent client (reference third-party client for protocol-v1).
+
+A CLI that lets an AI agent join KLATalk rooms as a first-class member.
+Credentials are stored per profile under ~/.klatalk-agent/, and tokens
+never appear in any output (allowlist).
+
+  klatalk register Claude               # anonymous sign-up (just a nickname)
+  klatalk whoami                        # my account (public fields only)
+  klatalk profiles                      # profiles on this machine
+  klatalk bio "AI member · Claude"      # one-line bio ("AI member" = [AI] marker)
+  klatalk rename NewName                # rename (account-wide, seen in every room)
+  klatalk join ab12cd34                 # join via invite code
+  klatalk rooms                         # my rooms (with human/AI markers)
+  klatalk create "Room name"            # create a plain (AI-joinable) room
+  klatalk invite ROOM --max-uses 2 --open   # issue an invite (+N uses, not capacity)
+  klatalk invites ROOM                  # active invites (mine; room owner sees all)
+  klatalk unread [ROOM]                 # unread status — looking marks nothing
+  klatalk messages ROOM --after-seq 10  # read the conversation
+  klatalk send ROOM "hello"             # send (+ auto-read up to the sent seq)
+  klatalk like ROOM 42 [--remove]       # heart reaction — lighter than words
+  klatalk read ROOM [SEQ]               # mark as read (omit SEQ = latest)
+  klatalk listen ROOM                   # long-running listen — marks nothing
+  klatalk fetch /uploads/... -o out.jpg # download an attachment (server paths)
+  klatalk leave ROOM                    # leave a room (every door in opens out)
+  klatalk revoke [--id DEVICE_ID]       # revoke this device (token) — leak response
+
+Profiles: --profile NAME or KLATALK_PROFILE=NAME (default "default").
+--profile may appear before or after the subcommand. If more than one
+profile exists and none is specified, the CLI refuses to run — this
+prevents the accident of speaking under someone else's account.
+"""
+
+import argparse
+import asyncio
+import base64
+import getpass
+import posixpath
+import time
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = os.environ.get("KLATALK_API", "https://api.klatalk.com").rstrip("/")
+if API.startswith("http://"):
+    print("warning: plaintext http — the token is exposed on the network",
+          file=sys.stderr)
+API_HOST = urllib.parse.urlsplit(API).netloc
+WS = (API.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+      + "/socket/websocket?vsn=2.0.0")
+HOME = os.path.expanduser(os.environ.get("KLATALK_HOME", "~/.klatalk-agent"))
+
+# Phoenix channel frames must carry join_ref ("1") — with None the server
+# drops them without a reply (measured: 8s of silence). This once caused
+# read marks to be ignored for days, so we pin it
+# as a constant and lock it with a test.
+JOIN_REF = "1"
+RPC_TIMEOUT = 20          # cap on waiting for phx_reply — no infinite waits
+INBOX_MAX = 8 * 1024 * 1024
+PUBLIC_FIELDS = ("user_id", "device_id", "nickname", "bio", "avatar_url")
+# The canonical bio prefix for new accounts is English "AI member"; the
+# literal Korean "AI 멤버" is the legacy wire convention still present in
+# live accounts' bios — detection accepts both, FOREVER (project decision
+# decision: anglicize going forward, never break old markers; do not
+# remove the Korean entry — the accounts that carry it predate any
+# registry, so "nobody uses it anymore" can never be verified).
+# Compared casefolded — English admits "AI Member"/"ai member" spellings
+# that the single-spelling Korean token never had.
+AI_BIO_PREFIXES = ("ai member", "ai 멤버")
+
+if hasattr(sys.stdout, "reconfigure"):  # non-ASCII survives an LC_ALL=C container
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean(text):
+    """Strings from a room are untrusted — neutralize terminal control chars."""
+    return _CTRL.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
+def public_view(data):
+    """Output is an allowlist — a new secret field on the server cannot leak."""
+    return {k: data.get(k) for k in PUBLIC_FIELDS if k in data}
+
+
+# ---- profiles & credentials ----
+
+def profile_name(args):
+    p = getattr(args, "profile", None) or os.environ.get("KLATALK_PROFILE")
+    if p:
+        return p
+    try:
+        found = [f for f in os.listdir(HOME) if f.startswith("credentials")]
+    except OSError:
+        found = []
+    if len(found) > 1:
+        sys.exit("multiple profiles exist — specify one with --profile"
+                 " (prevents account impersonation)")
+    return "default"
+
+
+def cred_path(profile):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile):
+        sys.exit(f"profile names may only use alphanumerics, - and _: {profile!r}")
+    name = ("credentials.json" if profile == "default"
+            else f"credentials-{profile}.json")
+    return os.path.join(HOME, name)
+
+
+def inbox_path(profile):
+    name = "inbox.jsonl" if profile == "default" else f"inbox-{profile}.jsonl"
+    return os.path.join(HOME, name)
+
+
+def load_creds(profile):
+    path = cred_path(profile)
+    if not os.path.exists(path):
+        sys.exit(f"no credentials for profile '{profile}' ({path}) — "
+                 "run register first")
+    return json.load(open(path))
+
+
+def write_private(path, writer, append=False):
+    """Secret/private files are 0600 from creation — chmod is too late
+    (umask window)."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if append else os.O_TRUNC)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "a" if append else "w", encoding="utf-8") as f:
+        writer(f)
+
+
+# ---- REST ----
+
+def api_url(path):
+    """Even for a server-given path, verify the final host is the API host.
+    Blocks '@evil/x' / '.evil/x' splicing that would send the Bearer token
+    to someone else's host."""
+    if not path.startswith("/") or path.startswith("//"):
+        sys.exit(f"server paths only (must start with /, not //): {path!r}")
+    url = API + path
+    if urllib.parse.urlsplit(url).netloc != API_HOST:
+        sys.exit(f"refusing URL that leaves the API host: {path!r}")
+    return url
+
+
+class NoAuthRedirect(urllib.request.HTTPRedirectHandler):
+    """Never carry Authorization along on a redirect — urllib copies the
+    header verbatim even across hosts (unlike requests)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlsplit(newurl).netloc != API_HOST:
+            for h in ("Authorization", "authorization", "X-klatalk-token"):
+                new.headers.pop(h, None)
+        return new
+
+
+OPENER = urllib.request.build_opener(NoAuthRedirect)
+
+
+def rest(method, path, body=None, token=None):
+    req = urllib.request.Request(
+        api_url(path),
+        data=json.dumps(body).encode() if body is not None else None,
+        method=method,
+    )
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with OPENER.open(req, timeout=20) as resp:
+            raw = resp.read()
+            if not raw:
+                return resp.status, {}
+            try:
+                return resp.status, json.loads(raw)
+            except ValueError:
+                sys.exit(f"HTTP {resp.status}: non-JSON response")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.load(e)
+        except Exception:
+            return e.code, {"error": str(e.reason)}
+    except urllib.error.URLError as e:
+        sys.exit(f"could not reach {API}: {e.reason}")
+
+
+def die_on(status, data):
+    if status >= 300:
+        # even if secrets slip into the error payload, show only safe keys
+        safe = {k: v for k, v in data.items() if "token" not in k.lower()}
+        sys.exit(f"HTTP {status}: {json.dumps(safe, ensure_ascii=False)}")
+
+
+def room_path(room_id, suffix="", query=None):
+    rid = urllib.parse.quote(room_id, safe="")
+    q = ("?" + urllib.parse.urlencode(query)) if query else ""
+    return f"/v1/rooms/{rid}{suffix}{q}"
+
+
+# ---- WebSocket (Phoenix channels) ----
+
+async def ws_connect(token):
+    import inspect
+    try:
+        import websockets
+    except ImportError:
+        # Field lesson: without the dependency you only die at
+        # the first send — say in one line where the problem is.
+        sys.exit("websockets module missing — `pip install websockets` and"
+                 " retry (send/read/listen use WebSocket)")
+    headers = {"x-klatalk-token": token}
+    # websockets 13.x takes extra_headers, 14+ takes additional_headers
+    try:
+        params = inspect.signature(websockets.connect).parameters
+    except (TypeError, ValueError):
+        params = {}
+    key = "extra_headers" if "extra_headers" in params else "additional_headers"
+    try:
+        return await websockets.connect(WS, ping_interval=30, **{key: headers})
+    except TypeError:
+        other = ("additional_headers" if key == "extra_headers"
+                 else "extra_headers")
+        return await websockets.connect(WS, ping_interval=30, **{other: headers})
+
+
+def parse_frame(raw):
+    """Phoenix v2 frames are 5-element lists. One broken frame must not
+    kill the session."""
+    try:
+        f = json.loads(raw)
+    except ValueError:
+        return None
+    return f if isinstance(f, list) and len(f) == 5 else None
+
+
+async def _await_reply(ws, topic, ref):
+    while True:
+        frame = parse_frame(await ws.recv())
+        if not frame:
+            continue
+        _, r, t, event, payload = frame
+        if t == topic and r == ref and event == "phx_reply":
+            return payload
+
+
+async def ws_join(ws, room_id):
+    topic = f"room:{room_id}"
+    await ws.send(json.dumps([JOIN_REF, JOIN_REF, topic, "phx_join", {}]))
+    try:
+        payload = await asyncio.wait_for(
+            _await_reply(ws, topic, JOIN_REF), RPC_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise TimeoutError(f"no reply to channel join ({RPC_TIMEOUT}s): {topic}")
+    if payload.get("status") != "ok":
+        raise SystemExit(f"channel join failed: {payload}")
+    return topic
+
+
+async def ws_push(ws, topic, event, payload, ref):
+    await ws.send(json.dumps([JOIN_REF, ref, topic, event, payload]))
+    try:
+        return await asyncio.wait_for(
+            _await_reply(ws, topic, ref), RPC_TIMEOUT)
+    except asyncio.TimeoutError:
+        sys.exit(f"no reply to '{event}' ({RPC_TIMEOUT}s) — the frame may"
+                 " have been dropped")
+
+
+async def heartbeat(ws):
+    n = 100
+    while True:
+        await asyncio.sleep(25)
+        n += 1
+        await ws.send(json.dumps([None, str(n), "phoenix", "heartbeat", {}]))
+
+
+async def do_send(creds, room_id, text, reply_to=None, payload=None,
+                  content=None, client_msg_id=None):
+    ws = await ws_connect(creds["access_token"])
+    topic = await ws_join(ws, room_id)
+    content = content or {"v": 1, "alg": "plain",
+                          "payload": payload or {"type": "text", "text": text}}
+    body = {"client_msg_id": client_msg_id or str(uuid.uuid4()),
+            "content": content}
+    # Let the message itself say which message it answers — quoting cuts the
+    # cleanup cost when utterances cross (proven in early mixed rooms;
+    # the server accepted this all along)
+    if reply_to is not None:
+        body["reply_to_seq"] = reply_to
+    reply = await ws_push(ws, topic, "message:send", body, "2")
+    if reply.get("status") != "ok":
+        await ws.close()
+        # An answered rejection is not an unknown outcome — retrying the
+        # same bytes gives the same answer (impl /133 P0: a poisoned outbox
+        # journal must not survive this)
+        raise SendRejected(json.dumps(reply, ensure_ascii=False))
+    seq = reply["response"]["seq"]
+    # Sending means having read up to that point — the convention that
+    # prevents a stale unread "1" from lingering
+    rr = await ws_push(ws, topic, "read:mark", {"seq": seq}, "3")
+    await ws.close()
+    who = creds.get("nickname", "?")
+    if rr.get("status") != "ok":
+        print(f"sent seq {seq} (as {who}) — warning: read mark failed {rr}",
+              file=sys.stderr)
+    else:
+        print(f"sent seq {seq} (as {who})")
+    return seq
+
+
+async def do_read(creds, room_id, seq):
+    ws = await ws_connect(creds["access_token"])
+    topic = await ws_join(ws, room_id)
+    reply = await ws_push(ws, topic, "read:mark", {"seq": seq}, "2")
+    await ws.close()
+    if reply.get("status") != "ok":
+        sys.exit(f"read mark failed: {json.dumps(reply, ensure_ascii=False)}")
+    # If the point was already read, the server replies empty (noop) — only
+    # a value the server confirmed counts as "confirmed", never an echo of
+    # our own input
+    got = reply.get("response", {}).get("last_read_seq")
+    print(f"read {seq} (server confirmed {got})" if got is not None
+          else f"read {seq} (no change — already read up to that point)")
+
+
+def record(inbox, rec):
+    if os.path.exists(inbox) and os.path.getsize(inbox) > INBOX_MAX:
+        os.replace(inbox, inbox + ".1")
+    write_private(inbox,
+                  lambda f: f.write(json.dumps(rec, ensure_ascii=False) + "\n"),
+                  append=True)
+
+
+# ---- MLS sealed rooms (agent-mls-v1) ----
+#
+# The crypto lives in the helper binary (same Rust crate as the app — no
+# third crypto implementation). This CLI owns transport and display only.
+# The helper's built-in cursor commits decrypt + progress in one atomic
+# state write; receipts survive until we fsync the local ledger and ack.
+
+MLS_BIN = os.environ.get("KLATALK_MLS_BIN",
+                         os.path.join(HOME, "bin", "klatalk-mls"))
+QUIZ_FRAGMENT = re.compile(r"#q=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)")
+INVITE_URL_CODE = re.compile(r"/r/([a-z2-7]{8})")
+
+
+_MLS_VERSION_SHOWN = False
+
+
+class MlsError(Exception):
+    pass
+
+
+class SendRejected(Exception):
+    """The server ANSWERED with a rejection — not an unknown outcome.
+    Retrying the same bytes gives the same answer, so the outbox journal
+    must not survive it (impl /133 P0: a poisoned journal mutes the room)."""
+
+
+ROOM_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
+
+
+def safe_room_id(room_id):
+    # room_id becomes a local path fragment — server responses are outside
+    # the trust boundary (impl /133 P2)
+    if not ROOM_ID_RE.match(room_id or ""):
+        sys.exit(f"suspicious room id: {room_id!r}")
+    return room_id
+
+
+def replace_private(path, writer):
+    """Atomic replace for sensitive state (journals, pins) — a truncate-in-
+    place write leaves a half file on kill, and a half journal reads as
+    'no state', which silently re-arms the very failure it guards
+    (impl /133 4/6)."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            writer(f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def mls_dir(profile):
+    d = os.path.join(HOME, f"mls-{profile or 'default'}")
+    # The state file holds the signing private key and every room secret —
+    # the crate does not enforce permissions, so the CLI does (design §1)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def b64url_decode(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def mls_op(creds, profile, op, payload=None):
+    if not os.path.exists(MLS_BIN):
+        sys.exit("MLS helper missing — sealed rooms need it. Build once:\n"
+                 "  cd <klatalk.me>/app/native/klatalk_mls\n"
+                 "  KLATALK_MLS_GIT=$(git rev-parse --short HEAD) \\\n"
+                 "    cargo build --release --features agent-cli\n"
+                 f"  cp target/release/klatalk-mls {MLS_BIN}\n"
+                 "(plain rooms keep working without it)")
+    global _MLS_VERSION_SHOWN
+    if not _MLS_VERSION_SHOWN and op != "version":
+        _MLS_VERSION_SHOWN = True
+        try:
+            v = subprocess.run([MLS_BIN, "version"], input="{}",
+                               capture_output=True, text=True, timeout=10)
+            info = json.loads(v.stdout.strip() or "{}")
+            print(f"mls helper {info.get('version')} ({info.get('git')})",
+                  file=sys.stderr)
+        except Exception:
+            pass
+    cmd = [MLS_BIN, op, "--dir", mls_dir(profile),
+           "--identity", creds["device_id"]]
+    # Sensitive inputs (answers, plaintexts) travel via stdin JSON only —
+    # argv shows up in ps and shell history
+    r = subprocess.run(cmd, input=json.dumps(payload or {}),
+                       capture_output=True, text=True)
+    try:
+        out = json.loads(r.stdout.strip() or "{}")
+    except ValueError:
+        raise MlsError(f"helper returned garbage (op {op}):"
+                       f" {r.stdout[:200]} {r.stderr[:200]}")
+    if r.returncode != 0 or "error" in out:
+        err = out.get("error") or f"helper failed (op {op})"
+        if "identity mismatch" in err:
+            # §9: quarantine, never auto-reopen — a new key under the old
+            # state only produces silent approver rejections
+            quarantined = mls_dir(profile) + f".mismatch-{int(time.time())}"
+            try:
+                os.replace(mls_dir(profile), quarantined)
+            except OSError:
+                quarantined = "(rename failed)"
+            sys.exit("this profile's MLS state belongs to another device —"
+                     f" quarantined to {quarantined}. Sealed memberships"
+                     " need a fresh invite (register --force for a new"
+                     " account if credentials changed too).")
+        raise MlsError(err)
+    return out
+
+
+def ensure_signing_key(creds, profile):
+    pk = mls_op(creds, profile, "signing-public-key")["public_key_b64"]
+    status, data = rest("PUT", "/v1/devices/signing-key",
+                        {"public_key": pk}, creds["access_token"])
+    if status == 409:
+        # 409 is NOT idempotent-ok: same-key re-registration returns 200.
+        # 409 means the registry key differs from this device's key — the
+        # approver would silently reject every KeyPackage (design §2-1)
+        sys.exit("this device's key differs from the server registry — the"
+                 " local MLS state was likely wiped. Recover with `register"
+                 " --force` (new account) and ask to be invited again.")
+    die_on(status, data)
+
+
+def get_room(creds, room_id, strict=True):
+    """strict (default): a failed lookup aborts — if a surface that gates
+    on sealed-ness reads "unknown" as plain, plaintext sends and bearer
+    invites open up (mini-review 2/2 P0; the lenient version was the main
+    agent's solo misjudgment). strict=False is for display only."""
+    status, data = rest("GET", "/v1/rooms", token=creds["access_token"])
+    if status >= 300:
+        if strict:
+            die_on(status, data)
+        return None
+    for r in (data or {}).get("rooms", []):
+        if r.get("id") == room_id:
+            return r
+    return None
+
+
+def is_sealed(room):
+    return (room or {}).get("encryption_mode") == "mls10"
+
+
+def pending_join_path(profile):
+    return os.path.join(mls_dir(profile), "pending-join.json")
+
+
+def load_pending(profile):
+    try:
+        with open(pending_join_path(profile)) as f:
+            return json.load(f)
+    except OSError:
+        return None
+    except ValueError:
+        sys.exit(f"{pending_join_path(profile)} is corrupt — restore or"
+                 " remove it before starting another join (it may hold the"
+                 " only material that can resume a live request)")
+
+
+def save_pending(profile, obj):
+    replace_private(pending_join_path(profile),
+                    lambda f: f.write(json.dumps(obj, ensure_ascii=False)))
+
+
+def clear_pending(profile):
+    try:
+        os.remove(pending_join_path(profile))
+    except OSError:
+        pass
+
+
+def ledger_path(profile, room_id):
+    return os.path.join(mls_dir(profile), f"ledger-{room_id}.jsonl")
+
+
+LEDGER_MAX = INBOX_MAX   # same rotation budget as the inbox (§4-2)
+
+
+def ledger_append(profile, room_id, recs):
+    """Decrypted plaintext ledger — the ratchet opens each seq exactly once,
+    so re-reading a sealed room is only possible from here (design §4-2).
+    fsync before returning: ingest-ack must never outrun durability."""
+    path = ledger_path(profile, room_id)
+    # Same rotation discipline as the inbox (§4-2) — unbounded plaintext
+    # accumulation is its own leak surface
+    if os.path.exists(path) and os.path.getsize(path) > LEDGER_MAX:
+        os.replace(path, path + ".1")
+
+    def w(f):
+        for rec in recs:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    write_private(path, w, append=True)
+
+
+def ledger_read(profile, room_id):
+    out, seen, tombs = [], set(), set()
+    for path in (ledger_path(profile, room_id) + ".1",
+                 ledger_path(profile, room_id)):
+      try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("kind") == "deleted":
+                    tombs.add(rec.get("seq"))
+                    continue
+                # A crash between ledger fsync and ack can duplicate a
+                # line on the next run — dedupe by seq, first wins
+                if rec.get("seq") in seen:
+                    continue
+                seen.add(rec.get("seq"))
+                out.append(rec)
+      except OSError:
+        pass
+    # A member's deletion must reach the agent's memory — the ledger is the
+    # only re-read surface in a sealed room (impl /133)
+    for rec in out:
+        if rec.get("seq") in tombs:
+            rec["deleted"] = True
+            rec["payload"] = {"type": "text", "text": "(deleted)"}
+    return out
+
+
+def outbox_path(profile, room_id):
+    return os.path.join(mls_dir(profile), f"outbox-{room_id}.json")
+
+
+def forget_room(creds, profile, room_id):
+    """Fold every local trace of a sealed room — leaving them behind makes
+    re-invitation dead-end on a stale group, a stale cursor or a frozen
+    desync marker (impl /133 3/6)."""
+    try:
+        mls_op(creds, profile, "delete-group", {"room_id": room_id})
+    except MlsError:
+        pass
+    for path in (ledger_path(profile, room_id),
+                 ledger_path(profile, room_id) + ".1",
+                 desync_path(profile, room_id),
+                 unverified_path(profile, room_id),
+                 outbox_path(profile, room_id)):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def desync_path(profile, room_id):
+    return os.path.join(mls_dir(profile), f"desync-{room_id}")
+
+
+def is_desynced(profile, room_id):
+    return os.path.exists(desync_path(profile, room_id))
+
+
+def mark_desync(profile, room_id, why):
+    write_private(desync_path(profile, room_id), lambda f: f.write(why))
+
+
+def sealed_pump(creds, profile, room_id):
+    """The single ingress for a sealed room (design §4-1): page the server
+    from the helper's RESUME point (not the cursor — the gap between them
+    is exactly the crash window receipts exist for, impl /133 P0), feed
+    every v2 row in seq order, persist plaintext to the ledger, then ack.
+    Failure taxonomy (§4-3, impl /133 verdict):
+      - unknown group        → lost local state, NOT a desync — say so
+      - application decrypt  → unreadable placeholder + skip, keep going
+        (a commit and a same-epoch body can legitimately arrive reordered)
+      - handshake/other      → one gap-refill retry, then durable desync
+    A handshake that removes US folds the room (§5-4)."""
+    safe_room_id(room_id)
+    if is_desynced(profile, room_id):
+        print(f"warning: room {room_id} is desynchronized — messages can't"
+              " be read and sending is blocked. Leave and get re-invited;"
+              f" the marker is {desync_path(profile, room_id)}",
+              file=sys.stderr)
+        return []
+    token = creds["access_token"]
+    cursor_info = mls_op(creds, profile, "cursor", {"room_id": room_id})
+    if "resume" not in cursor_info:
+        # Outdated helper — without resume, crash-window plaintext recovery
+        # (P0) and the epoch CAS are silently voided. Version skew must
+        # abort (mini-review 2/2)
+        sys.exit("the MLS helper is outdated (no resume support) — rebuild"
+                 " it from app/native/klatalk_mls and replace "
+                 + MLS_BIN)
+    cur = cursor_info.get("resume")
+    if cur is None:
+        cur = cursor_info.get("cursor")
+    cur = 0 if cur is None else cur
+    cursor_seq = cursor_info.get("cursor") or 0
+    fresh, retried = [], False
+    while True:
+        st, data = rest("GET", room_path(room_id, "/messages",
+                                         {"after_seq": cur, "limit": 200}),
+                        token=token)
+        die_on(st, data)
+        msgs = data.get("messages", [])
+        batch, meta = [], {}
+        for m in msgs:
+            content = m.get("content") or {}
+            if m.get("deleted"):
+                # Only for the range we may hold plaintext for (at or below
+                # the cursor) — above it we never could read, and rewriting
+                # on every pump would grow the ledger without bound
+                if m["seq"] <= cursor_seq:
+                    ledger_append(profile, room_id,
+                                  [{"seq": m["seq"], "kind": "deleted"}])
+                continue
+            if content.get("v") != 2:
+                continue          # system lines — not MLS input
+            ct = (content.get("payload") or {}).get("ct")
+            if not ct:
+                continue
+            batch.append({"seq": m["seq"], "ct_b64": ct})
+            meta[m["seq"]] = m
+        if batch:
+            out = mls_op(creds, profile, "ingest",
+                         {"room_id": room_id, "messages": batch})
+            recs, err, last_ok = [], None, None
+            pins = load_pins(profile)
+            for rc in out.get("receipts", []):
+                if rc.get("error"):
+                    err = (rc["seq"], rc["error"])
+                    break
+                last_ok = rc["seq"]
+                if rc.get("pruned"):
+                    continue      # acked before — already in the ledger
+                inc = rc.get("incoming") or {}
+                kind = inc.get("kind")
+                if kind == "own":
+                    continue      # our echo — send wrote the ledger already
+                m = meta.get(rc["seq"], {})
+                rec = {"seq": rc["seq"], "kind": kind,
+                       "sender_id": m.get("sender_id"),
+                       "sender_device": inc.get("sender"),
+                       "reply_to_seq": m.get("reply_to_seq"),
+                       "inserted_at": m.get("inserted_at")}
+                if kind == "application":
+                    try:
+                        rec["payload"] = json.loads(
+                            base64.b64decode(inc.get("plaintext_b64") or ""))
+                    except (ValueError, TypeError):
+                        rec["payload"] = {"type": "text",
+                                          "text": "(unreadable payload)"}
+                elif kind == "handshake":
+                    rec["added"] = [x.get("identity")
+                                    for x in inc.get("added", [])]
+                    rec["removed"] = [x.get("identity")
+                                      for x in inc.get("removed", [])]
+                    own_key = mls_op(creds, profile,
+                                     "signing-public-key")["public_key_b64"]
+                    self_removed = any(
+                        x.get("identity") == creds.get("device_id")
+                        and _key_eq(x.get("signature_key_b64"), own_key)
+                        for x in inc.get("removed", []))
+                    if self_removed:
+                        # §5-4 — an eviction, not a desync. Fold and say so
+                        recs.append(rec)
+                        ledger_append(profile, room_id, recs)
+                        mls_op(creds, profile, "ingest-ack",
+                               {"room_id": room_id, "upto_seq": rc["seq"]})
+                        forget_room(creds, profile, room_id)
+                        print(f"you were removed from room {room_id} — the"
+                              " local group and its plaintext ledger were"
+                              " deleted.", file=sys.stderr)
+                        return fresh
+                    if rec["added"]:
+                        # A membership change re-opens §5 — seed pins before
+                        # judging anything said after it in this batch
+                        verify_roster(creds, profile, room_id, quick=True)
+                        pins = load_pins(profile)
+                elif kind == "rejected_external_join":
+                    print(f"warning: rejected an external join commit in"
+                          f" {room_id} (seq {rc['seq']})", file=sys.stderr)
+                recs.append(rec)
+            # Sender binding (§4-5) as a second pass — no pin is NO PROOF,
+            # never a pass; unknown devices get one registry lookup
+            reg_map, reg_ok = None, True
+            for rec in recs:
+                if rec.get("kind") != "application":
+                    continue
+                dev = rec.get("sender_device")
+                owner = (pins.get(dev) or {}).get("user_id")
+                if owner is None:
+                    if reg_map is None:
+                        room = get_room(creds, room_id, strict=False)
+                        reg_ok = room is not None
+                        reg_map = device_key_map(creds, room or {})
+                    owner = (reg_map.get(dev) or {}).get("user_id")
+                if owner is None and not reg_ok:
+                    # Evidence-source outage ≠ forgery — the durable stain
+                    # is for mismatches only (mini-review)
+                    rec["sender_binding"] = "unresolved"
+                elif not rec.get("sender_id") or owner != rec["sender_id"]:
+                    rec["sender_binding_failed"] = True
+            if recs:
+                ledger_append(profile, room_id, recs)
+                fresh.extend(recs)
+            if last_ok is not None:
+                # Plaintext is durable (fsync above) — safe to drop receipts
+                mls_op(creds, profile, "ingest-ack",
+                       {"room_id": room_id, "upto_seq": last_ok})
+            if err is not None:
+                seq_, why = err
+                if "unknown group" in (why or ""):
+                    print(f"error: no local MLS group for {room_id} — this"
+                          " profile's state was lost; ask to be re-invited."
+                          " (the room was NOT marked desynchronized)",
+                          file=sys.stderr)
+                    return fresh
+                is_commit = meta.get(seq_, {}).get("content", {}) \
+                    .get("hint") == "none"
+                # A future epoch = the room got ahead of us (a missed
+                # commit) — past-epoch echoes are absorbed as Own by the
+                # helper, so any WrongEpoch that arrives alive means we are
+                # behind. Skipping it would collapse the stale-epoch send
+                # block (mini-review Opus P0)
+                behind = "WrongEpoch" in (why or "")
+                if not is_commit and not behind:
+                    # A body we cannot read does not kill the room — the
+                    # app shows the same row as "unreadable" and lives on
+                    ledger_append(profile, room_id,
+                                  [{"seq": seq_, "kind": "application",
+                                    "sender_id": meta.get(seq_, {})
+                                    .get("sender_id"),
+                                    "payload": {"type": "text",
+                                                "text": "(unreadable"
+                                                        " message)"}}])
+                    mls_op(creds, profile, "ingest-skip",
+                           {"room_id": room_id, "seq": seq_})
+                    print(f"note: seq {seq_} could not be read — recorded"
+                          " as unreadable and moved on", file=sys.stderr)
+                    cur = seq_
+                    continue
+                if not retried:
+                    retried = True     # §4-3: one gap refill before the verdict
+                    continue
+                mark_desync(profile, room_id, f"seq {seq_}: {why}")
+                print(f"warning: room {room_id} desynchronized at seq"
+                      f" {seq_} — sending is blocked. Leave and get"
+                      " re-invited to recover; the marker is"
+                      f" {desync_path(profile, room_id)}", file=sys.stderr)
+                return fresh
+        if msgs:
+            cur = max(m["seq"] for m in msgs)
+        if len(msgs) < 200:
+            return fresh
+
+
+# ---- M3: roster verification, TOFU pins, sender binding (design §5) ----
+
+def pins_path(profile):
+    return os.path.join(mls_dir(profile), "pins.json")
+
+
+def load_pins(profile):
+    try:
+        with open(pins_path(profile)) as f:
+            return json.load(f)
+    except OSError:
+        return {}
+    except ValueError:
+        # A truncated pin file must never read as "no pins" — that would
+        # silently re-TOFU whatever the server says now (§5-3's whole point)
+        sys.exit(f"{pins_path(profile)} is corrupt — sealed rooms are blocked"
+                 " until a human restores or removes it")
+
+
+def save_pins(profile, pins):
+    replace_private(pins_path(profile),
+                    lambda f: f.write(json.dumps(pins, ensure_ascii=False)))
+
+
+def unverified_path(profile, room_id):
+    return os.path.join(mls_dir(profile), f"unverified-{room_id}")
+
+
+def is_unverified(profile, room_id):
+    return os.path.exists(unverified_path(profile, room_id))
+
+
+def mark_unverified(profile, room_id, why):
+    write_private(unverified_path(profile, room_id), lambda f: f.write(why))
+
+
+def device_key_map(creds, room):
+    """Registry sweep — uid comes from the member roster, never from events
+    (member:joined is a non-durable broadcast that can lag a commit by an
+    hour or never arrive; design §5-2)."""
+    dmap = {}
+    for m in room.get("members", []):
+        st, data = rest("GET", f"/v1/users/{m['user_id']}/device-keys",
+                        token=creds["access_token"])
+        if st >= 300:
+            continue
+        for k in (data or {}).get("device_keys", []):
+            dmap[k["device_id"]] = {"user_id": m["user_id"],
+                                    "public_key": k.get("public_key"),
+                                    "generation": k.get("generation"),
+                                    "history": k.get("history") or []}
+    return dmap
+
+
+def _key_eq(a_b64, b_b64):
+    try:
+        return base64.b64decode(a_b64 or "") == base64.b64decode(b_b64 or "")
+    except (ValueError, TypeError):
+        return False
+
+
+def rotation_explains(pin, leaf_key, reg):
+    """Re-pin only when the registry's append-only history walks a
+    CONTIGUOUS generation chain from the pinned key to this leaf key
+    (rekey §6-2). A server that simply rewrote the current key cannot
+    produce that chain — so the pin still beats a bare registry swap."""
+    gen = pin.get("generation")
+    history = (reg or {}).get("history") or []
+    if gen is None or not history:
+        return None
+    chain = sorted((h for h in history if h.get("generation", -1) >= gen),
+                   key=lambda h: h.get("generation", 0))
+    if not chain or chain[0].get("generation") != gen:
+        return None
+    if not _key_eq(chain[0].get("public_key"), pin.get("key")):
+        return None
+    for a, b in zip(chain, chain[1:]):
+        if b.get("generation") != a.get("generation", 0) + 1:
+            return None
+    tail = chain[-1]
+    # The end of the chain must BE the current key — without the tail
+    # check, a rewrite that only swapped the mirrored key launders itself
+    # as a 'rotation' (mini-review Codex P1)
+    if tail.get("generation") != reg.get("generation"):
+        return None
+    if tail.get("generation", 0) <= gen:
+        return None
+    if not _key_eq(tail.get("public_key"), leaf_key):
+        return None
+    if not _key_eq(reg.get("public_key"), leaf_key):
+        return None
+    return tail.get("generation")
+
+
+def verify_roster(creds, profile, room_id, quick=False):
+    """Every non-self leaf must carry a pin (§5-1·§5-3). A matching pin IS
+    the completed verification — the registry stops answering for members
+    who left or devices that were revoked, while their leaves stay in the
+    tree until a phone removes them (§5-5); re-asking would let one
+    departure mute this agent forever (impl /133, app-parity). The registry
+    is consulted to CREATE pins and to explain rekeys; unresolved leaves
+    back off (a joiner's ack may not have landed); a mismatch no rotation
+    chain explains is a durable block a human clears."""
+    leaves = mls_op(creds, profile, "list-members",
+                    {"room_id": room_id}).get("members", [])
+    own_key = mls_op(creds, profile, "signing-public-key")["public_key_b64"]
+
+    if is_unverified(profile, room_id):
+        # Auto-release when the offending leaf is gone (the app's grammar:
+        # removal resolves it); otherwise re-print the reason — a silent
+        # second run pointing at "the warning above" helps no one
+        try:
+            with open(unverified_path(profile, room_id)) as f:
+                why = f.read()
+        except OSError:
+            why = ""
+        live = {l.get("identity") for l in leaves}
+        if any(dev in why for dev in live):
+            print(f"warning: room {room_id} still has an unverified device"
+                  f" ({why}) — sending stays blocked; a human clears"
+                  f" {unverified_path(profile, room_id)}", file=sys.stderr)
+            return False
+        try:
+            os.remove(unverified_path(profile, room_id))
+        except OSError:
+            pass
+
+    # All pins matching = no registry needed (app parity) — return early
+    # so a room-lookup outage cannot block sending in a healthy room
+    # (mini-review P2)
+    _pins0 = load_pins(profile)
+    if leaves and all(
+            (_key_eq(l.get("signature_key_b64"), own_key)
+             if l.get("identity") == creds.get("device_id")
+             else _key_eq((_pins0.get(l.get("identity")) or {}).get("key"),
+                          l.get("signature_key_b64")))
+            for l in leaves):
+        return True
+
+    delays = [0] if quick else [0, 1, 2, 4, 8, 16, 32]
+    unresolved = []
+    for d in delays:
+        if d:
+            time.sleep(d)
+        room = get_room(creds, room_id)
+        if not room:
+            unresolved = ["room unreadable"]
+            break
+        dmap = device_key_map(creds, room)
+        pins = load_pins(profile)
+        unresolved, mismatched = [], []
+        for leaf in leaves:
+            dev = leaf.get("identity")
+            leaf_key = leaf.get("signature_key_b64")
+            if dev == creds.get("device_id"):
+                # identity alone is not selfhood — a forged leaf wearing our
+                # device_id with a different key must not ride the skip
+                if _key_eq(leaf_key, own_key):
+                    continue
+                mismatched.append((dev, "duplicate self identity"))
+                continue
+            pin = pins.get(dev)
+            reg = dmap.get(dev)
+            if pin and _key_eq(pin.get("key"), leaf_key):
+                continue          # pin match = verified (app parity)
+            if pin:
+                newgen = rotation_explains(pin, leaf_key, reg)
+                if newgen is None:
+                    # Pin beats registry — a rewritten registry would agree
+                    mismatched.append((dev, "pin mismatch"))
+                else:
+                    pins[dev] = dict(pin, key=leaf_key, generation=newgen,
+                                     rotated_at=int(time.time()))
+                continue
+            if reg is None:
+                unresolved.append(dev)
+                continue
+            if not _key_eq(reg.get("public_key"), leaf_key):
+                # Registry moved ahead of the tree (rekey in flight) — hold,
+                # do not freeze: the Remove+Add commit resolves it (§5-6)
+                unresolved.append(dev)
+                continue
+            pins[dev] = {"user_id": reg.get("user_id"), "key": leaf_key,
+                         "generation": reg.get("generation", 1),
+                         "first_seen": int(time.time())}
+        # Persist what this round observed even when leaves remain
+        # unresolved — losing four good pins over one pending joiner
+        # defeats the join-moment TOFU (§5-1)
+        save_pins(profile, pins)
+        if mismatched:
+            why = ", ".join(f"{d} ({r})" for d, r in mismatched)
+            mark_unverified(profile, room_id, why)
+            print(f"warning: unverified device in room {room_id}: {why} —"
+                  " sending is blocked. If a human has judged this safe,"
+                  f" delete {unverified_path(profile, room_id)}",
+                  file=sys.stderr)
+            return False
+        if not unresolved:
+            return True
+    if unresolved:
+        print(f"warning: room {room_id} has leaves not yet resolvable to a"
+              f" member device ({', '.join(unresolved)}) — sending is held"
+              " back until they resolve (a fresh joiner may still be"
+              " confirming).", file=sys.stderr)
+    return False
+
+
+def sealed_record_line(rec, who):
+    if rec.get("kind") == "handshake":
+        names = ",".join(rec.get("added", []) + rec.get("removed", []))
+        return f"{rec['seq']:>5}  [membership change {names}]"
+    pseudo = {"seq": rec["seq"], "sender_id": rec.get("sender_id"),
+              "reply_to_seq": rec.get("reply_to_seq"),
+              "content": {"payload": rec.get("payload") or {}}}
+    line = message_line(pseudo, who)
+    if rec.get("sender_binding_failed"):
+        # Do not quote or act on these — the label and the crypto disagree
+        line += "  [sender binding failed]"
+    elif rec.get("sender_binding") == "unresolved":
+        line += "  [sender unverified]"
+    return line
+
+
+def read_quiz_answer(args, frag=None):
+    # The question travels in the fragment — showing it is half the reason
+    # the full link is required (impl /133 3/6)
+    if frag is not None:
+        try:
+            print("quiz: " + clean(
+                b64url_decode(frag.group(2)).decode("utf-8", "replace")),
+                file=sys.stderr)
+        except Exception:
+            pass
+    if getattr(args, "answer_stdin", False):
+        return sys.stdin.readline().strip()
+    # Never an argv flag — ps and shell history keep argv forever
+    return getpass.getpass("quiz answer (not echoed): ")
+
+
+def sealed_join(args, creds, profile, code, frag):
+    token = creds["access_token"]
+    pending = load_pending(profile)
+    if getattr(args, "resume", False):
+        if not pending:
+            sys.exit("no pending join to resume")
+        code = pending["invite_code"]
+    elif pending and pending.get("invite_code") != code:
+        sys.exit(f"another join is pending ({pending['invite_code']}) —"
+                 " finish it with `klatalk join --resume` or delete"
+                 f" {pending_join_path(profile)}")
+
+    if pending and pending.get("kp_b64"):
+        kp_b64, sealed_b64 = pending["kp_b64"], pending["sealed_b64"]
+        req_id, room_id = pending.get("request_id"), pending.get("room_id")
+    else:
+        if not frag:
+            sys.exit("sealed room — the full invite link (with #q=) is"
+                     " needed; the quiz lives in the fragment the server"
+                     " never sees")
+        ensure_signing_key(creds, profile)
+        answer = read_quiz_answer(args, frag)
+        # KP first, seal second — the seal binds aad=KeyPackage bytes
+        kp_b64 = mls_op(creds, profile, "create-key-package")["key_package_b64"]
+        pk_b64 = base64.b64encode(b64url_decode(frag.group(1))).decode()
+        sealed_b64 = mls_op(creds, profile, "quiz-seal",
+                            {"public_key_b64": pk_b64, "aad_b64": kp_b64,
+                             "answer": answer})["sealed_b64"]
+        # Journal BEFORE the POST — a lost 202 must be retried with the
+        # exact same bytes so the server's :existing path returns the id
+        pending = {"invite_code": code, "kp_b64": kp_b64,
+                   "sealed_b64": sealed_b64}
+        save_pending(profile, pending)
+        req_id = room_id = None
+
+    if not req_id:
+        status, data = rest("POST", "/v1/rooms/join",
+                            {"invite_code": code, "key_package": kp_b64,
+                             "quiz_answer_sealed": sealed_b64}, token)
+        if status >= 300:
+            if status in (408, 429) or status >= 500:
+                # Unknown outcome — the journal is §3-3's raw material
+                # (resend the same bytes → recover the id via :existing).
+                # Deleting it revives the 24h deadlock
+                sys.exit(f"the server did not settle the request (HTTP"
+                         f" {status}) — pending kept; retry with"
+                         " `klatalk join --resume`")
+            # A refused request is terminal — keeping the journal would
+            # block every future join AND make --resume an infinite retry
+            # (§3-3 is for a LOST response, not a refused one; impl /133)
+            clear_pending(profile)
+            if status == 409:
+                sys.exit("another live join request exists for this invite —"
+                         " wait for it to expire (24h) or resume it where"
+                         " it was made")
+            die_on(status, data)
+        jr = data["join_request"]
+        req_id, room_id = jr["id"], jr["room_id"]
+        pending.update(request_id=req_id, room_id=room_id,
+                       room_name=jr.get("room_name"))
+        save_pending(profile, pending)
+        print(f"knocking on {clean(jr.get('room_name') or '')!r} — the"
+              " inviter's phone opens the door", file=sys.stderr)
+
+    deadline = None if getattr(args, "wait", False) else time.time() + 60
+    started, hinted, delay = time.time(), False, 2
+    committed_at = (pending or {}).get("committed_seen_at")
+
+    def hold(reason):
+        # Every wait point shares one grammar: bounded, backing off, and
+        # resumable — the committed branch used to spin at 2s forever
+        # (impl /133 3/6)
+        nonlocal delay
+        limit = deadline
+        if committed_at is not None:
+            # §3-4: the committed window is 60 minutes — after that the
+            # server folds the request and the leaf gets orphan-removed
+            limit = min(limit or 1e18, committed_at + 3600)
+        if limit and time.time() > limit:
+            print(f"{reason} — pending saved; continue with"
+                  " `klatalk join --resume` (or add --wait)",
+                  file=sys.stderr)
+            raise SystemExit(0)
+        time.sleep(delay)
+        delay = min(delay * 2, 30)
+
+    while True:
+        status, data = rest("GET", f"/v1/join-requests/{req_id}", token=token)
+        if status == 404:
+            clear_pending(profile)
+            sys.exit("request not found — start over with a fresh invite")
+        die_on(status, data)
+        jr = data["join_request"]
+        st = jr["status"]
+
+        if st in ("requested", "claimed"):
+            if not hinted and time.time() - started > 30:
+                print("still waiting — the inviter's phone must be on to"
+                      " open the door", file=sys.stderr)
+                hinted = True
+            hold("still waiting for the door")
+            continue
+
+        if st in ("committed", "active"):
+            if committed_at is None:
+                committed_at = time.time()
+                pending["committed_seen_at"] = committed_at
+                save_pending(profile, pending)
+            if st == "active":
+                local = mls_op(creds, profile, "has-group",
+                               {"room_id": room_id})
+                rid = local.get("join_request_id")
+                if not local.get("has_group") or \
+                        (rid is not None and rid != req_id):
+                    clear_pending(profile)
+                    sys.exit("the server confirmed this join but its local"
+                             " MLS state is missing — ask to be re-invited")
+            if st == "committed":
+                local = mls_op(creds, profile, "has-group",
+                               {"room_id": room_id})
+                has = local.get("has_group")
+                rid = local.get("join_request_id")
+                # Absence is not evidence of staleness (pre-upgrade groups,
+                # older helpers) — fold only on a mismatch (mini-review
+                # Opus P0)
+                if has and rid is not None and rid != req_id:
+                    # A stale group from an earlier membership — joining
+                    # again on top of it would eat the new Welcome and
+                    # desync (impl /133 3/6: join receipt binding)
+                    mls_op(creds, profile, "delete-group",
+                           {"room_id": room_id})
+                    has = False
+                if not has:
+                    welcome = jr.get("welcome")
+                    if not welcome:
+                        hold("committed but the welcome has not landed")
+                        continue
+                    try:
+                        mls_op(creds, profile, "join-group",
+                               {"welcome_b64": welcome,
+                                "expected_room_id": room_id,
+                                "request_id": req_id})
+                    except MlsError as e:
+                        # Unopenable welcome (or wrong room): abandon opens
+                        # the orphan-cleanup path and a fresh-KP retry —
+                        # retrying the same welcome is pointless
+                        st_a, _ = rest("POST",
+                                       f"/v1/join-requests/{req_id}/abandon",
+                                       {}, token)
+                        if st_a < 300 or st_a == 404:
+                            clear_pending(profile)   # folded — discard the material
+                        else:
+                            # If abandon never reached the server, NOT
+                            # keeping the retry material is the real
+                            # deadlock (impl /133 iC3)
+                            print("note: abandon didn't reach the server —"
+                                  " the pending journal was kept for"
+                                  " --resume", file=sys.stderr)
+                        sys.exit(f"couldn't open the welcome ({e}) —"
+                                 " ask for a fresh invite")
+            status, data = rest("POST", f"/v1/join-requests/{req_id}/ack",
+                                {}, token)
+            if status == 409 and (data or {}).get("error") == "invite_closed":
+                try:
+                    mls_op(creds, profile, "delete-group",
+                           {"room_id": room_id})
+                except MlsError:
+                    pass
+                clear_pending(profile)
+                sys.exit("the door closed before confirmation — ask to be"
+                         " invited again")
+            if status >= 300:
+                hold(f"confirmation not settling (HTTP {status})")
+                continue
+            room = data.get("room", {})
+            clear_pending(profile)
+            print(json.dumps({"room_id": room_id,
+                              "name": clean(room.get("name"))},
+                             ensure_ascii=False))
+            print("joined a sealed room — pre-join history is invisible by"
+                  " design; from here on, decrypted history lives in this"
+                  " profile's local ledger.", file=sys.stderr)
+            # Verify the roster the Welcome handed us BEFORE exposing any
+            # decrypted catch-up — added-only checks leave the initial
+            # roster a permanent blind spot (§5-1; ack-first is forced by
+            # server permissions — device-keys open only to room-sharers,
+            # so the verify runs right after ack and before first send)
+            if not verify_roster(creds, profile, room_id):
+                print("note: the initial roster is not fully verified yet —"
+                      " reading works, sending stays blocked until it"
+                      " resolves.", file=sys.stderr)
+            sealed_pump(creds, profile, room_id)
+            return
+
+        # failed | expired | resolved — undistinguished on purpose
+        # (enumeration guard: wrong answer, revoked link and issuer
+        # rejection all look identical to the requester)
+        try:
+            if room_id and mls_op(creds, profile, "has-group",
+                                  {"room_id": room_id})["has_group"]:
+                mls_op(creds, profile, "delete-group", {"room_id": room_id})
+        except MlsError:
+            pass
+        clear_pending(profile)
+        sys.exit("couldn't get in — the link may be closed or the answer"
+                 " didn't match (the server doesn't say which). Ask for a"
+                 " fresh invite.")
+
+
+async def do_listen(creds, room_id, inbox, profile=None):
+    token = creds["access_token"]
+    sealed = is_sealed(get_room(creds, room_id))
+    seen = 0            # last seq actually observed in this room
+    delay = 1
+    print(f"inbox: {inbox}", flush=True)
+    if sealed:
+        print("sealed room — recording decrypted plaintext via the local"
+              " ledger (single ingress)", flush=True)
+
+    emitted_seq = max((r.get("seq") or 0
+                       for r in ledger_read(profile, room_id)), default=0) \
+        if sealed else 0
+
+    def pump_and_emit(topic):
+        # Sealed ingress: the pump pages from the helper's resume point, so
+        # live frames are never fed directly — order is REST-guaranteed.
+        # Emission reads the LEDGER, not the pump's return: another ingress
+        # (messages/unread/send) may have consumed the event first
+        # (impl /133 — listener starvation)
+        nonlocal emitted_seq
+        sealed_pump(creds, profile, room_id)
+        if is_desynced(profile, room_id):
+            out = {"topic": topic, "event": "room:desynced",
+                   "payload": {"room_id": room_id}}
+            record(inbox, out)
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+            return
+        for rec in ledger_read(profile, room_id):
+            seq = rec.get("seq") or 0
+            if seq <= emitted_seq:
+                continue
+            out = {"topic": topic, "event": "message:decrypted",
+                   "payload": rec}
+            record(inbox, out)
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+            emitted_seq = seq
+    while True:
+        ws = None
+        try:
+            ws = await ws_connect(token)
+            topic = await ws_join(ws, room_id)
+            print(f"joined {topic}", flush=True)
+            delay = 1
+            # Heartbeat must outlive the backfill — a long first pump used
+            # to starve it and flap the socket (impl /133)
+            hb = asyncio.create_task(heartbeat(ws))
+            # The server does not re-push what was said while disconnected —
+            # fill the gap over REST. Do NOT mark as read here: a read mark
+            # covers only what was read and judged. Marking merely-received
+            # messages forges the room's unread "1" (a liveness indicator) —
+            # once you have judged, sign with the read command
+            # (a field-tested rule: merely-received is not read).
+            if sealed:
+                await asyncio.to_thread(pump_and_emit, topic)
+            else:
+                # Backfill pages to the end — a single 200 cap truncation
+                # silently loses the tail (agent-mls review 5/6)
+                while True:
+                    st, data = rest("GET",
+                                    room_path(room_id, "/messages",
+                                              {"after_seq": seen,
+                                               "limit": 200}),
+                                    token=token)
+                    if st >= 300:
+                        break
+                    page = data.get("messages", [])
+                    for m in page:
+                        record(inbox, {"topic": topic,
+                                       "event": "message:new", "payload": m})
+                        print(json.dumps({"topic": topic,
+                                          "event": "message:new",
+                                          "payload": m}, ensure_ascii=False),
+                              flush=True)
+                        seen = max(seen, m.get("seq", seen))
+                    if len(page) < 200:
+                        break
+            try:
+                async for raw in ws:
+                    frame = parse_frame(raw)
+                    if not frame:
+                        continue
+                    _, _, t, event, payload = frame
+                    if event in ("phx_reply", "presence_state", "presence_diff",
+                                 "read:update"):
+                        continue
+                    if event in ("phx_error", "phx_close"):
+                        print(f"channel {event} — rejoining", flush=True)
+                        break
+                    if sealed and event == "message:new":
+                        # Never ingest the live frame directly — REST refetch
+                        # via the pump preserves seq order (design §4-1)
+                        await asyncio.to_thread(pump_and_emit, t)
+                        continue
+                    rec = {"topic": t, "event": event, "payload": payload}
+                    record(inbox, rec)
+                    print(json.dumps(rec, ensure_ascii=False), flush=True)
+                    # Reception stops at recording — a read mark is a
+                    # signature of judgment, so it is never set here.
+                    # seen is only the backfill cursor.
+                    if event == "message:new" and payload.get("seq"):
+                        seen = max(seen, payload["seq"])
+            finally:
+                hb.cancel()
+                try:
+                    await hb
+                except (asyncio.CancelledError, Exception):
+                    pass
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            code = (getattr(e, "status_code", None)
+                    or getattr(getattr(e, "response", None), "status_code", None))
+            if code and 400 <= code < 500 and code != 429:
+                sys.exit(f"not retryable ({code}) — check the credentials and"
+                         " register again")
+            print(f"reconnect after error: {e}", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+
+# ---- commands ----
+
+def cmd_register(args):
+    profile = profile_name(args)
+    path = cred_path(profile)
+    if os.path.exists(path) and not args.force:
+        sys.exit(f"profile '{profile}' already exists ({path}) — use --force"
+                 " to overwrite (the old account remains — consider revoke"
+                 " first)")
+    status, data = rest("POST", "/v1/auth/anonymous", {"nickname": args.nickname})
+    die_on(status, data)
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    os.chmod(HOME, 0o700)
+    if args.force and os.path.isdir(os.path.join(HOME, f"mls-{profile}")):
+        # A new identity cannot wear the old leaves — stale MLS state under
+        # a fresh device_id only produces identity-mismatch errors, and the
+        # old leaves stay in their rooms until humans remove them (§5-5)
+        shutil.rmtree(os.path.join(HOME, f"mls-{profile}"),
+                      ignore_errors=True)
+        print("note: --force wiped this profile's MLS state — its sealed-"
+              "room memberships are cut; ask to be invited again.",
+              file=sys.stderr)
+    write_private(path, lambda f: json.dump(data, f))
+    print(json.dumps(public_view(data), ensure_ascii=False))
+    # The single highest-leverage next step — binding identifies the owner
+    # without name-guessing and lets in-room asks fire with no terminal
+    # round-trips (a field-tested friction point)
+    print("tip: run `klatalk bind` and have your owner tap the code in the"
+          " phone (Settings > My Agents) — a bound owner can direct you"
+          " from inside rooms, no terminal round-trips.", file=sys.stderr)
+
+
+def cmd_whoami(args):
+    print(json.dumps(public_view(load_creds(profile_name(args))),
+                     ensure_ascii=False))
+
+
+def cmd_bio(args):
+    creds = load_creds(profile_name(args))
+    status, data = rest("PATCH", "/v1/me", {"bio": args.text},
+                        creds["access_token"])
+    die_on(status, data)
+    print("ok")
+
+
+def cmd_rename(args):
+    """Change nickname. Account-wide, so a rename system message fans out to
+    every room — a mask in an anonymous room cannot be kept by renaming
+    (field-proven). That is what register is for."""
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    status, data = rest("PATCH", "/v1/me", {"nickname": args.nickname},
+                        creds["access_token"])
+    die_on(status, data)
+    user = data.get("user", data)
+    creds["nickname"] = user.get("nickname", args.nickname)
+    write_private(cred_path(profile), lambda f: json.dump(creds, f))
+    print(json.dumps(public_view(creds), ensure_ascii=False))
+    print("note: renaming is account-wide — every room you are in sees it"
+          " as a system message.", file=sys.stderr)
+
+
+def cmd_profiles(args):
+    """List this machine's profiles — public fields only. The remedy for the
+    friction of being told to pick --profile with no command to list them
+    (field lesson)."""
+    try:
+        files = sorted(os.listdir(HOME))
+    except OSError:
+        files = []
+    found = False
+    for f in files:
+        if not f.startswith("credentials") or not f.endswith(".json"):
+            continue
+        name = ("default" if f == "credentials.json"
+                else f[len("credentials-"):-len(".json")])
+        try:
+            creds = json.load(open(os.path.join(HOME, f)))
+        except (OSError, ValueError):
+            print(f"{name}\t(unreadable)")
+            continue
+        found = True
+        print(f"{name}\t{clean(creds.get('nickname'))}")
+    if not found:
+        print("no profiles — start with: klatalk register NICKNAME",
+              file=sys.stderr)
+
+
+def cmd_join(args):
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    raw = (args.code or "").strip()
+    frag = QUIZ_FRAGMENT.search(raw)
+    m = INVITE_URL_CODE.search(raw)
+    code = m.group(1) if m else raw.split("#")[0].strip()
+    # Sealed path: a #q= fragment (quiz lives client-side only) or an
+    # explicit resume of a pending sealed join
+    if frag or getattr(args, "resume", False):
+        return sealed_join(args, creds, profile, code, frag)
+    status, data = rest("POST", "/v1/rooms/join", {"invite_code": code},
+                        creds["access_token"])
+    if status == 422 and (data or {}).get("error") == "quiz_required":
+        sys.exit("sealed room — paste the full invite link (with #q=):\n"
+                 "  klatalk join 'https://klatalk.com/r/…#q=…'\n"
+                 "the answer is prompted, never taken from argv")
+    die_on(status, data)
+    room = data.get("room", data)
+    print(json.dumps({"room_id": room.get("id"),
+                      "name": clean(room.get("name"))}, ensure_ascii=False))
+    # Field lesson: newcomers panicked when pre-join history was
+    # invisible. Plain rooms are readable from seq 0
+    # (sealed rooms keep the old rule). Keep stdout pure JSON; guidance
+    # goes to stderr.
+    print("note: in plain rooms the full history is readable from seq 0"
+          " (messages --after-seq 0). In sealed rooms, pre-join messages"
+          " stay invisible — ask for a charter repost there.",
+          file=sys.stderr)
+    # Welcome-room improvement: join does the collision
+    # check instead of pushing it onto the user. Check failures stay quiet —
+    # the join itself already succeeded.
+    try:
+        my = clean(creds.get("nickname") or "")
+        _, listing = rest("GET", "/v1/rooms", token=creds["access_token"])
+        for r in listing.get("rooms", []):
+            if r.get("id") != room.get("id"):
+                continue
+            same = [m for m in r.get("members", [])
+                    if clean(m.get("nickname")) == my
+                    and m.get("user_id") != creds.get("user_id")]
+            if same:
+                print(f"warning: this room already has the same nickname"
+                      f" ({my}) — convention is that whoever arrived first"
+                      " yields via rename.", file=sys.stderr)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+
+def is_ai(member):
+    # Self-declared only — identity disclosure is optional (SKILL.md startup
+    # step 1), so anonymous AIs are not caught. Treating unmarked members as
+    # human is the conservative direction of norm 3. Both the canonical
+    # English prefix and the legacy Korean one count (see AI_BIO_PREFIXES);
+    # lstrip+casefold absorbs the spelling variance English introduced.
+    return (member.get("bio") or "").lstrip().casefold().startswith(AI_BIO_PREFIXES)
+
+
+def cmd_rooms(args):
+    creds = load_creds(profile_name(args))
+    status, data = rest("GET", "/v1/rooms", token=creds["access_token"])
+    die_on(status, data)
+    for r in data.get("rooms", []):
+        ms = r.get("members", [])
+        # Norm-3 enforcement aid — the marker covers only self-declared AIs,
+        # so "humans" is precisely the count of unmarked members (anonymous
+        # AIs may be included — treating them as human is the safe direction)
+        members = ", ".join(clean(m.get("nickname")) + ("[AI]" if is_ai(m) else "")
+                            for m in ms)
+        humans = sum(1 for m in ms if not is_ai(m))
+        print(f"{r['id']}  {clean(r.get('name'))!r}  seq {r.get('last_seq')} "
+              f"(my read {r.get('my_last_read_seq')})  humans {humans}  [{members}]")
+
+
+def cmd_create(args):
+    creds = load_creds(profile_name(args))
+    status, data = rest("POST", "/v1/rooms", {"name": args.name},
+                        creds["access_token"])
+    die_on(status, data)
+    room = data.get("room", data)
+    print(json.dumps({"room_id": room.get("id"),
+                      "name": clean(room.get("name")),
+                      "encryption_mode": room.get("encryption_mode")},
+                     ensure_ascii=False))
+
+
+def cmd_invite(args):
+    creds = load_creds(profile_name(args))
+    # Sealed-room invites need a quiz, and the CLI has no quiz surface —
+    # a quiz-less bearer link is the combination protocol-v1 §2-b
+    # eliminated ("wall + open door = a lie"). The server does not stop
+    # unbound accounts here, so this client closes its own surface
+    # (agent-mls-v1 §6).
+    if is_sealed(get_room(creds, args.room)):
+        sys.exit("sealed-room invites need a quiz — issue them from the"
+                 " phone. (a bare link would let anyone who picks it up in)")
+    body = {}
+    if args.max_uses is not None:      # 0 is meaningful — no falsy checks
+        body["max_uses"] = args.max_uses
+    if args.ttl_days is not None:
+        body["ttl_days"] = args.ttl_days
+    # Owner-bound accounts must carry a granted approval (approval-v1
+    # §2-5) — the server consumes it in the same transaction as the insert
+    if getattr(args, "approval", None):
+        body["approval_id"] = args.approval
+    status, data = rest("POST", room_path(args.room, "/invites"), body,
+                        creds["access_token"])
+    die_on(status, data)
+    inv = data["invite"]
+    print(json.dumps({"url": inv.get("url"), "code": inv.get("code"),
+                      "max_uses": inv.get("max_uses"),
+                      "expires_at": inv.get("expires_at")}, ensure_ascii=False))
+    # Invite semantics (invite-identity-v1 verdict 1, the 08-10 morning
+    # incident): max_uses is the number of uses issued (+N), not room
+    # capacity. The app converts the same invite into "up to N people"
+    # (seats left), so one number reads differently on two screens — we
+    # pin it down here.
+    if inv.get("max_uses") is not None:
+        print(f"this invite is +{inv['max_uses']} uses — the number of"
+              " admissions it grants, not the room's capacity. Uses are not"
+              " refunded when someone leaves.",
+              file=sys.stderr)
+    # Opened on a desktop, the landing page shows a QR — a human scans it
+    # with their phone camera and walks straight in (zero copy-paste).
+    # Use only when inviting humans.
+    if args.open and inv.get("url"):
+        opener = ("open" if sys.platform == "darwin"
+                  else "xdg-open" if shutil.which("xdg-open") else None)
+        if opener:
+            subprocess.run([opener, inv["url"]], check=False)
+            print("opened the invite page — scan the QR with a phone camera"
+                  " to enter directly")
+        else:
+            print("cannot open automatically in this environment — open the"
+                  " url above in a browser", file=sys.stderr)
+
+
+def cmd_invites(args):
+    """List active invites with remaining uses — only mine; the room owner
+    sees the whole room's. The original code is never shown again (the
+    server stores only a hash) — if it is lost, reissue."""
+    creds = load_creds(profile_name(args))
+    status, data = rest("GET", room_path(args.room, "/invites"),
+                        token=creds["access_token"])
+    die_on(status, data)
+    invs = data.get("invites", [])
+    if args.json:
+        print(json.dumps(invs, ensure_ascii=False))
+        return
+    if not invs:
+        print("no active invites")
+        return
+    for i in invs:
+        used = i.get("use_count") or 0
+        mx = i.get("max_uses")
+        left = ("unlimited" if mx is None
+                else f"+{max(mx - used, 0)} uses left")
+        quiz = ""
+        if i.get("has_quiz"):
+            quiz = " · quiz" + (" (locked)" if i.get("quiz_locked") else "")
+        mine = " · issued by me" if i.get("created_by") == creds.get("user_id") else ""
+        print(f"{i.get('id')}  used {used}"
+              f"{'' if mx is None else '/' + str(mx)} · {left}{quiz}"
+              f" · expires {clean(str(i.get('expires_at')))}{mine}")
+
+
+def cmd_leave(args):
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    sealed = is_sealed(get_room(creds, args.room))
+    status, data = rest("POST", room_path(args.room, "/leave"), {},
+                        creds["access_token"])
+    die_on(status, data)
+    if sealed:
+        # Leaving without folding local state dead-ends the re-invite on a
+        # stale group and a frozen desync marker (impl /133 3/6)
+        forget_room(creds, profile, args.room)
+        print("note: your cryptographic leaf stays in the tree until a"
+              " phone removes it — ask in the room to be removed.",
+              file=sys.stderr)
+    print(f"left {args.room}")
+
+
+def cmd_revoke(args):
+    """Leak response. Two distinct meanings (agent-mls-v1 §5-5):
+    - no --id: burn THIS account via DELETE /v1/me. The server itself
+      leaves every room with a farewell line (me_controller.delete walks
+      all memberships) — a CLI-side leave loop would only duplicate that
+      and add new partial-failure states, so there is none (impl /133,
+      the subtractive fix). Local destruction happens only after the
+      server confirms.
+    - --id OTHER: revoke that device only; this terminal's MLS state is
+      untouched. --id with THIS device is refused — the old semantics
+      never burned the account, and a pasted device_id must not either."""
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    token = creds["access_token"]
+
+    if args.id:
+        if args.id == creds.get("device_id"):
+            sys.exit("that is this terminal's own device — the server"
+                     " refuses self-revocation (422). To burn the whole"
+                     " account run `klatalk revoke --yes` with no --id.")
+        status, data = rest("DELETE",
+                            f"/v1/me/devices/"
+                            f"{urllib.parse.quote(args.id, safe='')}",
+                            token=token)
+        die_on(status, data)
+        print(f"revoked {args.id} — this profile keeps working.")
+        return
+
+    if not getattr(args, "yes", False):
+        sys.exit("this burns the whole account (rooms, membership, local"
+                 " keys) and cannot be undone — rerun with --yes")
+
+    status, data = rest("DELETE", "/v1/me", token=token)
+    die_on(status, data)
+    # Server burn confirmed — only now is local destruction safe. Report
+    # honestly if it fails (a silent half-burn claims more than it did)
+    leftovers = []
+    try:
+        shutil.rmtree(mls_dir(profile))
+    except OSError:
+        leftovers.append(mls_dir(profile))
+    try:
+        os.remove(cred_path(profile))
+    except OSError:
+        leftovers.append(cred_path(profile))
+    if leftovers:
+        print("warning: could not remove " + ", ".join(leftovers)
+              + " — delete manually (they hold keys and plaintext).",
+              file=sys.stderr)
+    print("account burned — the server left every room on your behalf;"
+          " local credentials and MLS state removed. Note: sealed-room"
+          " leaves stay in their trees until a phone removes them."
+          " Start again with: register")
+
+
+def summarize_payload(payload):
+    kind = payload.get("type")
+    if kind == "text":
+        return clean(payload.get("text", ""))
+    if kind == "image":
+        return f"[image {clean(payload.get('url', ''))}]"
+    if kind == "file":
+        return (f"[file {clean(payload.get('name', ''))} "
+                f"{clean(payload.get('url', ''))}]")
+    if kind == "system":
+        return f"[system] {clean(payload.get('text', ''))}"
+    return f"[{clean(kind)}] {clean(json.dumps(payload, ensure_ascii=False)[:120])}"
+
+
+def message_line(m, who):
+    nick, ai = who.get(m.get("sender_id"),
+                       ((m.get("sender_id") or "?")[:8], False))
+    tag = f"{clean(nick)}{'[AI]' if ai else ''}"
+    payload = (m.get("content") or {}).get("payload", {})
+    deleted = " (deleted)" if m.get("deleted") else ""
+    # A reply must say what it answers — agents reading the text surface
+    # lost the arrow the JSON always carried (field-reported by an agent)
+    reply = f"↩#{m['reply_to_seq']} " if m.get("reply_to_seq") else ""
+    return f"{m['seq']:>5}  {tag}: {reply}{summarize_payload(payload)}{deleted}"
+
+
+def member_who(room):
+    return {m["user_id"]: (m.get("nickname"), is_ai(m))
+            for m in room.get("members", [])}
+
+
+def cmd_messages(args):
+    creds = load_creds(profile_name(args))
+    token = creds["access_token"]
+    status, rooms = rest("GET", "/v1/rooms", token=token)
+    die_on(status, rooms)
+    who, room_meta = {}, None
+    for r in rooms.get("rooms", []):
+        if r["id"] == args.room:
+            who = member_who(r)
+            room_meta = r
+    if is_sealed(room_meta):
+        # The ratchet opens each seq exactly once — sealed re-reads come
+        # from the local ledger, never from re-fetched server ciphertext
+        # (design §4-2). --after/--before are display filters here.
+        profile = profile_name(args)
+        sealed_pump(creds, profile, args.room)
+        recs = [rec for rec in ledger_read(profile, args.room)
+                if (args.after_seq is None or rec["seq"] > args.after_seq)
+                and (args.before_seq is None or rec["seq"] < args.before_seq)]
+        recs = recs[-args.limit:]
+        if args.json:
+            print(json.dumps(recs, ensure_ascii=False))
+            return
+        if recs and args.after_seq is not None \
+                and recs[0]["seq"] > args.after_seq + 1:
+            print("(records before this device received them are not"
+                  " available)", file=sys.stderr)
+        for rec in recs:
+            print(sealed_record_line(rec, who))
+        return
+    query = {"limit": args.limit}
+    if args.after_seq is not None:
+        query["after_seq"] = args.after_seq
+    if args.before_seq is not None:
+        query["before_seq"] = args.before_seq
+    status, data = rest("GET", room_path(args.room, "/messages", query),
+                        token=token)
+    die_on(status, data)
+    msgs = data.get("messages", [])
+    if args.json:
+        print(json.dumps(msgs, ensure_ascii=False))
+        return
+    for m in msgs:
+        print(message_line(m, who))
+
+
+def cmd_unread(args):
+    """Unread status — the first move of a turn-catch-up member. Looking does
+    not mark as read: a read mark covers only what was read and judged, and
+    is signed explicitly via the read command."""
+    creds = load_creds(profile_name(args))
+    token = creds["access_token"]
+    status, data = rest("GET", "/v1/rooms", token=token)
+    die_on(status, data)
+    rooms = data.get("rooms", [])
+    if args.room:
+        rooms = [r for r in rooms if r["id"] == args.room]
+        if not rooms:
+            sys.exit("not a member of that room")
+    total = 0
+    for r in rooms:
+        last = r.get("last_seq") or 0
+        mine = r.get("my_last_read_seq") or 0
+        n = last - mine
+        if n <= 0:
+            continue
+        total += n
+        print(f"{r['id']}  {clean(r.get('name'))!r}  unread {n} "
+              f"(my read {mine} → latest {last})")
+        if args.room:            # a named room gets bodies too — judgment fuel
+            if is_sealed(r):
+                # Sealed bodies come from the ledger — re-decrypting the
+                # server rows is impossible (ratchet), design §4-2
+                profile = profile_name(args)
+                sealed_pump(creds, profile, r["id"])
+                for rec in ledger_read(profile, r["id"]):
+                    if rec["seq"] > mine:
+                        print(sealed_record_line(rec, member_who(r)))
+                continue
+            st, md = rest("GET", room_path(r["id"], "/messages",
+                                           {"after_seq": mine,
+                                            "limit": args.limit}),
+                          token=token)
+            die_on(st, md)
+            for m in md.get("messages", []):
+                print(message_line(m, member_who(r)))
+    if total == 0:
+        print("no unread messages")
+
+
+def latest_seq(creds, room_id):
+    status, data = rest("GET", "/v1/rooms", token=creds["access_token"])
+    die_on(status, data)
+    for r in data.get("rooms", []):
+        if r["id"] == room_id:
+            return r["last_seq"]
+    sys.exit("not a member of that room")
+
+
+def cmd_bind(args):
+    """Start the binding ceremony (owner-binding-v1 §1) — this terminal
+    births a code; the owner's phone swallows it and one tap signs. The
+    binding is the root of envelope-axis approvals: once bound, room-
+    resource calls (invites) require a granted approval."""
+    creds = load_creds(profile_name(args))
+    status, data = rest("POST", "/v1/owner-bindings/code", {},
+                        creds["access_token"])
+    die_on(status, data)
+    print(json.dumps({"code": data.get("code"),
+                      "link_url": data.get("link_url"),
+                      "generation": data.get("generation"),
+                      "expires_at": data.get("expires_at")},
+                     ensure_ascii=False))
+    print("hand this code to your owner — phone: Settings > My agents,"
+          " within 5 minutes. The owner's tap is the signature.",
+          file=sys.stderr)
+
+
+def canonical_request(action, room_id, requester_id, ttl, max_uses,
+                      target=None, envelope_ref="terminal", work_id=None):
+    """The canon (approval-v1 §1) — the exact bytes everyone hashes.
+    Sorted keys, no spaces, integers only; nobody re-canonicalizes
+    downstream, so these bytes ARE the request. envelope_ref names the
+    owner's ask this request fires inside (grant ⊆ envelope, §0-3) —
+    pass a short summary of the ask; the server never interprets it,
+    it only lives inside the fingerprint. work_id ties the approval to
+    a unit of work (future STOP-epoch binding)."""
+    axis = "envelope" if action.startswith("envelope.") else "room"
+    body = {"v": 1, "action": action, "approver_axis": axis,
+            "requester": requester_id, "room_id": room_id,
+            "envelope_ref": envelope_ref,
+            "work_id": work_id or str(uuid.uuid4()),
+            "ttl": ttl, "max_uses": max_uses,
+            "nonce": uuid.uuid4().hex[:16]}
+    if target is not None:
+        body["target"] = target
+    return json.dumps(body, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode()
+
+
+def cmd_request_approval(args):
+    """Register an approval request and float the card in the room
+    (approval-v1 §2). Non-blocking: keep doing already-granted work while
+    the card waits — never sit idle on a pending card."""
+    creds = load_creds(profile_name(args))
+    if is_sealed(get_room(creds, args.room)):
+        # Cards are plain-room only (design §6) — pushing a v1 plaintext
+        # card into an MLS room gets plaintext_rejected and orphans the
+        # approval. Say the cause up front.
+        sys.exit("approval cards live in plain rooms only — a sealed"
+                 " room's agent is a conversation member (design §6)")
+    canon = canonical_request(args.action, args.room, creds["user_id"],
+                              args.ttl, args.uses, target=args.target,
+                              envelope_ref=args.envelope)
+    status, data = rest("POST", room_path(args.room, "/approvals"),
+                        {"canon": base64.b64encode(canon).decode()},
+                        creds["access_token"])
+    die_on(status, data)
+    approval_id = data["id"]
+    # §2-2 confirmed fallback — old clients render payload.text verbatim,
+    # so it must carry the action for a human, not a machine string
+    fallback = args.text or (
+        "An approval request has arrived. Update the app to approve it"
+        " here.")
+    payload = {"type": "approval_request", "approval_id": approval_id,
+               "canon": base64.b64encode(canon).decode(), "text": fallback}
+    try:
+        asyncio.run(do_send(creds, args.room, fallback, payload=payload))
+    except SystemExit:
+        # A pending row with no card in the room is the orphan §2-2
+        # forbids — take the request back before dying
+        rest("POST", f"/v1/approvals/{approval_id}/revoke", {},
+             creds["access_token"])
+        sys.exit("card send failed — the approval request was revoked")
+    print(json.dumps({"approval_id": approval_id,
+                      "status": data.get("status"),
+                      "expires_at": data.get("expires_at")},
+                     ensure_ascii=False))
+    print("card floated — the approver's tap is the signature. Check with"
+          f" `klatalk approval {approval_id}`; act only after granted"
+          " (fail-closed).", file=sys.stderr)
+
+
+def cmd_approval(args):
+    """Approval status — check before acting (approval-v1 §0-5: the
+    signature is the source of authority, the server is the source of
+    revocation; unreachable server = do not act). Phase A honesty: the
+    key registry's root is the server, so grant verification here is
+    server-attested — signer key/generation printed for audit."""
+    creds = load_creds(profile_name(args))
+    status, data = rest("GET", f"/v1/approvals/{args.id}", None,
+                        creds["access_token"])
+    die_on(status, data)
+    print(json.dumps({"id": data.get("id"), "status": data.get("status"),
+                      "action": data.get("action"),
+                      "used": data.get("used"),
+                      "max_uses": data.get("max_uses"),
+                      "expires_at": data.get("expires_at"),
+                      "signer_user_id": data.get("signer_user_id"),
+                      "signer_key": data.get("signer_key")},
+                     ensure_ascii=False))
+
+
+def cmd_approval_consume(args):
+    """Consume one use before an out-of-room action (approval-v1 §2-5) —
+    consume success is the precondition, and the idempotency key makes
+    retries safe (same key = same use, nothing burned twice). If the
+    outcome of the action is unknown, do NOT retry with a new key — ask
+    the human again in the room."""
+    creds = load_creds(profile_name(args))
+    status, data = rest("POST", f"/v1/approvals/{args.id}/consume",
+                        {"idempotency_key": args.key},
+                        creds["access_token"])
+    die_on(status, data)
+    print(json.dumps(data, ensure_ascii=False))
+
+
+def sealed_send(args, creds, profile, room_id, payload, reply_to=None):
+    safe_room_id(room_id)
+    if is_desynced(profile, room_id):
+        sys.exit("this room is desynchronized — sending is blocked (a stale"
+                 " epoch could hand new secrets to a removed member). Leave"
+                 " and get re-invited to recover.")
+    # Catch up first — encrypting behind missed commits is the stale-epoch
+    # hazard the desync rule exists for (design §4-3)
+    sealed_pump(creds, profile, room_id)
+    if is_desynced(profile, room_id):
+        sys.exit("this room just desynchronized — sending is blocked.")
+
+    # Settle an unknown-outcome predecessor FIRST, and never as a substitute
+    # for the new utterance (impl /133 P0: the old journal used to hijack
+    # and silently swallow the next send)
+    outbox = outbox_path(profile, room_id)
+    stale = None
+    try:
+        with open(outbox) as f:
+            stale = json.load(f)
+    except (OSError, ValueError):
+        pass
+    if stale:
+        # Always settle with the same id and the same ciphertext — the
+        # server absorbs duplicates via client_msg_id, so this is
+        # idempotent; the earlier verdict of "the epoch changed, so it was
+        # never sent" was a lie that duplicated an already-stored
+        # utterance (mini-review 2/2)
+        print("note: resending a previous message whose outcome was"
+              " unknown (same id, same ciphertext) — rerun this command"
+              " to send the new one afterwards", file=sys.stderr)
+        try:
+            seq = asyncio.run(do_send(creds, room_id, "",
+                                      reply_to=stale.get("reply_to"),
+                                      content=stale["content"],
+                                      client_msg_id=stale["client_msg_id"]))
+        except SendRejected as e:
+            os.remove(outbox)
+            sys.exit(f"the earlier message was rejected ({e}) — journal"
+                     " cleared; rerun to send the new one")
+        if seq and stale.get("payload") is not None:
+            # A settled utterance is part of this room's history too — the
+            # journal holds the ledger material
+            ledger_append(profile, room_id,
+                          [{"seq": seq, "kind": "application", "own": True,
+                            "sender_id": creds.get("user_id"),
+                            "sender_device": creds.get("device_id"),
+                            "payload": stale["payload"]}])
+        os.remove(outbox)
+        sys.exit("previous send resolved — nothing new was sent yet;"
+                 " rerun this command for the new message")
+
+    plaintext_b64 = base64.b64encode(
+        json.dumps(payload, ensure_ascii=False).encode()).decode()
+
+    # Epoch CAS (impl /133 P0 + mini-review correction): pin the epoch
+    # BEFORE verification so that a change during or right after it lands
+    # as a CAS failure — reading it after verification would lock in the
+    # epoch of an unverified leaf that slipped in between
+    for attempt in range(2):
+        epoch = mls_op(creds, profile, "group-epoch",
+                       {"room_id": room_id})["epoch"]
+        if not verify_roster(creds, profile, room_id):
+            sys.exit("sending is blocked until every device in the room is"
+                     " verified (see the warning above)")
+        try:
+            ct = mls_op(creds, profile, "encrypt",
+                        {"room_id": room_id, "expected_epoch": epoch,
+                         "plaintext_b64": plaintext_b64})["ct_b64"]
+            break
+        except MlsError as e:
+            if "roster_changed" not in str(e) or attempt == 1:
+                raise
+    content = {"v": 2, "alg": "mls10", "payload": {"ct": ct}}
+    # Reactions ride quietly, same hint grammar as the app (design §4-4)
+    if isinstance(payload, dict) and "reaction" in payload:
+        content["hint"] = "quiet"
+    cmid = str(uuid.uuid4())
+    replace_private(outbox, lambda f: f.write(json.dumps(
+        {"client_msg_id": cmid, "content": content, "epoch": epoch,
+         "reply_to": reply_to, "payload": payload})))
+    try:
+        seq = asyncio.run(do_send(creds, room_id, "", reply_to=reply_to,
+                                  content=content, client_msg_id=cmid))
+    except SendRejected as e:
+        os.remove(outbox)
+        sys.exit(f"send failed: {e}")
+    # Our own utterance decrypts exactly zero times (the echo comes back as
+    # Own) — the send moment is the ONLY moment its plaintext exists, and
+    # the ledger is the sole re-read surface (§4-2, impl /133 4/6)
+    if seq:
+        ledger_append(profile, room_id,
+                      [{"seq": seq, "kind": "application", "own": True,
+                        "sender_id": creds.get("user_id"),
+                        "sender_device": creds.get("device_id"),
+                        "payload": payload}])
+    try:
+        os.remove(outbox)
+    except OSError:
+        pass
+
+
+def cmd_send(args):
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    room = get_room(creds, args.room)
+    if is_sealed(room):
+        # §1's argv rule covers every process the plaintext crosses — in a
+        # sealed room the message body is exactly what §7 protects
+        if getattr(args, "text_stdin", False):
+            text = sys.stdin.read().rstrip("\n")
+        elif args.text is not None:
+            sys.exit("sealed-room plaintext must not ride argv (ps, shell"
+                     " history) — use: klatalk send ROOM --text-stdin")
+        else:
+            sys.exit("nothing to send — use --text-stdin for sealed rooms")
+        return sealed_send(args, creds, profile, args.room,
+                           {"type": "text", "text": text},
+                           reply_to=args.reply)
+    if getattr(args, "text_stdin", False):
+        text = sys.stdin.read().rstrip("\n")
+    elif args.text is None:
+        sys.exit("plain-room send needs TEXT (or use --text-stdin)")
+    else:
+        text = args.text
+    try:
+        asyncio.run(do_send(creds, args.room, text, reply_to=args.reply))
+    except SendRejected as e:
+        sys.exit(f"send failed: {e}")
+
+
+def cmd_like(args):
+    """Heart reaction — the third state: lighter than words, more honest than
+    silence. Payload shape matches the app's text+reaction sidecar (the ❤️
+    text is the fallback for old clients)."""
+    # The sidecar has exactly two keys — the server enforces map_size==2
+    # against tampering (message.ex valid_reaction_sidecar?; measured:
+    # rejected as invalid_message, not 426)
+    action = "remove" if args.remove else "add"
+    payload = {"type": "text", "text": "❤️",
+               "reaction": {"target_seq": args.seq, "action": action}}
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    if is_sealed(get_room(creds, args.room)):
+        return sealed_send(args, creds, profile, args.room, payload)
+    try:
+        asyncio.run(do_send(creds, args.room, "❤️", payload=payload))
+    except SendRejected as e:
+        sys.exit(f"send failed: {e}")
+
+
+def cmd_read(args):
+    creds = load_creds(profile_name(args))
+    seq = args.seq if args.seq is not None else latest_seq(creds, args.room)
+    asyncio.run(do_read(creds, args.room, seq))
+
+
+def cmd_wait(args):
+    """Block until a new message lands in the room, print it, exit 0.
+    The platform-agnostic wake-up half of residency: harnesses without a
+    file Monitor loop `wait` between judgment turns —
+        while klatalk wait ROOM; do <judge and reply>; done
+    Exit 3 on --timeout (no new messages) so loops can idle honestly.
+    Field-proven need: a harness once had to hand-build an
+    inbox-polling bridge because reception (listen) existed but wake-up
+    was Claude-Monitor-specific."""
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    room = get_room(creds, args.room, strict=False)
+    sealed = is_sealed(room)
+    after = args.after_seq
+    if after is None:
+        after = (room or {}).get("last_seq") or 0
+    deadline = time.time() + args.timeout if args.timeout else None
+    delay = 2
+    who = member_who(room or {})
+    while True:
+        if sealed:
+            recs = [r for r in
+                    (sealed_pump(creds, profile, args.room) or
+                     ledger_read(profile, args.room))
+                    if (r.get("seq") or 0) > after and not r.get("own")]
+            if recs:
+                for r in recs:
+                    print(sealed_record_line(r, who))
+                return
+        else:
+            st, data = rest("GET", room_path(args.room, "/messages",
+                                             {"after_seq": after,
+                                              "limit": 200}),
+                            token=creds["access_token"])
+            die_on(st, data)
+            fresh = [m for m in data.get("messages", [])
+                     if m.get("sender_id") != creds.get("user_id")]
+            if fresh:
+                for m in fresh:
+                    print(message_line(m, who))
+                return
+        if deadline and time.time() > deadline:
+            print("no new messages", file=sys.stderr)
+            sys.exit(3)
+        time.sleep(delay)
+        delay = min(delay * 2, 15)
+
+
+def cmd_listen(args):
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    asyncio.run(do_listen(creds, args.room, args.inbox or inbox_path(profile),
+                          profile=profile))
+
+
+def cmd_fetch(args):
+    # Guards run before credentials — pure input validation, testable
+    # without an account. Validate ONE string and send THAT string
+    # (validate-A/send-B was the small-133 finding): reject any URL
+    # anatomy beyond a bare path, decode once, refuse residual escapes
+    # (double encoding), backslashes, NUL, and any path that changes
+    # under normalization (dot-segments, duplicate slashes).
+    parts = urllib.parse.urlsplit(args.url)
+    if parts.scheme or parts.netloc or parts.query or parts.fragment:
+        sys.exit("fetch accepts only /uploads/ attachment paths")
+    path = urllib.parse.unquote(parts.path)
+    if (path != posixpath.normpath(path)
+            or not path.startswith("/uploads/")
+            or any(c in path for c in ("\\", "\x00", "%"))):
+        sys.exit("fetch accepts only /uploads/ attachment paths")
+    # -o is required: a room-chosen basename must never name a local file
+    out = args.out
+    if not out or out.startswith(".") or os.sep in out:
+        sys.exit("specify the output filename with -o")
+    creds = load_creds(profile_name(args))
+    url = api_url(path)  # send exactly what was validated
+    if os.path.exists(out) and not args.force:
+        sys.exit(f"{out} already exists — pass another name with -o, or --force")
+    req = urllib.request.Request(url)
+    req.add_header("Authorization", f"Bearer {creds['access_token']}")
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with OPENER.open(req, timeout=60) as resp, os.fdopen(fd, "wb") as f:
+        shutil.copyfileobj(resp, f)     # never buffer a large attachment whole
+    print(out)
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    # SUPPRESS — so a subparser does not overwrite the top-level value with
+    # None. Without it, `klatalk --profile x rooms` silently falls back to
+    # the default account.
+    common.add_argument("--profile", default=argparse.SUPPRESS,
+                        help="credentials profile (default: KLATALK_PROFILE)")
+    p = argparse.ArgumentParser(
+        prog="klatalk", parents=[common], description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn):
+        s = sub.add_parser(name, parents=[common])   # --profile after subcommand
+        s.set_defaults(fn=fn)
+        return s
+
+    s = add("register", cmd_register); s.add_argument("nickname")
+    s.add_argument("--force", action="store_true")
+    add("whoami", cmd_whoami)
+    add("profiles", cmd_profiles)
+    s = add("bio", cmd_bio); s.add_argument("text")
+    s = add("rename", cmd_rename); s.add_argument("nickname")
+    s = add("join", cmd_join); s.add_argument("code", nargs="?", default="")
+    s.add_argument("--answer-stdin", action="store_true", dest="answer_stdin",
+                   help="read the quiz answer from stdin (first line) —"
+                        " there is deliberately no --answer VALUE flag")
+    s.add_argument("--wait", action="store_true",
+                   help="keep polling past 60s (sealed rooms — a human must"
+                        " open the door)")
+    s.add_argument("--resume", action="store_true",
+                   help="continue a pending sealed join from its journal")
+    add("rooms", cmd_rooms)
+    s = add("create", cmd_create); s.add_argument("name")
+    s = add("invite", cmd_invite); s.add_argument("room")
+    s.add_argument("--max-uses", type=int,
+                   help="uses issued (+N): how many admissions this link"
+                        " grants — not room capacity")
+    s.add_argument("--ttl-days", type=int)
+    s.add_argument("--open", action="store_true",
+                   help="open the invite page in a browser (desktop shows a QR)")
+    s.add_argument("--approval",
+                   help="granted approval id — required once this account"
+                        " is owner-bound (server enforces, approval-v1 §2-5)")
+    add("bind", cmd_bind)
+    s = add("request-approval", cmd_request_approval); s.add_argument("room")
+    # room.pin.set is deliberately absent until the server enforces pin
+    # delegation — a grant nobody can execute reads as "approved, then
+    # nothing happened" (full-arc review)
+    s.add_argument("--action", required=True,
+                   choices=["room.invite.create", "envelope.custom"])
+    s.add_argument("--target")
+    s.add_argument("--envelope", default="terminal",
+                   help="short name of the owner's ask this fires inside"
+                        " (grant ⊆ envelope — lives only in the fingerprint)")
+    s.add_argument("--ttl", type=int, default=3600,
+                   help="seconds (server caps at 24h)")
+    s.add_argument("--uses", type=int, default=1,
+                   help="max uses (server caps at 10)")
+    s.add_argument("--text", help="card fallback text shown in the room")
+    s = add("approval", cmd_approval); s.add_argument("id")
+    s = add("approval-consume", cmd_approval_consume); s.add_argument("id")
+    s.add_argument("--key", required=True,
+                   help="idempotency key — same key returns the same use")
+    s = add("invites", cmd_invites); s.add_argument("room")
+    s.add_argument("--json", action="store_true")
+    s = add("unread", cmd_unread); s.add_argument("room", nargs="?")
+    s.add_argument("--limit", type=int, default=100)
+    s = add("leave", cmd_leave); s.add_argument("room")
+    s = add("revoke", cmd_revoke); s.add_argument("--id")
+    s.add_argument("--yes", action="store_true",
+                   help="confirm burning the whole account (no --id)")
+    s = add("messages", cmd_messages); s.add_argument("room")
+    s.add_argument("--after-seq", type=int); s.add_argument("--before-seq", type=int)
+    s.add_argument("--limit", type=int, default=100)
+    s.add_argument("--json", action="store_true")
+    s = add("send", cmd_send); s.add_argument("room")
+    s.add_argument("text", nargs="?", default=None)
+    s.add_argument("--text-stdin", action="store_true", dest="text_stdin",
+                   help="read the message body from stdin — required in"
+                        " sealed rooms (argv shows up in ps)")
+    s.add_argument("--reply", type=int, metavar="SEQ",
+                   help="send as a reply to this seq (quote chip)")
+    s = add("like", cmd_like); s.add_argument("room")
+    s.add_argument("seq", type=int)
+    s.add_argument("--remove", action="store_true", help="remove the heart")
+    s = add("read", cmd_read); s.add_argument("room")
+    s.add_argument("seq", nargs="?", type=int)
+    s = add("wait", cmd_wait); s.add_argument("room")
+    s.add_argument("--after-seq", type=int, default=None, dest="after_seq",
+                   help="wake on messages after this seq (default: current"
+                        " last_seq — i.e. only genuinely new ones)")
+    s.add_argument("--timeout", type=float, default=None,
+                   help="give up after N seconds (exit 3)")
+    s = add("listen", cmd_listen); s.add_argument("room"); s.add_argument("--inbox")
+    s = add("fetch", cmd_fetch); s.add_argument("url")
+    s.add_argument("-o", "--out"); s.add_argument("--force", action="store_true")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.fn(args)
+    except MlsError as e:
+        # Helper failures are honest one-liners, not tracebacks (§9)
+        sys.exit(f"MLS helper: {e}")
+
+
+if __name__ == "__main__":
+    main()
