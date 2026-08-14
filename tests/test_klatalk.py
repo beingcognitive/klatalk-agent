@@ -184,6 +184,29 @@ class TestUrlGuard(Base):
         self.assertIsNotNone(m)
         self.assertEqual(m.group(1).lower(), "ab2cd3ef")
 
+    def test_profile_name_ignores_atomic_replace_tmp(self):
+        # A kill during replace_private leaves credentials.json.tmp.<pid> —
+        # it must not read as a second profile and lock out bare commands
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        for name in ("credentials.json", "credentials.json.tmp.123"):
+            with open(os.path.join(self.home, name), "w") as f:
+                f.write("{}")
+        args = type("A", (), {"profile": None})()
+        self.assertEqual(self.cli.profile_name(args), "default")
+
+    def test_inbox_resume_state_stops_at_holes(self):
+        # Resume must be the highest CONTIGUOUS seq — resuming from the
+        # plain max would skip a hole (seq 4) forever
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        inbox = os.path.join(self.home, "inbox.jsonl")
+        with open(inbox, "w") as f:
+            for seq in (1, 2, 3, 5):
+                f.write(json.dumps({"topic": "room:R", "event": "message:new",
+                                    "payload": {"seq": seq}}) + "\n")
+        resume, retained = self.cli.inbox_resume_state(inbox, "R")
+        self.assertEqual(resume, 3)
+        self.assertEqual(retained, {1, 2, 3, 5})
+
     def test_redirect_strips_authorization(self):
         # urllib copies Authorization even on cross-host redirects — check
         # that the handler strips it (the spot where urllib differs from
@@ -250,6 +273,15 @@ class TestSecretsNeverPrinted(Base):
         with self.assertRaises(SystemExit) as ctx:
             self.cli.die_on(422, {"error": "quiz_required"})
         self.assertIn("quiz_required", str(ctx.exception))
+
+    def test_die_on_names_changeset_fields_without_values(self):
+        # Phoenix changeset failures arrive as {"errors": {field: [msgs]}} —
+        # the field NAME must read through (else "nickname taken" prints as
+        # request_failed), the VALUES must not (any string could be a secret)
+        with self.assertRaises(SystemExit) as ctx:
+            self.cli.die_on(422, {"errors": {"nickname": ["SECRET-VALUE"]}})
+        self.assertIn("nickname", str(ctx.exception))
+        self.assertNotIn("SECRET-VALUE", str(ctx.exception))
 
 
 class TestCredentialFiles(Base):

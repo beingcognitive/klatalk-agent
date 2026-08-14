@@ -107,7 +107,11 @@ def profile_name(args):
     if p:
         return p
     try:
-        found = [f for f in os.listdir(HOME) if f.startswith("credentials")]
+        # Exact shapes only — an atomic-replace tmp file left by a kill
+        # (credentials.json.tmp.<pid>) must not read as a second profile
+        found = [f for f in os.listdir(HOME)
+                 if f == "credentials.json"
+                 or (f.startswith("credentials-") and f.endswith(".json"))]
     except OSError:
         found = []
     if len(found) > 1:
@@ -221,6 +225,16 @@ def die_on(status, data):
         # denylist broke one nesting level deep ({"error": {"access_token":
         # …}} serialized whole) — never serialize the payload.
         err = data.get("error") if isinstance(data, dict) else None
+        if err is None and isinstance(data, dict):
+            # Phoenix changeset shape: {"errors": {"nickname": [...]}}.
+            # Pass field NAMES only — a value could be any string, and a
+            # base64url secret would sail through the character allowlist.
+            fields = data.get("errors")
+            if isinstance(fields, dict) and fields:
+                names = sorted(k for k in fields
+                               if re.fullmatch(r"[a-z_]{1,32}", str(k)))
+                if names:
+                    err = "invalid: " + ", ".join(names)
         if not isinstance(err, str) \
                 or not re.fullmatch(r"[A-Za-z0-9 _.,:'()-]{1,120}", err):
             err = "request_failed"
@@ -367,12 +381,37 @@ def record(inbox, rec):
                   append=True)
 
 
-def inbox_last_seq(inbox, room_id):
-    """Highest message seq this inbox already carries for the room — the
-    plain-room listen resume point. Without it, every restart re-emitted
-    the whole history as fresh message:new events, and a file monitor
-    replayed old instructions as new ones."""
-    last = 0
+def listen_cursor_path(profile, room_id):
+    # The durable resume point lives OUTSIDE the inbox — the skill tells
+    # agents to delete the inbox when a residency ends, and an inbox-only
+    # cursor would replay the whole room as fresh events on the next listen
+    return os.path.join(HOME,
+                        f"listen-{profile or 'default'}-{room_id}.seq")
+
+
+def listen_cursor_read(profile, room_id):
+    try:
+        with open(listen_cursor_path(profile, room_id)) as f:
+            return int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def listen_cursor_write(profile, room_id, seq):
+    try:
+        replace_private(listen_cursor_path(profile, room_id),
+                        lambda f: f.write(str(seq)))
+    except OSError:
+        pass    # a lost cursor only costs duplicate emissions, never data
+
+
+def inbox_resume_state(inbox, room_id):
+    """(resume, retained) for the plain-room listen: resume = highest seq
+    CONTIGUOUS from the oldest retained row (a hole must be backfilled —
+    resuming from the plain max would skip it forever), retained = every
+    seq already in the inbox (so refilling a hole doesn't re-emit rows
+    the monitor has already seen)."""
+    seqs = set()
     topic = f"room:{room_id}"
     for path in (inbox + ".1", inbox):
         try:
@@ -388,10 +427,18 @@ def inbox_last_seq(inbox, room_id):
                     if (rec.get("topic") == topic
                             and rec.get("event") == "message:new"
                             and isinstance(seq, int)):
-                        last = max(last, seq)
+                        seqs.add(seq)
         except OSError:
             pass
-    return last
+    if not seqs:
+        return 0, seqs
+    ordered = sorted(seqs)
+    resume = ordered[0]
+    for seq in ordered[1:]:
+        if seq != resume + 1:
+            break
+        resume = seq
+    return resume, seqs
 
 
 # ---- MLS sealed rooms (agent-mls-v1) ----
@@ -1107,6 +1154,11 @@ def read_quiz_answer(args, frag=None):
 
 
 def sealed_join(args, creds, profile, code, frag):
+    # The executable is a public surface too — the experimental hedge must
+    # not live only in README/SKILL (release gate: live-server E2E pending)
+    print("warning: sealed-room joining is EXPERIMENTAL — a live-server"
+          " end-to-end join has not yet been verified; do not treat this"
+          " path as production-ready.", file=sys.stderr)
     token = creds["access_token"]
     pending = load_pending(profile)
     if getattr(args, "resume", False):
@@ -1320,9 +1372,15 @@ def sealed_join(args, creds, profile, code, frag):
 async def do_listen(creds, room_id, inbox, profile=None):
     token = creds["access_token"]
     sealed = is_sealed(get_room(creds, room_id))
-    # Resume where this inbox left off — starting at 0 re-emitted the whole
-    # history as fresh events on every restart (266 review)
-    seen = 0 if sealed else inbox_last_seq(inbox, room_id)
+    # Resume where this listener left off — starting at 0 re-emitted the
+    # whole history as fresh events on every restart (266 review). The
+    # cursor file survives inbox deletion/rotation; the inbox scan covers
+    # legacy installs and catches holes that still need a backfill.
+    if sealed:
+        seen, recorded_seqs = 0, set()
+    else:
+        seen, recorded_seqs = inbox_resume_state(inbox, room_id)
+        seen = max(seen, listen_cursor_read(profile, room_id))
     delay = 1
     print(f"inbox: {inbox}", flush=True)
     if sealed:
@@ -1391,13 +1449,19 @@ async def do_listen(creds, room_id, inbox, profile=None):
                         raise RuntimeError(f"backfill failed (HTTP {st})")
                     page = data.get("messages", [])
                     for m in page:
-                        record(inbox, {"topic": topic,
-                                       "event": "message:new", "payload": m})
-                        print(json.dumps({"topic": topic,
-                                          "event": "message:new",
-                                          "payload": m}, ensure_ascii=False),
-                              flush=True)
-                        seen = max(seen, m.get("seq", seen))
+                        seq = m.get("seq")
+                        # A row already in the inbox (hole refill) is not a
+                        # fresh event — record/emit only the truly new
+                        if seq not in recorded_seqs:
+                            rec = {"topic": topic, "event": "message:new",
+                                   "payload": m}
+                            record(inbox, rec)
+                            print(json.dumps(rec, ensure_ascii=False),
+                                  flush=True)
+                        if isinstance(seq, int):
+                            recorded_seqs.add(seq)
+                            seen = max(seen, seq)
+                    listen_cursor_write(profile, room_id, seen)
                     if len(page) < 200:
                         break
             try:
@@ -1429,7 +1493,9 @@ async def do_listen(creds, room_id, inbox, profile=None):
                     # signature of judgment, so it is never set here.
                     # seen is only the backfill cursor.
                     if event == "message:new" and payload.get("seq"):
+                        recorded_seqs.add(payload["seq"])
                         seen = max(seen, payload["seq"])
+                        listen_cursor_write(profile, room_id, seen)
             finally:
                 hb.cancel()
                 try:
@@ -1560,7 +1626,9 @@ def cmd_join(args):
     raw = (args.code or "").strip()
     frag = QUIZ_FRAGMENT.search(raw)
     m = INVITE_URL_CODE.search(raw)
-    code = m.group(1).lower() if m else raw.split("#")[0].strip()
+    # Codes are lowercase base32 server-side — normalize BOTH shapes; a
+    # bare pasted code is the likelier autocapitalize victim
+    code = (m.group(1) if m else raw.split("#")[0].strip()).lower()
     # Sealed path: a #q= fragment (quiz lives client-side only) or an
     # explicit resume of a pending sealed join
     if frag or getattr(args, "resume", False):
@@ -2342,6 +2410,9 @@ def build_parser():
     s = add("bio", cmd_bio); s.add_argument("text")
     s = add("rename", cmd_rename); s.add_argument("nickname")
     s = add("join", cmd_join); s.add_argument("code", nargs="?", default="")
+    s.description = ("Anyone-room joins are supported. Sealed-room joins are"
+                     " EXPERIMENTAL: live-server end-to-end verification has"
+                     " not passed yet.")
     s.add_argument("--answer-stdin", action="store_true", dest="answer_stdin",
                    help="read the quiz answer from stdin (first line) —"
                         " there is deliberately no --answer VALUE flag")
