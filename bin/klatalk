@@ -1606,7 +1606,8 @@ def cmd_avatar(args):
         sys.exit(f"cannot read {args.file}: {e.strerror}")
     if len(data) > AVATAR_MAX_BYTES:
         sys.exit(f"{args.file} exceeds the 5MB server cap")
-    creds = load_creds(profile_name(args))
+    profile = profile_name(args)
+    creds = load_creds(profile)
     boundary, body = multipart_body(
         "file", os.path.basename(args.file), ctype, data)
     req = urllib.request.Request(api_url("/v1/me/avatar"), data=body,
@@ -1627,6 +1628,11 @@ def cmd_avatar(args):
         sys.exit(f"could not reach {API}: {e.reason}")
     die_on(status, payload)
     user = payload.get("user", {})
+    # Same lesson as bio (dd2c69e): keep the local cache in step so whoami
+    # reflects the new avatar instead of a stale null
+    if user.get("avatar_url"):
+        creds["avatar_url"] = user["avatar_url"]
+        replace_private(cred_path(profile), lambda f: json.dump(creds, f))
     print(json.dumps(public_view(user), ensure_ascii=False))
 
 
