@@ -157,6 +157,33 @@ class TestUrlGuard(Base):
         self.assertNotIn("only /uploads/", str(ctx.exception))
         self.assertNotIn("with -o", str(ctx.exception))
 
+    def test_fetch_refuses_symlink_output(self):
+        # A planted `photo.jpg -> ../credentials.json` plus --force would
+        # truncate the link target; a broken link even slips past exists()
+        def fetch_args(url, out, force=False):
+            return type("A", (), {"url": url, "out": out, "force": force,
+                                  "profile": None})()
+
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            os.symlink(os.path.join(self.tmp, "target"), "planted.jpg")
+            for force in (False, True):
+                with self.subTest(force=force), \
+                     self.assertRaisesRegex(SystemExit, "symbolic-link"):
+                    self.cli.cmd_fetch(
+                        fetch_args("/uploads/a.jpg", "planted.jpg", force))
+        finally:
+            os.chdir(cwd)
+
+    def test_invite_code_parses_case_insensitively(self):
+        # Pasted links arrive auto-capitalized — the code must still parse,
+        # lowercased (codes are lowercase base32 server-side)
+        m = self.cli.INVITE_URL_CODE.search("https://klatalk.com/r/AB2CD3EF")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1).lower(), "ab2cd3ef")
+
     def test_redirect_strips_authorization(self):
         # urllib copies Authorization even on cross-host redirects — check
         # that the handler strips it (the spot where urllib differs from
@@ -177,6 +204,26 @@ class TestUrlGuard(Base):
             self.assertNotIn("SECRET", joined,
                              "the token rode along on the redirect")
 
+    def test_redirect_strips_authorization_on_scheme_downgrade(self):
+        # Same host, https→http — origin includes the scheme, so the token
+        # must not ride onto a plaintext connection
+        handler = self.cli.NoAuthRedirect()
+        req = urllib.request.Request(self.cli.API + "/uploads/a.jpg")
+        req.add_header("Authorization", "Bearer SECRET")
+
+        class FakeFP:
+            def read(self, *a):
+                return b""
+
+        downgraded = "http://" + self.cli.API_HOST + "/x"
+        new = handler.redirect_request(
+            req, FakeFP(), 302, "Found",
+            {"location": downgraded}, downgraded)
+        if new is not None:
+            joined = " ".join(f"{k}:{v}" for k, v in new.headers.items())
+            self.assertNotIn("SECRET", joined,
+                             "the token survived an https→http downgrade")
+
 
 class TestSecretsNeverPrinted(Base):
     """[2/6] If token hiding is a denylist, one new server field leaks it."""
@@ -194,6 +241,15 @@ class TestSecretsNeverPrinted(Base):
         with contextlib.redirect_stderr(buf), self.assertRaises(SystemExit):
             self.cli.die_on(401, {"error": "bad", "access_token": "SECRET-A"})
         self.assertNotIn("SECRET-A", buf.getvalue())
+        # The old key-name denylist broke one nesting level deep — the
+        # allowlist must never serialize a structured payload
+        with contextlib.redirect_stderr(buf), self.assertRaises(SystemExit):
+            self.cli.die_on(401, {"error": {"access_token": "SECRET-NESTED"}})
+        self.assertNotIn("SECRET-NESTED", buf.getvalue())
+        # …while a plain error code still reads through
+        with self.assertRaises(SystemExit) as ctx:
+            self.cli.die_on(422, {"error": "quiz_required"})
+        self.assertIn("quiz_required", str(ctx.exception))
 
 
 class TestCredentialFiles(Base):
@@ -531,12 +587,13 @@ class TestUntrustedText(Base):
     """[3/6] Room text is untrusted — terminal control chars get neutralized."""
 
     def test_control_chars_escaped(self):
-        # Korean text intentionally kept: exercises non-ASCII handling
-        # alongside the control-char escaping
-        out = self.cli.clean("정상\x1b[2K\r가짜 프롬프트")
+        # Non-ASCII text exercises encoding alongside control-char escaping
+        out = self.cli.clean("café\x1b[2K\rfake prompt")
         self.assertNotIn("\x1b", out)
         self.assertNotIn("\r", out)
-        self.assertIn("정상", out)
+        self.assertIn("café", out)
+        # None renders empty — a missing nickname must not print "None"
+        self.assertEqual(self.cli.clean(None), "")
 
     def test_summarize_never_raises(self):
         for payload in [{"type": "text", "text": "hello"},

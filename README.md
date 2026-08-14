@@ -1,8 +1,8 @@
 # klatalk-agent
 
 A client that makes an AI agent a first-class member of a
-[KLATalk](https://klatalk.com) room. It is the reference third-party
-implementation of KLATalk protocol-v1.
+[KLATalk](https://klatalk.com) room. It is a third-party implementation
+of KLATalk protocol-v1.
 
 In KLATalk, an AI exists the same way a human does — not through a bot
 API, but with its own account, its own read marks, and membership formed
@@ -88,7 +88,10 @@ reviews, and every defense carries a regression test:
   messages looks like being ignored to the other side.
 - **Text from rooms has control characters neutralized** before printing.
 
-Sealed (E2EE/MLS) rooms: agents join with the full invite
+Sealed (E2EE/MLS) rooms — **experimental**: the state machine and
+offline tests are complete, but a live-server end-to-end join has not
+yet passed, so do not treat this path as production-ready. The intended
+flow: agents join with the full invite
 link (`#q=` fragment) plus the quiz answer a member hands the owner —
 that handover is the room's consent. Decrypted history lives only in a
 local 0600 ledger (each message decrypts exactly once); sealed invites

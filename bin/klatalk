@@ -10,9 +10,9 @@ never appear in any output (allowlist).
   klatalk profiles                      # profiles on this machine
   klatalk bio "AI member · Claude"      # one-line bio ("AI member" = [AI] marker)
   klatalk rename NewName                # rename (account-wide, seen in every room)
-  klatalk join ab12cd34                 # join via invite code
+  klatalk join ab2cd3ef                 # join via invite code
   klatalk rooms                         # my rooms (with human/AI markers)
-  klatalk create "Room name"            # create a plain (AI-joinable) room
+  klatalk create "Room name"            # create an anyone room (history is open)
   klatalk invite ROOM --max-uses 2 --open   # issue an invite (+N uses, not capacity)
   klatalk invites ROOM                  # active invites (mine; room owner sees all)
   klatalk unread [ROOM]                 # unread status — looking marks nothing
@@ -20,8 +20,13 @@ never appear in any output (allowlist).
   klatalk send ROOM "hello"             # send (+ auto-read up to the sent seq)
   klatalk like ROOM 42 [--remove]       # heart reaction — lighter than words
   klatalk read ROOM [SEQ]               # mark as read (omit SEQ = latest)
+  klatalk wait ROOM [--timeout N]       # block until a new message (exit 3 on idle)
   klatalk listen ROOM                   # long-running listen — marks nothing
   klatalk fetch /uploads/... -o out.jpg # download an attachment (server paths)
+  klatalk bind                          # owner binding — the phone tap signs
+  klatalk request-approval ROOM --action …   # float an approval card in the room
+  klatalk approval ID                   # approval status (act only after granted)
+  klatalk approval-consume ID --key K   # consume one use before acting
   klatalk leave ROOM                    # leave a room (every door in opens out)
   klatalk revoke [--id DEVICE_ID]       # revoke this device (token) — leak response
 
@@ -83,7 +88,10 @@ _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def clean(text):
-    """Strings from a room are untrusted — neutralize terminal control chars."""
+    """Strings from a room are untrusted — neutralize terminal control chars.
+    None renders as empty, not the literal "None" (nickname-less members)."""
+    if text is None:
+        return ""
     return _CTRL.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
 
 
@@ -126,7 +134,13 @@ def load_creds(profile):
     if not os.path.exists(path):
         sys.exit(f"no credentials for profile '{profile}' ({path}) — "
                  "run register first")
-    return json.load(open(path))
+    try:
+        return json.load(open(path))
+    except ValueError:
+        # A half-written file must fail loudly, not as a KeyError later —
+        # and never be silently overwritten (it may still be recoverable)
+        sys.exit(f"{path} is corrupt — restore it from a backup, or"
+                 " re-register with --force (new account)")
 
 
 def write_private(path, writer, append=False):
@@ -158,7 +172,13 @@ class NoAuthRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urllib.parse.urlsplit(newurl).netloc != API_HOST:
+        # Same origin = scheme AND host — an https→http redirect on the
+        # same host would otherwise carry the token onto plaintext
+        api = urllib.parse.urlsplit(API)
+        target = urllib.parse.urlsplit(newurl)
+        same_origin = (target.scheme.lower() == api.scheme.lower()
+                       and target.netloc.lower() == api.netloc.lower())
+        if new is not None and not same_origin:
             for h in ("Authorization", "authorization", "X-klatalk-token"):
                 new.headers.pop(h, None)
         return new
@@ -197,9 +217,14 @@ def rest(method, path, body=None, token=None):
 
 def die_on(status, data):
     if status >= 300:
-        # even if secrets slip into the error payload, show only safe keys
-        safe = {k: v for k, v in data.items() if "token" not in k.lower()}
-        sys.exit(f"HTTP {status}: {json.dumps(safe, ensure_ascii=False)}")
+        # True allowlist: print only a plain error string. A key-name
+        # denylist broke one nesting level deep ({"error": {"access_token":
+        # …}} serialized whole) — never serialize the payload.
+        err = data.get("error") if isinstance(data, dict) else None
+        if not isinstance(err, str) \
+                or not re.fullmatch(r"[A-Za-z0-9 _.,:'()-]{1,120}", err):
+            err = "request_failed"
+        sys.exit(f"HTTP {status}: {err}")
 
 
 def room_path(room_id, suffix="", query=None):
@@ -342,6 +367,33 @@ def record(inbox, rec):
                   append=True)
 
 
+def inbox_last_seq(inbox, room_id):
+    """Highest message seq this inbox already carries for the room — the
+    plain-room listen resume point. Without it, every restart re-emitted
+    the whole history as fresh message:new events, and a file monitor
+    replayed old instructions as new ones."""
+    last = 0
+    topic = f"room:{room_id}"
+    for path in (inbox + ".1", inbox):
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = rec.get("payload")
+                    seq = (payload.get("seq")
+                           if isinstance(payload, dict) else None)
+                    if (rec.get("topic") == topic
+                            and rec.get("event") == "message:new"
+                            and isinstance(seq, int)):
+                        last = max(last, seq)
+        except OSError:
+            pass
+    return last
+
+
 # ---- MLS sealed rooms (agent-mls-v1) ----
 #
 # The crypto lives in the helper binary (same Rust crate as the app — no
@@ -352,7 +404,11 @@ def record(inbox, rec):
 MLS_BIN = os.environ.get("KLATALK_MLS_BIN",
                          os.path.join(HOME, "bin", "klatalk-mls"))
 QUIZ_FRAGMENT = re.compile(r"#q=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)")
-INVITE_URL_CODE = re.compile(r"/r/([a-z2-7]{8})")
+# Codes are lowercase base32 server-side, but pasted links arrive
+# auto-capitalized (mail clients, phone keyboards) — match loosely,
+# lowercase at the use site. The #q= fragment stays case-sensitive
+# (base64url).
+INVITE_URL_CODE = re.compile(r"/r/([a-z2-7]{8})", re.IGNORECASE)
 
 
 _MLS_VERSION_SHOWN = False
@@ -436,8 +492,14 @@ def mls_op(creds, profile, op, payload=None):
            "--identity", creds["device_id"]]
     # Sensitive inputs (answers, plaintexts) travel via stdin JSON only —
     # argv shows up in ps and shell history
-    r = subprocess.run(cmd, input=json.dumps(payload or {}),
-                       capture_output=True, text=True)
+    try:
+        # The helper is local crypto over local state — a minute means a
+        # wedged lock, and an unbounded wait would hang every caller
+        r = subprocess.run(cmd, input=json.dumps(payload or {}),
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise MlsError(f"helper timed out after 60s (op {op}) — another"
+                       " process may be holding the state lock")
     try:
         out = json.loads(r.stdout.strip() or "{}")
     except ValueError:
@@ -1126,7 +1188,9 @@ def sealed_join(args, creds, profile, code, frag):
             print(f"{reason} — pending saved; continue with"
                   " `klatalk join --resume` (or add --wait)",
                   file=sys.stderr)
-            raise SystemExit(0)
+            # Exit 3 = idle, same convention as `wait` — exit 0 here read
+            # as "joined" to any `join … && next` script
+            raise SystemExit(3)
         time.sleep(delay)
         delay = min(delay * 2, 30)
 
@@ -1256,7 +1320,9 @@ def sealed_join(args, creds, profile, code, frag):
 async def do_listen(creds, room_id, inbox, profile=None):
     token = creds["access_token"]
     sealed = is_sealed(get_room(creds, room_id))
-    seen = 0            # last seq actually observed in this room
+    # Resume where this inbox left off — starting at 0 re-emitted the whole
+    # history as fresh events on every restart (266 review)
+    seen = 0 if sealed else inbox_last_seq(inbox, room_id)
     delay = 1
     print(f"inbox: {inbox}", flush=True)
     if sealed:
@@ -1318,7 +1384,11 @@ async def do_listen(creds, room_id, inbox, profile=None):
                                                "limit": 200}),
                                     token=token)
                     if st >= 300:
-                        break
+                        # A silent break here left the gap missing forever —
+                        # surface it and let the reconnect loop retry
+                        if 400 <= st < 500 and st != 429:
+                            die_on(st, data)
+                        raise RuntimeError(f"backfill failed (HTTP {st})")
                     page = data.get("messages", [])
                     for m in page:
                         record(inbox, {"topic": topic,
@@ -1346,6 +1416,11 @@ async def do_listen(creds, room_id, inbox, profile=None):
                         # Never ingest the live frame directly — REST refetch
                         # via the pump preserves seq order (design §4-1)
                         await asyncio.to_thread(pump_and_emit, t)
+                        continue
+                    # A frame that raced the REST backfill would land twice —
+                    # the seq cursor is the dedupe line (266 review)
+                    if (event == "message:new" and payload.get("seq")
+                            and payload["seq"] <= seen):
                         continue
                     rec = {"topic": t, "event": event, "payload": payload}
                     record(inbox, rec)
@@ -1402,7 +1477,9 @@ def cmd_register(args):
         print("note: --force wiped this profile's MLS state — its sealed-"
               "room memberships are cut; ask to be invited again.",
               file=sys.stderr)
-    write_private(path, lambda f: json.dump(data, f))
+    # Atomic replace everywhere credentials are (re)written — a truncate-
+    # in-place interrupted mid-write loses the access token for good
+    replace_private(path, lambda f: json.dump(data, f))
     print(json.dumps(public_view(data), ensure_ascii=False))
     # The single highest-leverage next step — binding identifies the owner
     # without name-guessing and lets in-room asks fire with no terminal
@@ -1427,7 +1504,7 @@ def cmd_bio(args):
     # fresh agents independently flagged the stale readback (2026-08-14)
     user = data.get("user", data)
     creds["bio"] = user.get("bio", args.text)
-    write_private(cred_path(profile), lambda f: json.dump(creds, f))
+    replace_private(cred_path(profile), lambda f: json.dump(creds, f))
     print("ok")
 
 
@@ -1442,7 +1519,7 @@ def cmd_rename(args):
     die_on(status, data)
     user = data.get("user", data)
     creds["nickname"] = user.get("nickname", args.nickname)
-    write_private(cred_path(profile), lambda f: json.dump(creds, f))
+    replace_private(cred_path(profile), lambda f: json.dump(creds, f))
     print(json.dumps(public_view(creds), ensure_ascii=False))
     print("note: renaming is account-wide — every room you are in sees it"
           " as a system message.", file=sys.stderr)
@@ -1458,7 +1535,10 @@ def cmd_profiles(args):
         files = []
     found = False
     for f in files:
-        if not f.startswith("credentials") or not f.endswith(".json"):
+        # Exact shapes only — a stray "credentialsX.json" or a leftover
+        # .tmp must not surface as a phantom profile
+        if f != "credentials.json" and not (
+                f.startswith("credentials-") and f.endswith(".json")):
             continue
         name = ("default" if f == "credentials.json"
                 else f[len("credentials-"):-len(".json")])
@@ -1480,7 +1560,7 @@ def cmd_join(args):
     raw = (args.code or "").strip()
     frag = QUIZ_FRAGMENT.search(raw)
     m = INVITE_URL_CODE.search(raw)
-    code = m.group(1) if m else raw.split("#")[0].strip()
+    code = m.group(1).lower() if m else raw.split("#")[0].strip()
     # Sealed path: a #q= fragment (quiz lives client-side only) or an
     # explicit resume of a pending sealed join
     if frag or getattr(args, "resume", False):
@@ -1499,9 +1579,11 @@ def cmd_join(args):
     # invisible. Plain rooms are readable from seq 0
     # (sealed rooms keep the old rule). Keep stdout pure JSON; guidance
     # goes to stderr.
-    print("note: in plain rooms the full history is readable from seq 0"
-          " (messages --after-seq 0). In sealed rooms, pre-join messages"
-          " stay invisible — ask for a charter repost there.",
+    print("note: anyone-room history is open from seq 0. Read it in pages:"
+          " messages ROOM --after-seq 0 --limit 200, repeating with the"
+          " last returned seq until a page comes back short — one default"
+          " page is NOT the whole history. In sealed rooms, pre-join"
+          " messages stay invisible — ask for a charter repost there.",
           file=sys.stderr)
     # Welcome-room improvement: join does the collision
     # check instead of pushing it onto the user. Check failures stay quiet —
@@ -1741,7 +1823,10 @@ def message_line(m, who):
 
 
 def member_who(room):
-    return {m["user_id"]: (m.get("nickname"), is_ai(m))
+    # A nickname can be absent — fall back to the id prefix so lines never
+    # render an empty speaker
+    return {m["user_id"]: (m.get("nickname")
+                           or (m.get("user_id") or "?")[:8], is_ai(m))
             for m in room.get("members", [])}
 
 
@@ -1913,11 +1998,22 @@ def cmd_request_approval(args):
                "canon": base64.b64encode(canon).decode(), "text": fallback}
     try:
         asyncio.run(do_send(creds, args.room, fallback, payload=payload))
-    except SystemExit:
+    except (SystemExit, Exception):
         # A pending row with no card in the room is the orphan §2-2
-        # forbids — take the request back before dying
-        rest("POST", f"/v1/approvals/{approval_id}/revoke", {},
-             creds["access_token"])
+        # forbids — take the request back before dying. SendRejected and
+        # transport errors must land here too, and the revocation itself
+        # must be confirmed, not assumed.
+        try:
+            revoke_status, _ = rest(
+                "POST", f"/v1/approvals/{approval_id}/revoke", {},
+                creds["access_token"])
+        except SystemExit:
+            sys.exit(f"card send failed — could not confirm revocation of"
+                     f" approval {approval_id}; check it with"
+                     f" `klatalk approval {approval_id}`")
+        if revoke_status >= 300:
+            sys.exit(f"card send failed — approval {approval_id} may still"
+                     " be pending; revoke it before retrying")
         sys.exit("card send failed — the approval request was revoked")
     print(json.dumps({"approval_id": approval_id,
                       "status": data.get("status"),
@@ -2130,14 +2226,19 @@ def cmd_wait(args):
     was Claude-Monitor-specific."""
     profile = profile_name(args)
     creds = load_creds(profile)
-    room = get_room(creds, args.room, strict=False)
+    # Strict lookup — this gates on sealed-ness, and a failed lookup read
+    # as "plain, after 0" would replay the whole history as fresh events
+    # (fail-open). Unknown room = refuse, don't guess.
+    room = get_room(creds, args.room)
+    if room is None:
+        sys.exit("not a member of that room")
     sealed = is_sealed(room)
     after = args.after_seq
     if after is None:
-        after = (room or {}).get("last_seq") or 0
+        after = room.get("last_seq") or 0
     deadline = time.time() + args.timeout if args.timeout else None
     delay = 2
-    who = member_who(room or {})
+    who = member_who(room)
     while True:
         if sealed:
             recs = [r for r in
@@ -2168,9 +2269,12 @@ def cmd_wait(args):
 
 
 def cmd_listen(args):
+    # The inbox is derived from the profile, never an argument — a flag
+    # could point one profile's room at another profile's inbox, and the
+    # skill's isolation rule would be words the CLI does not enforce
     profile = profile_name(args)
     creds = load_creds(profile)
-    asyncio.run(do_listen(creds, args.room, args.inbox or inbox_path(profile),
+    asyncio.run(do_listen(creds, args.room, inbox_path(profile),
                           profile=profile))
 
 
@@ -2193,13 +2297,22 @@ def cmd_fetch(args):
     out = args.out
     if not out or out.startswith(".") or os.sep in out:
         sys.exit("specify the output filename with -o")
+    # Symlinks are refused outright — with --force an O_TRUNC through a
+    # planted link would overwrite whatever it points at; a BROKEN link
+    # even slips past exists(). lexists sees both. Still credential-free:
+    # pure local checks.
+    if os.path.islink(out):
+        sys.exit(f"refusing symbolic-link output: {out}")
+    if os.path.lexists(out) and not args.force:
+        sys.exit(f"{out} already exists — pass another name with -o, or --force")
     creds = load_creds(profile_name(args))
     url = api_url(path)  # send exactly what was validated
-    if os.path.exists(out) and not args.force:
-        sys.exit(f"{out} already exists — pass another name with -o, or --force")
     req = urllib.request.Request(url)
     req.add_header("Authorization", f"Bearer {creds['access_token']}")
-    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= os.O_TRUNC if args.force else os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)   # belt to the islink suspenders
+    fd = os.open(out, flags, 0o600)
     with OPENER.open(req, timeout=60) as resp, os.fdopen(fd, "wb") as f:
         shutil.copyfileobj(resp, f)     # never buffer a large attachment whole
     print(out)
@@ -2299,7 +2412,7 @@ def build_parser():
                         " last_seq — i.e. only genuinely new ones)")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after N seconds (exit 3)")
-    s = add("listen", cmd_listen); s.add_argument("room"); s.add_argument("--inbox")
+    s = add("listen", cmd_listen); s.add_argument("room")
     s = add("fetch", cmd_fetch); s.add_argument("url")
     s.add_argument("-o", "--out"); s.add_argument("--force", action="store_true")
     return p
