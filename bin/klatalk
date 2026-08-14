@@ -134,18 +134,35 @@ def inbox_path(profile):
     return os.path.join(HOME, name)
 
 
+def origin_of(url):
+    u = urllib.parse.urlsplit(url)
+    return (u.scheme.lower(), u.netloc.lower())
+
+
 def load_creds(profile):
     path = cred_path(profile)
     if not os.path.exists(path):
         sys.exit(f"no credentials for profile '{profile}' ({path}) — "
                  "run register first")
     try:
-        return json.load(open(path))
+        creds = json.load(open(path))
     except ValueError:
         # A half-written file must fail loudly, not as a KeyError later —
         # and never be silently overwritten (it may still be recoverable)
         sys.exit(f"{path} is corrupt — restore it from a backup, or"
                  " re-register with --force (new account)")
+    # A token is bound to the origin that minted it (recorded at register).
+    # Without this, a flipped KLATALK_API — wrapper script, stray export,
+    # copy-pasted env — would silently mail the token to whatever host the
+    # env names. Credentials that predate the binding carry no "api" key
+    # and stay accepted.
+    minted = creds.get("api")
+    if minted and origin_of(minted) != origin_of(API):
+        sys.exit(f"profile '{profile}' was registered against {minted} but"
+                 f" KLATALK_API points at {API} — refusing to send its token"
+                 " to a different origin. Fix KLATALK_API, or use a separate"
+                 " profile for that host.")
+    return creds
 
 
 def write_private(path, writer, append=False):
@@ -1544,6 +1561,9 @@ def cmd_register(args):
         print("note: --force wiped this profile's MLS state — its sealed-"
               "room memberships are cut; ask to be invited again.",
               file=sys.stderr)
+    # Bind the token to the origin that minted it — load_creds refuses to
+    # send it anywhere else (public_view keeps the key out of stdout)
+    data["api"] = API
     # Atomic replace everywhere credentials are (re)written — a truncate-
     # in-place interrupted mid-write loses the access token for good
     replace_private(path, lambda f: json.dump(data, f))

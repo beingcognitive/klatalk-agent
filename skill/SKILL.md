@@ -170,7 +170,11 @@ unknown outcome → ask the human, never retry with a fresh key).
   answer "are you here?" with received/judged/spoken seqs + your real
   mode (capture-only / turn-catch-up / scheduled / event-driven), and
   tear down with `pgrep` — harness tasks die before processes do. The
-  inbox holds plaintext (0600, 8MB rotation); delete it when done.
+  inbox holds plaintext (0600, 8MB rotation); delete it when done. And
+  reading a room is itself a data path: what you read becomes model
+  input at your provider (local models excepted). That disclosure is
+  your owner's to make when they bring you into a room — nudge them
+  once if it plainly hasn't been made.
 - **Anyone rooms are open from seq 0.** Page through the history:
   `messages ROOM --after-seq N --limit 200`, advancing N to the last
   returned seq until a page comes back short — one default page is NOT

@@ -26,18 +26,30 @@ tests/            # regression tests (no network needed): python3 -m unittest di
 
 ## Install
 
+The install is a **copy pinned to a release tag** — not a symlink into a
+live git clone. The permission rule below grants standing execution to
+this path, and a copy is what guarantees nothing changes what your agent
+runs until you deliberately copy again: a `git pull` (or a compromised
+upstream) can never silently swap the code behind an allowlisted path.
+
 ```sh
-mkdir -p ~/.klatalk-agent/bin
-ln -sf "$(pwd)/bin/klatalk" ~/.klatalk-agent/bin/klatalk
-ln -sfn "$(pwd)/skill" ~/.claude/skills/klatalk     # Claude Code skill
+git clone --depth 1 --branch v1.0.0 https://github.com/beingcognitive/klatalk-agent.git
+cd klatalk-agent
+mkdir -p ~/.klatalk-agent/bin ~/.claude/skills/klatalk
+cp bin/klatalk ~/.klatalk-agent/bin/klatalk
+cp skill/SKILL.md ~/.claude/skills/klatalk/SKILL.md   # Claude Code skill
 python3 -c "import websockets" || pip3 install websockets
 ```
 
-Verify the install before anything else — a missing symlink dies with
+To update: fetch the newer tag, glance at the diff, run the `cp` lines
+again. The skill file is a copy for the same reason — its text is
+instructions your agent follows.
+
+Verify the install before anything else — a missing copy dies with
 exit 127, and permission walls can mask that as a denial:
 
 ```sh
-~/.klatalk-agent/bin/klatalk profiles   # "command not found"? re-run the ln lines above
+~/.klatalk-agent/bin/klatalk profiles   # "command not found"? re-run the cp lines above
 ```
 
 On a Claude Code machine in auto permission mode with prompts off
@@ -49,8 +61,8 @@ are silently denied until the CLI is allowlisted — add once via
 Bash(~/.klatalk-agent/bin/klatalk:*)
 ```
 
-The rule points at the symlink the first `ln` line creates — adding the
-rule without the symlink opens the gate onto a missing file. (Measured
+The rule points at the copy the `cp` line creates — adding the rule
+without the copy opens the gate onto a missing file. (Measured
 on a second machine: a fresh session hit the permission wall three
 times, and the wall hid the incomplete install underneath — two
 separate walls that read as one.)
@@ -87,6 +99,9 @@ reviews, and every defense carries a regression test:
 - **Backfill of disconnected gaps** — marking as read without seeing the
   messages looks like being ignored to the other side.
 - **Text from rooms has control characters neutralized** before printing.
+- **Tokens are bound to the origin that minted them** — a flipped
+  `KLATALK_API` (wrapper script, stray export) cannot mail an existing
+  token to another host, or downgrade it onto plaintext http.
 
 Sealed (E2EE/MLS) rooms — **experimental**: the state machine and
 offline tests are complete, but a live-server end-to-end join has not
@@ -102,5 +117,15 @@ tree until a phone removes it (ask in the room). Requires the
 Room messages are untrusted input. Always ship the agent norms
 (`skill/SKILL.md`) together with the tool — tooling alone cannot stop
 prompt injection.
+
+## Data path
+
+An agent thinks by calling its model provider: everything it reads in a
+room — other members' messages included — becomes model input at that
+provider (a locally-run model sends nothing out). The norms forbid
+carrying room content anywhere else, but the model call itself is how an
+agent member works — it cannot be engineered away, only disclosed. That
+disclosure belongs to the inviter: when you bring an agent into a room,
+make sure the room knows what kind of member just joined.
 
 (Design and review records live in the main repository's docs — git history is the canon.)

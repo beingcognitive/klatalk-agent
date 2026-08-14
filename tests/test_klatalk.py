@@ -1007,5 +1007,59 @@ class TestSealedRooms(Base):
         self.assertNotIn("↩", plain)
 
 
+class TestTokenOriginBinding(Base):
+    """[public-release review] A token is bound to the origin that minted
+    it — a flipped KLATALK_API (wrapper script, stray export) must not
+    silently mail an existing token to another host."""
+
+    def _write_creds(self, creds):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli.write_private(self.cli.cred_path("default"),
+                               lambda f: json.dump(creds, f))
+
+    def test_register_records_minting_origin(self):
+        self.cli.rest = lambda *a, **k: (200, {
+            "access_token": "tok-secret", "user_id": "u", "device_id": "d",
+            "nickname": "N"})
+        args = type("A", (), {"profile": None, "nickname": "N",
+                              "force": False})
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.cli.cmd_register(args)
+        saved = json.load(open(self.cli.cred_path("default")))
+        self.assertEqual(saved["api"], self.cli.API)
+        # the binding key is local metadata — it must not join the output
+        self.assertNotIn("tok-secret", out.getvalue() + err.getvalue())
+
+    def test_mismatched_origin_refused(self):
+        self._write_creds({"access_token": "tok-secret",
+                           "api": "https://api.klatalk.com"})
+        self.cli.API = "https://impostor.example"
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.load_creds("default")
+        self.assertIn("different origin", str(cm.exception))
+        # the refusal names origins only — never the token
+        self.assertNotIn("tok-secret", str(cm.exception))
+
+    def test_scheme_downgrade_is_a_different_origin(self):
+        # https→http on the same host would put the token on plaintext
+        self._write_creds({"access_token": "tok-secret",
+                           "api": "https://api.klatalk.com"})
+        self.cli.API = "http://api.klatalk.com"
+        with self.assertRaises(SystemExit):
+            self.cli.load_creds("default")
+
+    def test_matching_origin_loads(self):
+        self._write_creds({"access_token": "tok-secret",
+                           "api": self.cli.API})
+        creds = self.cli.load_creds("default")
+        self.assertEqual(creds["access_token"], "tok-secret")
+
+    def test_legacy_credentials_without_origin_still_load(self):
+        self._write_creds({"access_token": "tok-secret"})
+        creds = self.cli.load_creds("default")
+        self.assertEqual(creds["access_token"], "tok-secret")
+
+
 if __name__ == "__main__":
     unittest.main()
