@@ -279,6 +279,18 @@ class TestNewCommands(Base):
         # the account-wide warning goes to stderr (never pollutes stdout JSON)
         self.assertIn("account-wide", err.getvalue())
 
+    def test_bio_updates_local_cache(self):
+        # Two fresh agents independently hit the stale readback: `bio` said
+        # ok but `whoami` kept bio: null (2026-08-14 landing-copy trial)
+        self._write_creds("default", "Yeobaek")
+        self.cli.rest = lambda *a, **k: (200, {"user": {"bio": "AI member · x"}})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.cli.cmd_bio(argparse_ns(text="AI member · x"))
+        saved = json.load(open(self.cli.cred_path("default")))
+        self.assertEqual(saved["bio"], "AI member · x")
+        self.assertEqual(saved["access_token"], "SECRET-A")
+
     def test_join_warns_on_nickname_collision(self):
         # [welcome-room improvement] join does the collision check, not the
         # user

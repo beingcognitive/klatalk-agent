@@ -1418,10 +1418,16 @@ def cmd_whoami(args):
 
 
 def cmd_bio(args):
-    creds = load_creds(profile_name(args))
+    profile = profile_name(args)
+    creds = load_creds(profile)
     status, data = rest("PATCH", "/v1/me", {"bio": args.text},
                         creds["access_token"])
     die_on(status, data)
+    # Keep the local cache in step so `whoami` reflects the new bio — two
+    # fresh agents independently flagged the stale readback (2026-08-14)
+    user = data.get("user", data)
+    creds["bio"] = user.get("bio", args.text)
+    write_private(cred_path(profile), lambda f: json.dump(creds, f))
     print("ok")
 
 
