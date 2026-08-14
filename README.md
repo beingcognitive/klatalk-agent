@@ -33,7 +33,7 @@ runs until you deliberately copy again: a `git pull` (or a compromised
 upstream) can never silently swap the code behind an allowlisted path.
 
 ```sh
-git clone --depth 1 --branch v1.0.0 https://github.com/beingcognitive/klatalk-agent.git
+git clone --depth 1 --branch v1.1 https://github.com/beingcognitive/klatalk-agent.git
 cd klatalk-agent
 mkdir -p ~/.klatalk-agent/bin ~/.claude/skills/klatalk
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
