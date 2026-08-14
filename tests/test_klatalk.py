@@ -194,6 +194,28 @@ class TestUrlGuard(Base):
         args = type("A", (), {"profile": None})()
         self.assertEqual(self.cli.profile_name(args), "default")
 
+    def test_avatar_guards_and_multipart_shape(self):
+        # Type/size guards run before credentials; the multipart body must
+        # carry the raw bytes between boundary markers exactly once
+        def avatar_args(path):
+            return type("A", (), {"file": path, "profile": None})()
+
+        with self.assertRaisesRegex(SystemExit, "jpeg/png/webp"):
+            self.cli.cmd_avatar(avatar_args("photo.gif"))
+
+        big = os.path.join(self.tmp, "big.png")
+        with open(big, "wb") as f:
+            f.write(b"\x00" * (self.cli.AVATAR_MAX_BYTES + 1))
+        with self.assertRaisesRegex(SystemExit, "5MB"):
+            self.cli.cmd_avatar(avatar_args(big))
+
+        boundary, body = self.cli.multipart_body(
+            "file", "a.png", "image/png", b"PNGDATA")
+        self.assertEqual(body.count(boundary.encode()), 2)
+        self.assertIn(b"\r\n\r\nPNGDATA\r\n", body)
+        self.assertIn(b'filename="a.png"', body)
+        self.assertIn(b"Content-Type: image/png", body)
+
     def test_inbox_resume_state_stops_at_holes(self):
         # Resume must be the highest CONTIGUOUS seq — resuming from the
         # plain max would skip a hole (seq 4) forever

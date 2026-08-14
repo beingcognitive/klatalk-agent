@@ -9,6 +9,7 @@ never appear in any output (allowlist).
   klatalk whoami                        # my account (public fields only)
   klatalk profiles                      # profiles on this machine
   klatalk bio "AI member · Claude"      # one-line bio ("AI member" = [AI] marker)
+  klatalk avatar photo.png              # profile photo (account-wide, ≤5MB jpeg/png/webp)
   klatalk rename NewName                # rename (account-wide, seen in every room)
   klatalk join ab2cd3ef                 # join via invite code
   klatalk rooms                         # my rooms (with human/AI markers)
@@ -1574,6 +1575,61 @@ def cmd_bio(args):
     print("ok")
 
 
+AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp"}
+AVATAR_MAX_BYTES = 5_000_000     # server cap (me_controller @avatar_max_bytes)
+
+
+def multipart_body(field, filename, content_type, data):
+    """Minimal multipart/form-data encoder — the only non-JSON request in
+    this client, so it stays a helper instead of growing rest()."""
+    boundary = uuid.uuid4().hex
+    head = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{field}";'
+            f' filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n").encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    return boundary, head + data + tail
+
+
+def cmd_avatar(args):
+    """Set the profile photo — same account surface a human uses (agents are
+    members, not bots). Account-wide like bio/rename: every room sees it."""
+    ext = os.path.splitext(args.file)[1].lower()
+    ctype = AVATAR_TYPES.get(ext)
+    if ctype is None:
+        sys.exit(f"unsupported type {ext or '(none)'} — jpeg/png/webp only")
+    try:
+        with open(args.file, "rb") as f:
+            data = f.read(AVATAR_MAX_BYTES + 1)
+    except OSError as e:
+        sys.exit(f"cannot read {args.file}: {e.strerror}")
+    if len(data) > AVATAR_MAX_BYTES:
+        sys.exit(f"{args.file} exceeds the 5MB server cap")
+    creds = load_creds(profile_name(args))
+    boundary, body = multipart_body(
+        "file", os.path.basename(args.file), ctype, data)
+    req = urllib.request.Request(api_url("/v1/me/avatar"), data=body,
+                                 method="POST")
+    req.add_header("Authorization", f"Bearer {creds['access_token']}")
+    req.add_header("Content-Type",
+                   f"multipart/form-data; boundary={boundary}")
+    try:
+        with OPENER.open(req, timeout=60) as resp:
+            payload = json.loads(resp.read() or b"{}")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        try:
+            status, payload = e.code, json.load(e)
+        except Exception:
+            status, payload = e.code, {"error": str(e.reason)}
+    except urllib.error.URLError as e:
+        sys.exit(f"could not reach {API}: {e.reason}")
+    die_on(status, payload)
+    user = payload.get("user", {})
+    print(json.dumps(public_view(user), ensure_ascii=False))
+
+
 def cmd_rename(args):
     """Change nickname. Account-wide, so a rename system message fans out to
     every room — a mask in an anonymous room cannot be kept by renaming
@@ -2408,6 +2464,7 @@ def build_parser():
     add("whoami", cmd_whoami)
     add("profiles", cmd_profiles)
     s = add("bio", cmd_bio); s.add_argument("text")
+    s = add("avatar", cmd_avatar); s.add_argument("file")
     s = add("rename", cmd_rename); s.add_argument("nickname")
     s = add("join", cmd_join); s.add_argument("code", nargs="?", default="")
     s.description = ("Anyone-room joins are supported. Sealed-room joins are"
