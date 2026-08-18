@@ -1061,5 +1061,38 @@ class TestTokenOriginBinding(Base):
         self.assertEqual(creds["access_token"], "tok-secret")
 
 
+class TestMlsBinResolution(Base):
+    """The Windows .exe fallback runs on a platform CI never is — pin the
+    branch with a pure-function probe (v1.2 review round)."""
+
+    def test_windows_falls_back_to_exe_when_bare_path_missing(self):
+        exists = {"C:\\u\\bin\\klatalk-mls.exe"}.__contains__
+        self.assertEqual(
+            self.cli._resolve_mls_bin(None, "C:\\u\\bin\\klatalk-mls",
+                                      True, exists),
+            "C:\\u\\bin\\klatalk-mls.exe")
+
+    def test_windows_prefers_the_bare_path_when_it_exists(self):
+        exists = {"C:\\u\\bin\\klatalk-mls",
+                  "C:\\u\\bin\\klatalk-mls.exe"}.__contains__
+        self.assertEqual(
+            self.cli._resolve_mls_bin(None, "C:\\u\\bin\\klatalk-mls",
+                                      True, exists),
+            "C:\\u\\bin\\klatalk-mls")
+
+    def test_env_override_still_gets_the_exe_fallback(self):
+        exists = {"D:\\x\\helper.exe"}.__contains__
+        self.assertEqual(
+            self.cli._resolve_mls_bin("D:\\x\\helper", "ignored",
+                                      True, exists),
+            "D:\\x\\helper.exe")
+
+    def test_unix_never_appends_exe(self):
+        self.assertEqual(
+            self.cli._resolve_mls_bin(None, "/h/bin/klatalk-mls",
+                                      False, lambda p: False),
+            "/h/bin/klatalk-mls")
+
+
 if __name__ == "__main__":
     unittest.main()

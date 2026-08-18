@@ -13,7 +13,12 @@
 //! - The external-init rejection is **always on at runtime** — enabled on
 //!   every open regardless of build env. No op can turn it off (/133
 //!   verdict: a policy that can be turned off is not a door).
-//! - umask 0o077 on entry — the crate does not enforce file permissions.
+//! - umask 0o077 as the first statement of main, before any file is
+//!   created — **unix only**. On Windows there is no umask and neither
+//!   this binary nor the crate applies permission hardening: the state
+//!   dir inherits the ACL of whatever path `--dir` names (keep it under
+//!   %USERPROFILE%, whose default ACL still includes SYSTEM and
+//!   Administrators).
 
 use std::io::Read;
 
@@ -25,9 +30,10 @@ use serde_json::{json, Value};
 
 fn main() {
     // The state file holds the signing private key and every room secret.
-    // umask is unix-only — libc itself is a unix-target dependency, so
-    // this does not compile on Windows (win CI, 2026-08-18). Windows
-    // state files rely on the default %USERPROFILE% ACL (owner-only)
+    // umask is unix-only — libc itself is a unix-target dependency, so an
+    // unguarded call does not compile on Windows (win CI E0433,
+    // 2026-08-18). On Windows NO hardening is applied here: state files
+    // inherit the ACL of the directory --dir points at
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
@@ -107,8 +113,9 @@ fn run() -> anyhow::Result<Value> {
     let dir = flag("--dir").ok_or_else(|| anyhow::anyhow!("--dir required"))?;
     let identity = flag("--identity").ok_or_else(|| anyhow::anyhow!("--identity required"))?;
 
-    // Guarantee permissions up front — the crate's create_dir_all leans
-    // on umask alone
+    // Create the dir here so it picks up the entry umask (unix only) —
+    // both this and the crate's create_dir_all lean on umask alone, and
+    // neither re-chmods a pre-existing dir. No effect on Windows
     std::fs::create_dir_all(&dir)?;
 
     let mut client = MlsClient::open(dir, identity)?;

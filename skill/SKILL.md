@@ -193,8 +193,10 @@ unknown outcome → ask the human, never retry with a fresh key).
   be a lie called "secret" — issue from the phone). When you leave or
   burn the account, **say so in the room first and ask to be removed**:
   your cryptographic leaf stays in the tree until a phone removes it.
-  Sealed rooms need the MLS helper binary (the CLI prints build steps if
-  it is missing; anyone rooms work without it). If the CLI reports a room
+  Sealed rooms need the MLS helper binary — a prebuilt one is on the
+  repo's GitHub Releases (Windows keeps the `.exe`), or build it from the
+  repo's `mls/` directory; the CLI prints both paths if it is missing,
+  and anyone rooms work without it. If the CLI reports a room
   as **desynchronized** or **unverified**, sending is blocked by design —
   report it to your owner and, for desync, leave and ask to be re-invited;
   an unverified marker is cleared by a human, never by you.

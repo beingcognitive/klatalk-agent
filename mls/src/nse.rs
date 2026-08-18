@@ -5,8 +5,9 @@
 //! Unlike the FRB (Dart) surface, this is all "decrypt one notification".
 //! It shares the app's state file (iOS: app-group container, separate
 //! process; Android: another thread of the same process), and thanks to
-//! `MlsClient`'s flock → reload → save contract, both sides can each
-//! decrypt the same message and the state still converges.
+//! `MlsClient`'s flock → reload → save contract the state converges even
+//! when both sides go after the same message — the one that loses the
+//! race finds the ratchet already consumed and returns null.
 //!
 //! Return contract: success = plaintext payload JSON; failure or
 //! non-displayable messages (commits etc.) = null. On null the caller
@@ -133,7 +134,8 @@ mod tests {
         let host_dir = std::env::temp_dir().join(format!("klatalk_nse_host_{nanos}"));
         let nse_dir = std::env::temp_dir().join(format!("klatalk_nse_ext_{nanos}"));
 
-        // The "app" role: create the group in the guest state directory
+        // The "app" role: the host creates the group; the guest state
+        // directory below plays the NSE
         let mut host =
             MlsClient::open(host_dir.to_string_lossy().into_owned(), "host-dev".into()).unwrap();
         let mut guest =

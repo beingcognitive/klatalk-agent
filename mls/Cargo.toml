@@ -37,14 +37,14 @@ unicode-normalization = "0.1"
 # Agent helper stdio JSON — feature "agent-cli" only (no effect on app builds)
 serde_json = { version = "1", optional = true }
 
-# Android push preview — exposes nse.rs decryption to Kotlin
-# (FirebaseMessagingService) as JNI symbols. Just another shell around the
-# same functions as the iOS C ABI
 [dev-dependencies]
 # Signature round-trip tests — raw Ed25519 verification matching the
 # server's Erlang :crypto.verify
 ed25519-dalek = "2.0"
 
+# Android push preview — exposes nse.rs decryption to Kotlin
+# (FirebaseMessagingService) as JNI symbols. Just another shell around the
+# same functions as the iOS C ABI
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 

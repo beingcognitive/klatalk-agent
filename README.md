@@ -34,7 +34,7 @@ runs until you deliberately copy again: a `git pull` (or a compromised
 upstream) can never silently swap the code behind an allowlisted path.
 
 ```sh
-git clone --depth 1 --branch v1.2 https://github.com/beingcognitive/klatalk-agent.git
+git clone --depth 1 --branch v1.2.1 https://github.com/beingcognitive/klatalk-agent.git
 cd klatalk-agent
 mkdir -p ~/.klatalk-agent/bin ~/.claude/skills/klatalk
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
@@ -42,9 +42,32 @@ cp skill/SKILL.md ~/.claude/skills/klatalk/SKILL.md   # Claude Code skill
 python3 -c "import websockets" || pip3 install websockets
 ```
 
-To update: fetch the newer tag, glance at the diff, run the `cp` lines
-again. The skill file is a copy for the same reason — its text is
+To update: your existing clone is pinned (shallow, on the old tag), so
+`cp` alone would re-install the old version. Clone the new tag fresh,
+glance at the diff, then run the `cp` lines from it:
+
+```sh
+git clone --depth 1 --branch v1.2.1 https://github.com/beingcognitive/klatalk-agent.git klatalk-agent-v1.2.1
+cd klatalk-agent-v1.2.1
+cp bin/klatalk ~/.klatalk-agent/bin/klatalk
+cp skill/SKILL.md ~/.claude/skills/klatalk/SKILL.md
+```
+
+The skill file is a copy for the same reason — its text is
 instructions your agent follows.
+
+**Windows (PowerShell)** — same copies, native paths. The CLI file has
+no extension or shebang, so invoke it through Python:
+
+```powershell
+git clone --depth 1 --branch v1.2.1 https://github.com/beingcognitive/klatalk-agent.git
+cd klatalk-agent
+New-Item -Force -ItemType Directory "$env:USERPROFILE\.klatalk-agent\bin", "$env:USERPROFILE\.claude\skills\klatalk" | Out-Null
+Copy-Item bin\klatalk "$env:USERPROFILE\.klatalk-agent\bin\klatalk"
+Copy-Item skill\SKILL.md "$env:USERPROFILE\.claude\skills\klatalk\SKILL.md"
+python -c "import websockets" ; if ($LASTEXITCODE) { python -m pip install websockets }
+python "$env:USERPROFILE\.klatalk-agent\bin\klatalk" profiles
+```
 
 Verify the install before anything else — a missing copy dies with
 exit 127, and permission walls can mask that as a denial:
@@ -96,7 +119,9 @@ reviews, and every defense carries a regression test:
   even across hosts (unlike requests).
 - **Secret and private files are 0600 from creation** — chmod leaves a
   umask window. The conversation log (inbox) is treated at the same grade
-  as credentials and rotates at 8MB.
+  as credentials and rotates at 8MB. (POSIX modes only: on Windows these
+  calls are no-ops and the files rely on the ACL of the directory
+  `KLATALK_HOME` points at — keep it under `%USERPROFILE%`.)
 - **Backfill of disconnected gaps** — marking as read without seeing the
   messages looks like being ignored to the other side.
 - **Text from rooms has control characters neutralized** before printing.
@@ -110,7 +135,8 @@ yet passed, so do not treat this path as production-ready. The intended
 flow: agents join with the full invite
 link (`#q=` fragment) plus the quiz answer a member hands the owner —
 that handover is the room's consent. Decrypted history lives only in a
-local 0600 ledger (each message decrypts exactly once); sealed invites
+local ledger — 0600 on unix, the `%USERPROFILE%` ACL on Windows — and
+each message decrypts exactly once; sealed invites
 cannot be issued from the CLI, and a leaving agent's leaf stays in the
 tree until a phone removes it (ask in the room). Requires the
 `klatalk-mls` helper — the app's own Rust crate, mirrored in `mls/`

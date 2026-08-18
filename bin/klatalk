@@ -466,12 +466,18 @@ def inbox_resume_state(inbox, room_id):
 # The helper's built-in cursor commits decrypt + progress in one atomic
 # state write; receipts survive until we fsync the local ledger and ack.
 
-MLS_BIN = os.environ.get("KLATALK_MLS_BIN",
-                         os.path.join(HOME, "bin", "klatalk-mls"))
-# Windows: the release artifact carries .exe — find it without ceremony
-if os.name == "nt" and not os.path.exists(MLS_BIN) \
-        and os.path.exists(MLS_BIN + ".exe"):
-    MLS_BIN += ".exe"
+def _resolve_mls_bin(env_value, default_path, is_windows, exists):
+    # Windows: the release artifact carries .exe — find it without
+    # ceremony. Split out so the branch is testable off-Windows.
+    path = env_value or default_path
+    if is_windows and not exists(path) and exists(path + ".exe"):
+        path += ".exe"
+    return path
+
+
+MLS_BIN = _resolve_mls_bin(os.environ.get("KLATALK_MLS_BIN"),
+                           os.path.join(HOME, "bin", "klatalk-mls"),
+                           os.name == "nt", os.path.exists)
 QUIZ_FRAGMENT = re.compile(r"#q=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)")
 # Codes are lowercase base32 server-side, but pasted links arrive
 # auto-capitalized (mail clients, phone keyboards) — match loosely,
@@ -540,14 +546,17 @@ def b64url_decode(s):
 
 def mls_op(creds, profile, op, payload=None):
     if not os.path.exists(MLS_BIN):
+        want = MLS_BIN
+        if os.name == "nt" and not want.lower().endswith(".exe"):
+            want += ".exe"
         sys.exit("MLS helper missing — sealed rooms need it. Download a\n"
-                 "prebuilt binary from this repo's GitHub Releases into\n"
-                 f"{MLS_BIN}\n"
-                 "(Windows: keep the .exe suffix), or build from source:\n"
-                 "  cd <klatalk-agent>/mls\n"
-                 "  KLATALK_MLS_GIT=$(git rev-parse --short HEAD) \\\n"
-                 "    cargo build --release --features agent-cli\n"
-                 f"  cp target/release/klatalk-mls {MLS_BIN}\n"
+                 "prebuilt binary from\n"
+                 "  https://github.com/beingcognitive/klatalk-agent/releases\n"
+                 "and save it as\n"
+                 f"  {os.path.normpath(want)}\n"
+                 "or build it from the repo's mls/ directory — steps in\n"
+                 "mls/README.md (needs Rust 1.89+ and a C compiler).\n"
+                 "KLATALK_MLS_BIN overrides the path.\n"
                  "(plain rooms keep working without it)")
     global _MLS_VERSION_SHOWN
     if not _MLS_VERSION_SHOWN and op != "version":
@@ -572,6 +581,10 @@ def mls_op(creds, profile, op, payload=None):
     except subprocess.TimeoutExpired:
         raise MlsError(f"helper timed out after 60s (op {op}) — another"
                        " process may be holding the state lock")
+    except OSError as e:
+        # A path that exists but cannot execute (wrong arch, missing
+        # .exe on Windows) must not surface as a raw traceback
+        raise MlsError(f"cannot run the helper at {MLS_BIN}: {e}")
     try:
         out = json.loads(r.stdout.strip() or "{}")
     except ValueError:

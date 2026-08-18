@@ -174,7 +174,10 @@ pub struct MlsClient {
     credential_with_key: CredentialWithKey,
     /// The §8-4 cutover gate — when on, ExternalInit (external join)
     /// commits are rejected. Not persisted in the state file: policy is
-    /// decided by the app version (default off = dark).
+    /// decided by the app version. The source default is off only so
+    /// tests and the agent helper state the policy explicitly — shipping
+    /// app builds compile with KLATALK_REJECT_EXTERNAL_JOINS=1 (release
+    /// build script), and the agent helper forces it on at runtime.
     reject_external_init: bool,
 }
 
@@ -350,9 +353,10 @@ impl MlsClient {
         })
     }
 
-    /// Creates a room — group_id is our room UUID bytes. Returns the
-    /// signed GroupInfo (PUT to the server as the ticket for external
-    /// commit joins).
+    /// Creates a room — group_id is the UTF-8 bytes of the room_id
+    /// string (not the UUID's raw 16 bytes). Returns the signed
+    /// GroupInfo (PUT to the server as the ticket for external commit
+    /// joins).
     pub fn create_group(&mut self, group_id: Vec<u8>) -> Result<Vec<u8>> {
         self.locked(|c| {
             let group = MlsGroup::new_with_group_id(
@@ -421,8 +425,9 @@ impl MlsClient {
     /// merge_pending; if it rejects (stale_epoch etc.), clear_pending —
     /// locally merging a commit that was never relayed forks us from the
     /// room (§8-4: the client half of the server's atomic relay).
-    /// Any pending commit left from before is cleared (crash-residue
-    /// self-healing).
+    /// An existing pending commit is rejected — session-start recovery
+    /// must clear it explicitly, so this operation can never merge
+    /// another operation's staged commit.
     pub fn add_member(&mut self, group_id: Vec<u8>, key_package: Vec<u8>) -> Result<AddOutcome> {
         self.locked(|c| {
             let kp_in = KeyPackageIn::tls_deserialize_exact(key_package.as_slice())
@@ -666,7 +671,7 @@ impl MlsClient {
     /// acceptance, clear_pending on rejection — the same two-phase as
     /// add_member). Leaving, kicking, orphan cleanup (spec §3-7), and
     /// stale-leaf cleanup (§4) all take this path. You cannot remove
-    /// yourself (my departure is deleted by a remaining device).
+    /// yourself (my own departure is committed by a remaining device).
     pub fn remove_member(&mut self, group_id: Vec<u8>, identity: String) -> Result<RemoveOutcome> {
         self.locked(|c| {
             let mut group = c.load_group(&group_id)?;
@@ -1708,7 +1713,7 @@ mod tests {
         assert!(b.encrypt(room_id.clone(), b"ghost".to_vec()).is_err());
 
         // Removing a nonexistent identity or yourself is an error (my
-        // departure is deleted by a remaining device)
+        // own departure is committed by a remaining device)
         assert!(a
             .remove_member(room_id.clone(), "nobody-device".to_string())
             .is_err());
