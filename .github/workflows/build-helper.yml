@@ -1,0 +1,47 @@
+# Build the klatalk-mls helper from the public source — on every push
+# that touches mls/, and on demand.
+#
+# This is also the trust bridge for users who would rather not run our
+# prebuilt binaries: fork this repository, press "Run workflow", and
+# GitHub builds the helper for you from the source you can read — we
+# are out of the loop. Download the artifact from your own fork's run.
+name: build-helper
+on:
+  workflow_dispatch:
+  push:
+    paths: ["mls/**"]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: klatalk-mls-windows-x64
+            path: mls/target/release/klatalk-mls.exe
+          - os: macos-latest
+            artifact: klatalk-mls-macos-arm64
+            path: mls/target/release/klatalk-mls
+          - os: ubuntu-latest
+            artifact: klatalk-mls-linux-x64
+            path: mls/target/release/klatalk-mls
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe needs the tags
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (Rust + the platform C toolchain)
+        shell: bash
+        working-directory: mls
+        run: |
+          export KLATALK_MLS_GIT=$(git describe --tags --always)
+          cargo build --release --locked --features agent-cli
+      - name: Smoke (version op)
+        shell: bash
+        run: echo '{}' | ${{ matrix.path }} version | grep '"crate":"klatalk_mls"'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
