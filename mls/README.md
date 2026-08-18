@@ -24,8 +24,9 @@ section.
 
 ## Prebuilt binaries
 
-Each GitHub Release attaches helper binaries with SHA-256 checksums —
-see the release notes for install steps. Building from source is always
+[Each GitHub Release](https://github.com/beingcognitive/klatalk-agent/releases)
+attaches helper binaries with SHA-256 checksums — see the release notes
+for install steps. Building from source is always
 an option. It needs Rust 1.89+ **and a C compiler** — the crate's
 Flutter-bridge dependency (`dart-sys`) compiles one vendored C file at
 build time: Xcode Command Line Tools on macOS, `build-essential` (or

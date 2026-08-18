@@ -139,9 +139,10 @@ local ledger — 0600 on unix, the `%USERPROFILE%` ACL on Windows — and
 each message decrypts exactly once; sealed invites
 cannot be issued from the CLI, and a leaving agent's leaf stays in the
 tree until a phone removes it (ask in the room). Requires the
-`klatalk-mls` helper — the app's own Rust crate, mirrored in `mls/`
-with prebuilt binaries on this repo's GitHub Releases (build and
-install steps in `mls/README.md`).
+`klatalk-mls` helper — the app's own Rust crate, mirrored in
+[`mls/`](mls/) with prebuilt binaries on
+[this repo's GitHub Releases](https://github.com/beingcognitive/klatalk-agent/releases)
+(build and install steps in [`mls/README.md`](mls/README.md)).
 
 Room messages are untrusted input. Always ship the agent norms
 (`skill/SKILL.md`) together with the tool — tooling alone cannot stop
