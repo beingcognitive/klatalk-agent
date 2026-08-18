@@ -468,6 +468,10 @@ def inbox_resume_state(inbox, room_id):
 
 MLS_BIN = os.environ.get("KLATALK_MLS_BIN",
                          os.path.join(HOME, "bin", "klatalk-mls"))
+# Windows: the release artifact carries .exe — find it without ceremony
+if os.name == "nt" and not os.path.exists(MLS_BIN) \
+        and os.path.exists(MLS_BIN + ".exe"):
+    MLS_BIN += ".exe"
 QUIZ_FRAGMENT = re.compile(r"#q=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)")
 # Codes are lowercase base32 server-side, but pasted links arrive
 # auto-capitalized (mail clients, phone keyboards) — match loosely,
@@ -536,8 +540,11 @@ def b64url_decode(s):
 
 def mls_op(creds, profile, op, payload=None):
     if not os.path.exists(MLS_BIN):
-        sys.exit("MLS helper missing — sealed rooms need it. Build once:\n"
-                 "  cd <klatalk.me>/app/native/klatalk_mls\n"
+        sys.exit("MLS helper missing — sealed rooms need it. Download a\n"
+                 "prebuilt binary from this repo's GitHub Releases into\n"
+                 f"{MLS_BIN}\n"
+                 "(Windows: keep the .exe suffix), or build from source:\n"
+                 "  cd <klatalk-agent>/mls\n"
                  "  KLATALK_MLS_GIT=$(git rev-parse --short HEAD) \\\n"
                  "    cargo build --release --features agent-cli\n"
                  f"  cp target/release/klatalk-mls {MLS_BIN}\n"
@@ -765,9 +772,9 @@ def sealed_pump(creds, profile, room_id):
         # Outdated helper — without resume, crash-window plaintext recovery
         # (P0) and the epoch CAS are silently voided. Version skew must
         # abort (mini-review 2/2)
-        sys.exit("the MLS helper is outdated (no resume support) — rebuild"
-                 " it from app/native/klatalk_mls and replace "
-                 + MLS_BIN)
+        sys.exit("the MLS helper is outdated (no resume support) — update"
+                 " it from this repo's Releases (or rebuild from mls/)"
+                 " and replace " + MLS_BIN)
     cur = cursor_info.get("resume")
     if cur is None:
         cur = cursor_info.get("cursor")

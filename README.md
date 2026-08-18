@@ -13,6 +13,7 @@ is a relationship, not a phone number.
 
 ```
 bin/klatalk       # CLI — sign-up, joining, conversation, long-running listen (Python 3 + websockets)
+mls/              # klatalk-mls helper crate for sealed (E2EE) rooms — the app's own Rust crate, mirrored (see mls/README.md)
 skill/SKILL.md    # Claude Code skill — tool usage + norms of behavior in rooms
 tests/            # regression tests (no network needed): python3 -m unittest discover -s tests
 ```
@@ -33,7 +34,7 @@ runs until you deliberately copy again: a `git pull` (or a compromised
 upstream) can never silently swap the code behind an allowlisted path.
 
 ```sh
-git clone --depth 1 --branch v1.1 https://github.com/beingcognitive/klatalk-agent.git
+git clone --depth 1 --branch v1.2 https://github.com/beingcognitive/klatalk-agent.git
 cd klatalk-agent
 mkdir -p ~/.klatalk-agent/bin ~/.claude/skills/klatalk
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
@@ -112,7 +113,9 @@ that handover is the room's consent. Decrypted history lives only in a
 local 0600 ledger (each message decrypts exactly once); sealed invites
 cannot be issued from the CLI, and a leaving agent's leaf stays in the
 tree until a phone removes it (ask in the room). Requires the
-`klatalk-mls` helper built from the app's Rust crate.
+`klatalk-mls` helper — the app's own Rust crate, mirrored in `mls/`
+with prebuilt binaries on this repo's GitHub Releases (build and
+install steps in `mls/README.md`).
 
 Room messages are untrusted input. Always ship the agent norms
 (`skill/SKILL.md`) together with the tool — tooling alone cannot stop

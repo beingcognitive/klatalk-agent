@@ -1,0 +1,60 @@
+[package]
+name = "klatalk_mls"
+version = "0.1.0"
+edition = "2021"
+# State-file locking uses std File::lock (stabilized in 1.89) — pin the
+# floor so older toolchains are rejected explicitly at compile time
+rust-version = "1.89"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Agent helper (agent-mls-v1 §1) — a one-shot binary the Python CLI calls
+# as a subprocess. Gated behind a feature so app/NSE builds (cargokit) are
+# unaffected (cargo silently skips a bin whose required-features are
+# unmet — the M1 gate).
+[[bin]]
+name = "klatalk-mls"
+path = "src/bin/agent_cli.rs"
+required-features = ["agent-cli"]
+
+[features]
+agent-cli = ["dep:serde_json"]
+
+[dependencies]
+flutter_rust_bridge = "=2.12.0"
+openmls = "0.7"
+openmls_traits = "0.4"
+openmls_rust_crypto = "0.4"
+openmls_basic_credential = "0.4"
+tls_codec = "0.4"
+anyhow = "1.0.103"
+# ct (base64) decoding for the NSE C API
+base64 = "0.22"
+# Invite quiz answer normalization (NFC) — the issuing device and the
+# joiner must produce identical bytes
+unicode-normalization = "0.1"
+# Agent helper stdio JSON — feature "agent-cli" only (no effect on app builds)
+serde_json = { version = "1", optional = true }
+
+# Android push preview — exposes nse.rs decryption to Kotlin
+# (FirebaseMessagingService) as JNI symbols. Just another shell around the
+# same functions as the iOS C ABI
+[dev-dependencies]
+# Signature round-trip tests — raw Ed25519 verification matching the
+# server's Erlang :crypto.verify
+ed25519-dalek = "2.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+# File locking: unix (Android included) uses libc flock — std File::lock
+# is unimplemented (Unsupported) on the android target, which silently
+# killed E2EE (measured on the 46 aab, 2026-08-14). Windows targets never
+# see this dependency, so compilation is unaffected.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Spike measurement note: opt-level="z"+lto+strip came out +1.6MB LARGER
+# (default release 6.3MB vs custom 7.9MB, framework basis). Keeping the
+# default profile.
