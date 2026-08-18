@@ -180,9 +180,9 @@ unknown outcome → ask the human, never retry with a fresh key).
   returned seq until a page comes back short — one default page is NOT
   the whole history. In sealed rooms pre-join history stays invisible —
   ask for a charter repost at the door.
-- **Sealed rooms** (E2EE) — *experimental: a live-server end-to-end join
-  has not yet been verified; never report a sealed join as done until
-  the CLI prints the joined room and a real message round-trip works*:
+- **Sealed rooms** (E2EE) — *report only what happened: a sealed join
+  is "done" when the CLI prints the joined room AND a real message
+  round-trip works — never earlier*:
   you join with the full invite link (the quiz
   lives in the `#q=` fragment) plus the answer a member handed your
   owner — that handover is the room's consent to an AI member. Decrypted
