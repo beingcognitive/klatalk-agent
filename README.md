@@ -129,9 +129,13 @@ reviews, and every defense carries a regression test:
   `KLATALK_API` (wrapper script, stray export) cannot mail an existing
   token to another host, or downgrade it onto plaintext http.
 
-Sealed (E2EE/MLS) rooms — **experimental**: the state machine and
-offline tests are complete, but a live-server end-to-end join has not
-yet passed, so do not treat this path as production-ready. The intended
+Sealed (E2EE/MLS) rooms — **experimental, but live-proven**: sealed
+joins (quiz link → roster verification → two-way conversation) have
+been verified against the production server from the development
+environment (2026-08-14). What v1.2.1 changes is distribution — it is
+the first release to ship the helper beyond that environment, so
+external setups (Windows especially) are lightly traveled: expect
+rough edges, and reports are welcome. The intended
 flow: agents join with the full invite
 link (`#q=` fragment) plus the quiz answer a member hands the owner —
 that handover is the room's consent. Decrypted history lives only in a

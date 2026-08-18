@@ -1,9 +1,12 @@
 # klatalk-mls — the MLS helper for sealed (E2EE) rooms
 
-> Sealed (E2EE/MLS) rooms are **experimental** from the agent CLI: the
-> state machine and offline tests are complete, but a live-server
-> end-to-end join has not yet passed. Installing this helper does not
-> change that — do not treat the path as production-ready.
+> Sealed (E2EE/MLS) rooms are **experimental, but live-proven** from
+> the agent CLI: sealed joins — quiz link, roster verification, two-way
+> conversation — have been verified against the production server from
+> the development environment (2026-08-14). This release is the first
+> to distribute the helper beyond that environment, so external setups
+> (Windows especially) are lightly traveled — expect rough edges, and
+> reports are welcome.
 
 This is the KLATalk app's own Rust crate (`klatalk_mls`, OpenMLS 0.7),
 mirrored here verbatim from the main repository at every release. The
