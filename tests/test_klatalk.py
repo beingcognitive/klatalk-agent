@@ -1249,6 +1249,48 @@ class TestResidency(Base):
         self.assertIn("late", out.getvalue())
         self.assertNotIn("mine", out.getvalue())
 
+    def test_serve_wakes_on_humans_and_on_ai_that_calls_my_name(self):
+        self._write_creds("default", "Hermes")
+        seen, runs = [], []
+        room = self._room(mine=3, last=3)
+        room["members"].append({"user_id": "bot", "nickname": "Opus",
+                                "bio": "AI member · test"})
+        msgs = [{"seq": 4, "sender_id": "bot",
+                 "content": {"payload": {"type": "text", "text": "hello everyone"}}},
+                {"seq": 5, "sender_id": "bot",
+                 "content": {"payload": {"type": "text", "text": "Hermes, your take?"}}}]
+        self.cli.rest = self._fake_rest(room, msgs, seen)
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertNotIn("hello everyone", runs[0])   # AI chatter: seen, not a wake
+        self.assertIn("Hermes, your take?", runs[0])  # my name called: a wake
+
+    def test_serve_daily_budget_sleeps_instead_of_spending(self):
+        self._write_creds("default", "Hermes")
+        seen, runs, naps = [], [], []
+        msgs = [{"seq": 4, "sender_id": "h",
+                 "content": {"payload": {"type": "text", "text": "one"}}}]
+        self.cli.rest = self._fake_rest(self._room(mine=3, last=3), msgs, seen)
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+
+        def nap(n):
+            naps.append(n)
+            if len(naps) >= 2:
+                raise KeyboardInterrupt        # stop the bench
+        self.cli.time.sleep = nap
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(KeyboardInterrupt):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=None,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=1))
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(naps, [60, 60])
+        self.assertIn("1 turns today", err.getvalue())
+
 
 class TestServeService(Base):
     """`serve --install` writes the service with this shell's PATH and cwd
@@ -1371,6 +1413,12 @@ class TestServeService(Base):
         self.assertFalse(os.path.exists(launcher))
         self.assertEqual([c[:2] for c in calls[-3:]],
                          [["schtasks", "/End"], ["taskkill", "/F"], ["schtasks", "/Delete"]])
+
+    def test_service_argv_carries_wake_and_budget(self):
+        argv = self.cli.service_argv("room-1234-5678", "p", 600, ["claude", "-p"],
+                                     ["--wake-on", "humans", "--max-turns-per-day", "40"])
+        i = argv.index("--")
+        self.assertEqual(argv[i - 4:i], ["--wake-on", "humans", "--max-turns-per-day", "40"])
 
 
 if __name__ == "__main__":
