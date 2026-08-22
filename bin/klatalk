@@ -24,6 +24,7 @@ never appear in any output (allowlist).
   klatalk wait ROOM [--timeout N]       # block until a new message (exit 3 on idle)
   klatalk listen ROOM                   # long-running listen — marks nothing
   klatalk serve ROOM -- CMD             # resident loop: new messages → one headless turn
+  klatalk serve ROOM --install launchd -- CMD   # …as a service (launchd | systemd)
   klatalk fetch /uploads/... -o out.jpg # download an attachment (server paths)
   klatalk bind                          # owner binding — the phone tap signs
   klatalk request-approval ROOM --action …   # float an approval card in the room
@@ -2517,6 +2518,130 @@ def run_turn(cmd, prompt, timeout):
     return proc.returncode
 
 
+def service_label(room_id, profile):
+    return f"com.klatalk.serve.{room_id[:8]}.{profile}"
+
+
+def service_argv(room_id, profile, turn_timeout, cmd):
+    """The serve command line a service runs — the interpreter and this
+    file by absolute path (a service has no shell, no PATH, no cwd)."""
+    argv = [sys.executable, os.path.abspath(__file__), "serve", room_id,
+            "--profile", profile, "--turn-timeout", f"{turn_timeout:g}",
+            "--"] + list(cmd)
+    return argv
+
+
+def service_env():
+    """What the turn needs from the installing shell: PATH (the agent CLI
+    lives in nvm/uv/brew paths a service never sees) and the klatalk
+    knobs, captured now so the service and this shell agree."""
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+           "HOME": os.path.expanduser("~")}
+    for k in ("KLATALK_HOME", "KLATALK_API", "KLATALK_MLS_BIN", "LANG"):
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    return env
+
+
+def launchd_plist(label, argv, env, cwd, log):
+    from xml.sax.saxutils import escape as x
+    args = "".join(f"\n      <string>{x(a)}</string>" for a in argv)
+    envs = "".join(f"\n      <key>{x(k)}</key><string>{x(v)}</string>"
+                   for k, v in env.items())
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{x(label)}</string>
+  <key>ProgramArguments</key>
+  <array>{args}
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>{envs}
+  </dict>
+  <key>WorkingDirectory</key><string>{x(cwd)}</string>
+  <key>StandardOutPath</key><string>{x(log)}</string>
+  <key>StandardErrorPath</key><string>{x(log)}</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+</dict>
+</plist>
+"""
+
+
+def systemd_unit(label, argv, env, cwd):
+    import shlex
+    envs = "".join(f"Environment={shlex.quote(k + '=' + v)}\n"
+                   for k, v in env.items())
+    return (f"[Unit]\nDescription=klatalk serve ({label})\n\n[Service]\n"
+            f"ExecStart={' '.join(shlex.quote(a) for a in argv)}\n"
+            f"WorkingDirectory={cwd}\n{envs}"
+            "Restart=always\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n")
+
+
+def serve_install(kind, room_id, profile, turn_timeout, cmd):
+    """Register serve as a user service so the seat outlives every turn
+    and every terminal: launchd (macOS) or systemd --user (Linux). The
+    plist/unit carries this shell's PATH and cwd — the two things agents
+    got wrong when writing one by hand."""
+    label = service_label(room_id, profile)
+    argv = service_argv(room_id, profile, turn_timeout, cmd)
+    env = service_env()
+    cwd = os.getcwd()
+    os.makedirs(HOME, mode=0o700, exist_ok=True)
+    log = os.path.join(HOME, f"serve-{room_id[:8]}-{profile}.log")
+    if kind == "launchd":
+        path = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(launchd_plist(label, argv, env, cwd, log))
+        dom = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", dom, path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        r = subprocess.run(["launchctl", "bootstrap", dom, path])
+        if r.returncode != 0:
+            sys.exit(f"launchctl bootstrap failed ({r.returncode}) — plist at {path}")
+        status = f"launchctl print {dom}/{label} | head -20"
+    elif kind == "systemd":
+        path = os.path.expanduser(f"~/.config/systemd/user/{label}.service")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(systemd_unit(label, argv, env, cwd))
+        for step in (["systemctl", "--user", "daemon-reload"],
+                     ["systemctl", "--user", "enable", "--now", label]):
+            r = subprocess.run(step)
+            if r.returncode != 0:
+                sys.exit(f"{' '.join(step)} failed ({r.returncode}) — unit at {path}")
+        status = f"systemctl --user status {label}"
+    else:
+        sys.exit("--install takes launchd (macOS) or systemd (Linux)")
+    print(f"installed {label}\n  service: {path}\n  log:     {log}\n"
+          f"  status:  {status}\n  remove:  klatalk serve {room_id}"
+          f" --profile {profile} --uninstall {kind}\n"
+          "now ask your owner for a test message — the reply that lands"
+          " through this service is what makes you resident")
+
+
+def serve_uninstall(kind, room_id, profile):
+    label = service_label(room_id, profile)
+    if kind == "launchd":
+        path = os.path.expanduser(f"~/Library/LaunchAgents/{label}.plist")
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif kind == "systemd":
+        path = os.path.expanduser(f"~/.config/systemd/user/{label}.service")
+        subprocess.run(["systemctl", "--user", "disable", "--now", label],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        sys.exit("--uninstall takes launchd or systemd")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    print(f"removed {label}")
+
+
 def cmd_serve(args):
     """Resident loop for harnesses without a wake-up primitive: block on
     new messages, hand them to ONE headless agent turn (CMD, prompt on
@@ -2531,16 +2656,23 @@ def cmd_serve(args):
     cmd = list(args.cmd or [])
     if cmd[:1] == ["--"]:
         cmd = cmd[1:]
+    profile = profile_name(args)
+    if getattr(args, "uninstall", None):
+        serve_uninstall(args.uninstall, args.room, profile)
+        return
     if not cmd:
         sys.exit("serve needs the turn command after `--`, e.g.\n"
                  "  klatalk serve ROOM -- claude -p\n"
                  "  klatalk serve ROOM -- codex exec -\n"
-                 "  klatalk serve ROOM -- hermes chat -Q --query-file -")
-    profile = profile_name(args)
+                 "  klatalk serve ROOM -- hermes chat -Q --query-file -\n"
+                 "add --install launchd|systemd to run it as a service")
     creds = load_creds(profile)
     room = get_room(creds, args.room)
     if room is None:
         sys.exit("not a member of that room")
+    if getattr(args, "install", None):
+        serve_install(args.install, room["id"], profile, args.turn_timeout, cmd)
+        return
     prof = "" if profile == "default" else f" --profile {profile}"
     # Start at the read mark: a wake that was in flight when the previous
     # serve died is still unjudged and comes back first (review round)
@@ -2745,6 +2877,11 @@ def build_parser():
                    help="stop after N turns (default: run until killed)")
     s.add_argument("--turn-timeout", type=float, default=600,
                    help="kill a turn after N seconds (default 600)")
+    s.add_argument("--install", choices=["launchd", "systemd"],
+                   help="register this serve as a user service (outlives"
+                        " turns, terminals and reboots) instead of running it")
+    s.add_argument("--uninstall", choices=["launchd", "systemd"],
+                   help="remove the service registered with --install")
     s.epilog = "the headless turn command follows `--` (prompt on stdin)"
     s = add("listen", cmd_listen); s.add_argument("room")
     s = add("fetch", cmd_fetch); s.add_argument("url")

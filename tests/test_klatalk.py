@@ -1247,5 +1247,77 @@ class TestResidency(Base):
         self.assertNotIn("mine", out.getvalue())
 
 
+class TestServeService(Base):
+    """`serve --install` writes the service with this shell's PATH and cwd
+    — the two things agents got wrong writing a plist by hand."""
+
+    def _write_creds(self, profile, nickname):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli.write_private(
+            self.cli.cred_path(profile),
+            lambda f: json.dump({"user_id": "u", "nickname": nickname,
+                                 "access_token": "SECRET-A"}, f))
+
+    def test_service_argv_is_absolute_and_keeps_the_turn_after_dashdash(self):
+        argv = self.cli.service_argv("room-1234-5678", "hermes", 600,
+                                     ["codex", "exec", "-c", "x=1", "-"])
+        self.assertTrue(os.path.isabs(argv[0]) and os.path.isabs(argv[1]))
+        i = argv.index("--")
+        self.assertEqual(argv[2:i], ["serve", "room-1234-5678", "--profile",
+                                     "hermes", "--turn-timeout", "600"])
+        self.assertEqual(argv[i + 1:], ["codex", "exec", "-c", "x=1", "-"])
+
+    def test_launchd_plist_carries_path_and_escapes(self):
+        os.environ["PATH"] = "/opt/nvm/bin:/usr/bin"
+        env = self.cli.service_env()
+        self.assertEqual(env["PATH"], "/opt/nvm/bin:/usr/bin")
+        self.assertEqual(env["KLATALK_HOME"], self.home)
+        plist = self.cli.launchd_plist("com.klatalk.serve.x", ["a", "b & c"],
+                                       env, "/w", "/l.log")
+        self.assertIn("<string>b &amp; c</string>", plist)
+        self.assertIn("<key>PATH</key><string>/opt/nvm/bin:/usr/bin</string>", plist)
+        self.assertIn("<key>KeepAlive</key><true/>", plist)
+        self.assertIn("<key>StandardErrorPath</key><string>/l.log</string>", plist)
+
+    def test_systemd_unit_quotes_exec_and_env(self):
+        unit = self.cli.systemd_unit("lbl", ["/usr/bin/python3", "/p/klatalk",
+                                             "serve", "R", "--", "sh", "-c", "a b"],
+                                     {"PATH": "/x:/y"}, "/w")
+        self.assertIn("ExecStart=/usr/bin/python3 /p/klatalk serve R -- sh -c 'a b'", unit)
+        self.assertIn("Environment=PATH=/x:/y", unit)
+        self.assertIn("Restart=always", unit)
+
+    def test_install_writes_plist_and_bootstraps(self):
+        # a fake HOME keeps LaunchAgents out of the real account
+        os.environ["HOME"] = self.tmp
+        self._write_creds("default", "Hermes")
+        room = {"id": "room-1234-5678", "name": "X", "encryption_mode": "plain",
+                "last_seq": 3, "my_last_read_seq": 3, "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        calls = []
+
+        class R:
+            returncode = 0
+        self.cli.subprocess.run = lambda cmd, **kw: (calls.append(cmd), R())[1]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cli.cmd_serve(argparse_ns(room="room-1234-5678", cmd=["claude", "-p"],
+                                           max_turns=None, turn_timeout=600,
+                                           install="launchd", uninstall=None))
+        path = os.path.join(self.tmp, "Library/LaunchAgents",
+                            "com.klatalk.serve.room-123.default.plist")
+        self.assertTrue(os.path.exists(path))
+        self.assertIn("<string>claude</string>", open(path).read())
+        self.assertEqual(calls[-1][:2], ["launchctl", "bootstrap"])
+        self.assertIn("test message", out.getvalue())       # the round trip is the finish line
+        # uninstall removes it again
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="room-1234-5678", cmd=[],
+                                           max_turns=None, turn_timeout=600,
+                                           install=None, uninstall="launchd"))
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(calls[-1][:2], ["launchctl", "bootout"])
+
+
 if __name__ == "__main__":
     unittest.main()
