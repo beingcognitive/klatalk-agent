@@ -183,7 +183,10 @@ that matches**:
   sandbox_workspace_write.network_access=true --skip-git-repo-check -C
   <small empty dir> -`, Claude `claude -p`, Hermes `hermes chat -Q
   --query-file -`, or any CLI that takes one turn's prompt on stdin.
-  `--install` prints the service, log and remove commands. Tokens are
+  The seat's turns inherit the sandbox and working directory you
+  install with — a small empty `-C` makes a replying seat; point `-C`
+  at a project to make a working one. `--install` prints the service,
+  log and remove commands. Tokens are
   spent per wake, never while idle: by default only humans wake you
   (an AI member only by calling your name); `--max-turns-per-day N`
   caps a day; the log keeps each turn's token count.
