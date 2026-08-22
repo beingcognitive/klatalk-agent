@@ -2349,18 +2349,21 @@ class TestCoreFixRound(TestCoreLibrary):
 
     def test_backfill_delivers_page_by_page(self):
         pages = {4: [self._msg(i) for i in range(5, 205)], 204: [self._msg(205)]}
-        self._room_rest(lambda after: pages.get(after, []))
+        fetches = []
+        self._room_rest(lambda after: (fetches.append(after), pages.get(after, []))[1])
         sent, got = [], []
         self.cli.ws_connect = self._laps_ws([[]], sent)
-        seen_at_205 = {}
+        first_page_before_second_fetch = {}
 
         def on_event(ev):
             got.append(ev.get("seq"))
             if ev.get("seq") == 5:
-                seen_at_205["first_page_delivered_before_second_fetch"] = True
+                first_page_before_second_fetch["v"] = (fetches == [4])
         with self.assertRaises(KeyboardInterrupt):
             asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R", on_event))
         self.assertEqual([s for s in got if s], list(range(5, 206)))
+        self.assertTrue(first_page_before_second_fetch.get("v"),
+                        "row 5 was delivered only after the whole gap was buffered")
 
     def test_do_listen_hole_refill_keeps_the_cursor_at_the_received_max(self):
         inbox = os.path.join(self.tmp, "inbox.jsonl")
@@ -2403,6 +2406,97 @@ class TestCoreFixRound(TestCoreLibrary):
             rows = [json.loads(l) for l in f]
         self.assertEqual(rows, [{"topic": "room:R", "event": "message:decrypted", "payload": rec}])
         self.assertFalse(os.path.exists(self.cli.listen_cursor_path("default", "R")))
+
+    def test_cold_start_busy_is_retried_not_deafening(self):
+        # P0 (mini-review): a KlatalkBusy from cold_start_cursor left `seen`
+        # None forever — every later lap died on `seq <= None`
+        self._room_rest(lambda after: [self._msg(5)] if after == 4 else [],
+                        room={"id": "R", "encryption_mode": "plain", "last_seq": 4,
+                              "my_last_read_seq": 4, "members": []})
+        calls = {"n": 0}
+        real = self.cli.cold_start_cursor
+
+        def flaky(room, profile, sealed):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise self.cli.KlatalkBusy("lock held")
+            return real(room, profile, sealed)
+        self.cli.cold_start_cursor = flaky
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[]], sent)
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R",
+                                             lambda ev: got.append((ev["kind"], ev.get("seq")))))
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(got, [("reconnect", None), ("joined", None), ("message", 5)])
+
+    def test_do_listen_marks_a_row_seen_only_once_the_inbox_holds_it(self):
+        inbox = os.path.join(self.tmp, "inbox.jsonl")
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self._room_rest(lambda after: [self._msg(5), self._msg(6)] if after == 4
+                        else [self._msg(6)] if after == 5 else [])
+        sent = []
+        self.cli.ws_connect = self._laps_ws([[], [self._frame(7)]], sent)
+        real_record, failed = self.cli.record, {"once": False}
+
+        def flaky_record(path, rec):
+            if rec.get("payload", {}).get("seq") == 6 and not failed["once"]:
+                failed["once"] = True
+                raise OSError("disk full")
+            real_record(path, rec)
+        self.cli.record = flaky_record
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                asyncio.run(self.cli.do_listen({"access_token": "T"}, "R", inbox, profile="default"))
+        with open(inbox) as f:
+            seqs = [json.loads(l)["payload"]["seq"] for l in f]
+        self.assertEqual(seqs, [5, 6, 7])
+        self.assertEqual(self.cli.listen_cursor_read("default", "R"), 7)
+
+    def test_pin_merge_never_overwrites_a_newer_pin(self):
+        # two rooms verify concurrently; A decided against a snapshot with
+        # no pin for X while B pinned X — A must not replace B's pin
+        os.makedirs(self.cli.mls_dir("default"), exist_ok=True)
+        creds = {"device_id": "me", "access_token": "T"}
+        leaves = [{"identity": "me", "signature_key_b64": "TUU="},
+                  {"identity": "X", "signature_key_b64": "QkJCQg=="}]
+        self.cli.mls_op = lambda c, p, op, payload=None: (
+            {"members": leaves} if op == "list-members" else {"public_key_b64": "TUU="})
+        self.cli.get_room = lambda c, r, strict=True: {"id": r, "members": [{"user_id": "u"}]}
+        self.cli.device_key_map = lambda c, room: {"X": {"user_id": "u", "public_key": "QkJCQg==", "generation": 1}}
+        real_load = self.cli.load_pins
+        state = {"raced": False}
+
+        def load_pins(profile):
+            pins = real_load(profile)
+            if not state["raced"] and not pins:
+                # B lands between A's snapshot and A's merge
+                state["raced"] = True
+                self.cli.save_pins(profile, {"X": {"user_id": "u", "key": "QUFBQQ==", "generation": 1}})
+            return pins
+        self.cli.load_pins = load_pins
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = self.cli.verify_roster(creds, "default", "A", quick=True)
+        self.assertFalse(ok)                                   # raced → unresolved, fail closed
+        self.assertEqual(real_load("default")["X"]["key"], "QUFBQQ==")   # B's pin survived
+
+    def test_corrupt_outbox_is_named_not_busy(self):
+        os.makedirs(self.cli.mls_dir("default"), exist_ok=True)
+        with open(self.cli.outbox_path("default", "R"), "w") as f:
+            f.write("{half")
+        with self.assertRaises(self.cli.KlatalkUsage):
+            self.cli._outbox_load("default", "R")
+        with open(self.cli.outbox_path("default", "R"), "w") as f:
+            f.write("{}")
+        with self.assertRaises(self.cli.KlatalkUsage):
+            self.cli._outbox_load("default", "R")
+
+    def test_send_gate_entries_are_reclaimed(self):
+        async def run():
+            async with self.cli._send_gate("p", "R"):
+                self.assertEqual(len(self.cli._send_gates), 1)
+            self.assertEqual(len(self.cli._send_gates), 0)
+        asyncio.run(run())
 
     # -- sealed sends --------------------------------------------------
 

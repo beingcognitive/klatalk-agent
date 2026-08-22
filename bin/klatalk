@@ -1391,6 +1391,7 @@ def _verify_roster(creds, profile, room_id, quick=False):
         with pins_lock(profile):
             pins = load_pins(profile)
         updates = {}                  # devs this round pinned or re-pinned
+        bases = {}                    # the pin each decision was based on
         unresolved, mismatched = [], []
         for leaf in leaves:
             dev = leaf.get("identity")
@@ -1412,6 +1413,7 @@ def _verify_roster(creds, profile, room_id, quick=False):
                     # Pin beats registry — a rewritten registry would agree
                     mismatched.append((dev, "pin mismatch"))
                 else:
+                    bases[dev] = pin
                     updates[dev] = pins[dev] = dict(
                         pin, key=leaf_key, generation=newgen,
                         rotated_at=int(time.time()))
@@ -1424,19 +1426,26 @@ def _verify_roster(creds, profile, room_id, quick=False):
                 # do not freeze: the Remove+Add commit resolves it (§5-6)
                 unresolved.append(dev)
                 continue
+            bases[dev] = None         # join-moment TOFU: decided against no pin
             updates[dev] = pins[dev] = {
                 "user_id": reg.get("user_id"), "key": leaf_key,
                 "generation": reg.get("generation", 1),
                 "first_seen": int(time.time())}
         # Persist what this round observed even when leaves remain
         # unresolved — losing four good pins over one pending joiner
-        # defeats the join-moment TOFU (§5-1). Merge into a fresh read so
-        # another room's pins written meanwhile survive.
+        # defeats the join-moment TOFU (§5-1). Merge into a fresh read, and
+        # CAS per device: a pin another room wrote while we decided against
+        # a snapshot beats our TOFU/rotation (§5-3) — re-decide next round
+        # instead of overwriting it (mini-review, 2/2).
         if updates:
             with pins_lock(profile):
                 merged = load_pins(profile)
-                merged.update(updates)
+                raced = [d for d in updates if merged.get(d) != bases[d]]
+                for d in updates:
+                    if d not in raced:
+                        merged[d] = updates[d]
                 save_pins(profile, merged)
+            unresolved.extend(raced)
         if mismatched:
             why = ", ".join(f"{d} ({r})" for d, r in mismatched)
             with room_lock(profile, room_id):
@@ -1884,9 +1893,13 @@ async def listen_core(creds, profile, room_id, on_event, cursor=None):
                 if room is None:
                     raise KlatalkMembership("not a member of that room")
                 sealed = is_sealed(room)
-                if seen is None:
-                    seen = await asyncio.to_thread(cold_start_cursor, room,
-                                                   profile, sealed)
+            if seen is None:
+                # its own step: cold_start_cursor reads the ledger under the
+                # room lock and can come back KlatalkBusy — folded into the
+                # `room is None` branch that retry never happened again and
+                # every later lap compared seq <= None (mini-review)
+                seen = await asyncio.to_thread(cold_start_cursor, room,
+                                               profile, sealed)
             ws = await ws_connect(token)
             topic = await ws_join(ws, room_id)
             connected_at = time.monotonic()
@@ -1935,6 +1948,12 @@ async def listen_core(creds, profile, room_id, on_event, cursor=None):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            if ws is not None:
+                try:
+                    await ws.close()      # never hold a dead channel across the backoff
+                except Exception:
+                    pass
+                ws = None
             if isinstance(e, KlatalkError) and not isinstance(
                     e, (KlatalkTransient, KlatalkQuota)):
                 raise             # auth, membership, mls, usage, blocked — final
@@ -1989,18 +2008,25 @@ async def do_listen(creds, room_id, inbox, profile=None):
             out = {"topic": topic, "event": ev["event"], "payload": ev["raw"]}
         else:
             seq = ev.get("seq")
-            if isinstance(seq, int) and not ev["sealed"]:
-                # the cursor tracks what was RECEIVED — a suppressed hole
-                # refill is still a row the inbox holds (133 r1)
-                listen_cursor_write(profile, room_id, seq)
+            plain_seq = isinstance(seq, int) and not ev["sealed"]
             if seq in recorded_seqs:
-                return            # a hole refill is not a fresh event
+                # a hole refill is not a fresh event — but it IS a row the
+                # inbox already holds, so the cursor may pass it (133 r1)
+                if plain_seq:
+                    listen_cursor_write(profile, room_id, seq)
+                return
             out = {"topic": topic,
                    "event": "message:decrypted" if ev["sealed"] else "message:new",
                    "payload": ev["raw"]}
-            if isinstance(seq, int) and not ev["sealed"]:
+            record(inbox, out)    # a failed write raises → re-delivered…
+            if plain_seq:
+                # …so only a row the inbox HOLDS is marked seen; marked
+                # earlier, the re-delivery would be suppressed and lost
                 recorded_seqs.add(seq)
-        record(inbox, out)        # a failed write raises → re-delivered
+                listen_cursor_write(profile, room_id, seq)
+            print(json.dumps(out, ensure_ascii=False), flush=True)
+            return
+        record(inbox, out)
         print(json.dumps(out, ensure_ascii=False), flush=True)
 
     await listen_core(creds, profile, room_id, on_event, cursor=seen)
@@ -2742,10 +2768,25 @@ def _outbox_load(profile, room_id):
         try:
             with open(path) as f:
                 data = json.load(f)
-            age = max(0.0, time.time() - os.path.getmtime(path))
-            return data, age
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return None, None
+        except ValueError:
+            # a half file is not "no journal" — refused as busy forever
+            # otherwise (mini-review); a human restores or removes it
+            raise KlatalkUsage(f"{path} is corrupt — restore or remove it"
+                               " before sending")
+        except OSError as e:
+            raise KlatalkUsage(f"cannot read {path}: {e.strerror}")
+        if (not isinstance(data, dict)
+                or not isinstance(data.get("client_msg_id"), str)
+                or not isinstance(data.get("content"), dict)):
+            raise KlatalkUsage(f"{path} is corrupt — restore or remove it"
+                               " before sending")
+        try:
+            age = max(0.0, time.time() - os.path.getmtime(path))
+        except OSError:
+            age = 0.0
+        return data, age
 
 
 def _outbox_clear(profile, room_id, client_msg_id):
@@ -2758,8 +2799,13 @@ def _outbox_clear(profile, room_id, client_msg_id):
             return False
         try:
             os.remove(outbox_path(profile, room_id))
-        except OSError:
+        except FileNotFoundError:
             pass
+        except OSError as e:
+            # an ANSWERED rejection must not leave a journal that the next
+            # send mistakes for an in-flight one — say so, loudly
+            raise KlatalkUsage("cannot clear the sealed outbox journal:"
+                               f" {e.strerror}")
         return True
 
 
@@ -2838,16 +2884,27 @@ def _sealed_commit(creds, profile, room_id, seq, payload, reply_to, cmid):
         _outbox_clear(profile, room_id, cmid)
 
 
-_send_gates = {}      # (profile, room_id) -> asyncio.Lock, per event loop
+_send_gates = {}      # (loop, profile, room_id) -> [asyncio.Lock, waiters]
 
 
-def _send_gate(profile, room_id):
+@contextlib.asynccontextmanager
+async def _send_gate(profile, room_id):
+    """One sender at a time per room within this process; the entry is
+    dropped when the last waiter leaves, so a long-lived host does not
+    accumulate a lock per room ever spoken to (mini-review)."""
     loop = asyncio.get_running_loop()
     key = (id(loop), profile, room_id)
-    gate = _send_gates.get(key)
-    if gate is None:
-        gate = _send_gates[key] = asyncio.Lock()
-    return gate
+    entry = _send_gates.get(key)
+    if entry is None:
+        entry = _send_gates[key] = [asyncio.Lock(), 0]
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and _send_gates.get(key) is entry:
+            del _send_gates[key]
 
 
 async def sealed_send_async(creds, profile, room_id, payload, reply_to=None,
