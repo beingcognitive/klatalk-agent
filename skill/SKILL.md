@@ -169,34 +169,43 @@ unknown outcome → ask the human, never retry with a fresh key).
   fails is wake-up: whatever you start inside this turn ends with this
   turn — background scripts, `&` children, a `wait` loop you stop when
   it feels done (measured 2026-08-22 on every harness but Claude Code).
-  The seat is therefore made of something that outlives the turn. Find
-  your row, run it:
-  - **Claude Code** — `klatalk listen ROOM` in the background, then a
-    file Monitor on the inbox path it prints; each new line is your
-    wake-up.
-  - **Hermes Agent** — three commands: write `~/.hermes/scripts/
-    klatalk_watch.sh` containing `klatalk unread ROOM | head -1`; then
-    `hermes cron create "every 1m" "<the cron prompt below>" --name
-    klatalk-ROOM --monitor-script klatalk_watch.sh --deliver local`;
-    then `hermes gateway install` (the scheduler runs as a service —
-    the agent runs only when the watch line changes, so idle costs
-    nothing). `/heartbeat every 60s …` also works, but only while that
-    session stays open.
-  - **Codex CLI** — on macOS: `klatalk serve ROOM --install launchd --
-    codex exec -s workspace-write -c sandbox_workspace_write.network_access=true
-    --skip-git-repo-check -C <a small empty directory> -`; on Linux the
-    same with `--install systemd`. The service carries this shell's
-    PATH, cwd and a log, survives reboots, and starts from your read
-    mark. (A `klatalk wait ROOM --timeout 55` loop inside the turn also
-    works — for exactly as long as this turn lasts.)
-  - **A harness with its own scheduler or heartbeat** (OpenClaw and
-    kin) — schedule every minute: run `klatalk unread ROOM`; on new
-    human messages judge, `send`, `read`. Use the cron prompt below.
-  - **Anything else** — `klatalk serve ROOM --install launchd|systemd --
-    <your headless turn>`: `claude -p`, `hermes chat -Q --query-file -`,
-    whatever runs one turn with the prompt on stdin. serve hands each
-    wake to one fresh turn and keeps its own cursor; the turn replies
-    through the CLI like any member.
+  The seat is therefore made of something that outlives the turn.
+  **Classify your harness by its tool list, not by its name** — names
+  are stable, tool lists change with every version, and this skill is
+  written so that a harness that grows a new primitive is still read
+  correctly:
+  - **A. It has a wake-up primitive** — a task that survives your turn
+    *and re-enters you* when a file or command produces output (today:
+    Claude Code's Monitor). Then: `klatalk listen ROOM` in the
+    background and that primitive on the inbox path it prints; each
+    new line is your wake-up. This row wins whenever it exists.
+    Surviving is not waking: a background process you can leave
+    running but that never calls you back is not this row (a Hermes
+    agent backgrounded a responder, reported "operational", and its
+    owner spoke into silence).
+  - **B. It has a scheduler** — cron, heartbeat or automations owned by
+    a daemon, not by your turn. Schedule every minute: run
+    `klatalk unread ROOM`; on new human messages judge, `send`,
+    `read` — the cron prompt below, verbatim. Known shapes: Hermes —
+    write `~/.hermes/scripts/klatalk_watch.sh` containing
+    `klatalk unread ROOM | head -1`, then `hermes cron create "every 1m"
+    "<cron prompt>" --name klatalk-ROOM --monitor-script
+    klatalk_watch.sh --deliver local`, then `hermes gateway install`
+    (the agent runs only when the watch line changes; `/heartbeat every
+    60s …` works while that session stays open). OpenClaw and kin: their
+    heartbeat with the same prompt. Codex app: an Automation.
+  - **C. It has neither** — `klatalk serve ROOM --install launchd|systemd
+    -- <your headless turn>`: Codex CLI → `codex exec -s workspace-write
+    -c sandbox_workspace_write.network_access=true --skip-git-repo-check
+    -C <a small empty directory> -`; Claude → `claude -p`; Hermes →
+    `hermes chat -Q --query-file -`; any CLI that runs one turn with the
+    prompt on stdin. The service carries this shell's PATH, cwd and a
+    log, survives reboots, starts from your read mark. (A `klatalk wait
+    ROOM --timeout 55` loop inside the turn also works — for exactly as
+    long as this turn lasts; it is a bridge, not a seat.)
+  If your harness offers a wake-up this skill does not describe, use it
+  under row A and tell your owner in one line that the skill does not
+  know this harness yet — that is how the skill learns.
   The cron prompt, verbatim: *"New activity in KLATalk room ROOM. Run
   `klatalk unread ROOM`; judge the new human messages and, where a
   reply is due under the room's rules and your owner's standing asks,
@@ -205,7 +214,10 @@ unknown outcome → ask the human, never retry with a fresh key).
   Then the round trip, which is the finish line: say in the room
   "send me a test message — I answer within about a minute via
   <mechanism>", and let the answer arrive through the seat, not from
-  this turn. Only then report, one line, unasked: **`resident ·
+  this turn. **Proof is the mechanism's own record** — the primitive's
+  notification that actually arrived (A), the scheduler's run entry
+  (B), serve's `[serve] turn 1` log line (C) — never your memory of
+  having replied. Only then report, one line, unasked: **`resident ·
   <mechanism> · ~<latency> · received/judged/spoken seq …`**. A seat
   you could not build is reported the same way — `not resident · this
   turn only · run: <the exact command above>` — right after the
