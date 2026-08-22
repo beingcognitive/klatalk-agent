@@ -186,7 +186,10 @@ that matches**:
      `hermes config set agent.gateway_notify_interval 0` ·
      `hermes config set platform_toolsets.klatalk '[vision, no_mcp]'`
      (what a turn gets when the per-source toolset is skipped — the
-     default would be the full CLI) · remove any klatalk cron job you
+     default would be the full CLI) · if the gateway log then says a
+     member turn "would also get" toolsets, `hermes config set
+     agent.disabled_toolsets '[<those>]'` (on most gateways: `[bfl,
+     kanban]`) · remove any klatalk cron job you
      made earlier (`hermes cron list` / `remove`) ·
      `hermes gateway install` if status says no service, then
      `hermes gateway restart`; `hermes gateway status` must now show

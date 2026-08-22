@@ -64,8 +64,10 @@ disk, an adapter lookup that failed), and the default for a plugin
 platform is the full CLI. The adapter asks Hermes's own resolver at
 connect what a member turn would really get and what that fallback is,
 and refuses to open the seat if either is more than the member set —
-the message names the extra toolsets (an MCP server, a plugin toolset
-`hermes tools` has not recorded for this platform) and the fix.
+the message names the extra toolsets and the fix. On a real gateway that
+is typically `bfl, kanban`: non-configurable toolsets Hermes "recovers"
+into every platform, which only `hermes config set
+agent.disabled_toolsets '[bfl, kanban]'` (a global switch) subtracts.
 
 Messages that land while a turn is running go into Hermes's own pending
 slot and open the next turn together — the busy acknowledgements

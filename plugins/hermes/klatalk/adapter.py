@@ -432,9 +432,14 @@ class KlatalkAdapter(BasePlatformAdapter):
                      sorted(member), sorted(fallback))
         extra = sorted(member - expected)
         if extra:
-            out.append("a member turn would also get %s — save `hermes tools` for the"
-                       " klatalk platform (records known plugin toolsets) and keep MCP"
-                       " servers off this platform" % ", ".join(extra))
+            # what the host folds in on its own: MCP servers, plugin toolsets
+            # `hermes tools` has not recorded, and "recovered" non-configurable
+            # toolsets (bfl, kanban …) that every platform universe carries —
+            # only agent.disabled_toolsets subtracts those
+            out.append("a member turn would also get %s — `hermes config set"
+                       " agent.disabled_toolsets '[%s]'` (the one switch that subtracts"
+                       " a recovered toolset; it is global), and keep MCP servers and"
+                       " unrecorded plugin toolsets off this platform" % (", ".join(extra), ", ".join(extra)))
         if not fallback <= expected:
             out.append("platform_toolsets.klatalk must be the member set: run"
                        " `hermes config set platform_toolsets.klatalk '[%s]'` — it is"
