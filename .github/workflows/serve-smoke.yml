@@ -62,3 +62,4 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw "task still registered after uninstall" }
           if (Test-Path $launcher) { throw "launcher still present after uninstall" }
           "schtasks round trip OK"
+          exit 0   # the last native command was the post-uninstall query, whose failure is the pass

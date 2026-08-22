@@ -118,6 +118,7 @@ class TestUrlGuard(Base):
         self.assertTrue(self.cli.api_url("/uploads/a.jpg").endswith("/uploads/a.jpg"))
         self.assertTrue(self.cli.api_url("/v1/rooms").endswith("/v1/rooms"))
 
+    @unittest.skipIf(os.name != "posix", "POSIX file modes / paths")
     def test_fetch_rejects_non_upload_paths_and_missing_o(self):
         """[SKILL review 2026-08-12 4/6 + mini-review] If fetch accepts a
         same-host path outside /uploads/, an authenticated GET response
@@ -157,6 +158,7 @@ class TestUrlGuard(Base):
         self.assertNotIn("only /uploads/", str(ctx.exception))
         self.assertNotIn("with -o", str(ctx.exception))
 
+    @unittest.skipIf(os.name != "posix", "POSIX file modes / paths")
     def test_fetch_refuses_symlink_output(self):
         # A planted `photo.jpg -> ../credentials.json` plus --force would
         # truncate the link target; a broken link even slips past exists()
@@ -310,6 +312,7 @@ class TestCredentialFiles(Base):
     """[6/6] Permissions must be set before the token touches the file —
     chmod is too late."""
 
+    @unittest.skipIf(os.name != "posix", "POSIX file modes / paths")
     def test_written_private_from_creation(self):
         os.makedirs(self.home, mode=0o700, exist_ok=True)
         path = os.path.join(self.home, "credentials.json")
@@ -321,6 +324,7 @@ class TestCredentialFiles(Base):
         mode = stat.S_IMODE(os.stat(path).st_mode)
         self.assertEqual(mode, 0o600, f"mode is {oct(mode)} — others can read it")
 
+    @unittest.skipIf(os.name != "posix", "POSIX file modes / paths")
     def test_inbox_record_is_private(self):
         os.makedirs(self.home, mode=0o700, exist_ok=True)
         inbox = os.path.join(self.home, "inbox.jsonl")
@@ -735,6 +739,7 @@ class TestSealedRooms(Base):
         self.assertTrue(m)
         self.assertEqual(self.cli.b64url_decode(m.group(1)), b"ABC")
 
+    @unittest.skipIf(os.name != "posix", "POSIX file modes / paths")
     def test_ledger_dedup_first_wins_and_0600(self):
         self.cli.ledger_append("default", "R",
                                [{"seq": 1, "kind": "application",
@@ -1333,6 +1338,7 @@ class TestServeService(Base):
         self.assertIn("Restart=always", unit)
         self.assertIn("StandardError=append:/l.log", unit)   # the proof line lands here
 
+    @unittest.skipIf(os.name != "posix", "launchd is macOS; the service path needs getuid")
     def test_install_writes_plist_and_bootstraps(self):
         # a fake HOME keeps LaunchAgents out of the real account
         os.environ["HOME"] = self.tmp
