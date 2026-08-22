@@ -1206,6 +1206,9 @@ class TestResidency(Base):
                          (["send", "R", "--", "x"], None))
         self.assertEqual(self.cli.split_serve_argv(["send", "serve", "--", "x"]),
                          (["send", "serve", "--", "x"], None))
+        # --profile before the subcommand is valid argparse here (post-fix verifier)
+        self.assertEqual(self.cli.split_serve_argv(["--profile", "p", "serve", "R", "--", "echo", "hi"]),
+                         (["--profile", "p", "serve", "R"], ["echo", "hi"]))
 
     def test_serve_retries_a_failed_turn_then_moves_on(self):
         # A flaky turn must not cost the messages; a dead one must not spin
@@ -1318,6 +1321,13 @@ class TestServeService(Base):
                                            install=None, uninstall="launchd"))
         self.assertFalse(os.path.exists(path))
         self.assertEqual(calls[-1][:2], ["launchctl", "bootout"])
+        # a second uninstall (wrong profile, wrong room) is refused, never
+        # reported as "removed"
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.cmd_serve(argparse_ns(room="room-1234-5678", cmd=[],
+                                           max_turns=None, turn_timeout=600,
+                                           install=None, uninstall="launchd"))
+        self.assertIn("no launchd service", str(cm.exception))
 
 
 if __name__ == "__main__":

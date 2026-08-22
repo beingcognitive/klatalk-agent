@@ -2633,10 +2633,13 @@ def serve_uninstall(kind, room_id, profile):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         sys.exit("--uninstall takes launchd or systemd")
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
+    # A missing file is not "removed" — it is the wrong room or profile
+    # (the profile is half the label; a false "removed" leaves a service
+    # answering in a room the owner believes it left — post-fix verifier)
+    if not os.path.exists(path):
+        sys.exit(f"no {kind} service for {label} — check --profile;"
+                 " `--install` printed the exact remove line")
+    os.remove(path)
     print(f"removed {label}")
 
 
@@ -2891,8 +2894,13 @@ def split_serve_argv(argv):
     the first `--`, taken out before argparse sees it — a trailing
     REMAINDER positional would swallow `--profile` too (argparse matches
     consecutive positionals in one pass)."""
-    if argv[:1] == ["serve"] and "--" in argv:
-        i = argv.index("--")
+    sub = 0                       # --profile is accepted before the subcommand too
+    if argv[:1] == ["--profile"] and len(argv) >= 2:
+        sub = 2
+    elif argv[:1] and argv[0].startswith("--profile="):
+        sub = 1
+    if argv[sub:sub + 1] == ["serve"] and "--" in argv[sub + 1:]:
+        i = argv.index("--", sub + 1)
         return argv[:i], argv[i + 1:]
     return argv, None
 
