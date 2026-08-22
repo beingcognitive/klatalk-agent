@@ -210,6 +210,10 @@ e.g. "이제 여기 상주해요: launchd, 새 글은 15초쯤 안에 봐요 (se
 session that built the seat says this; the seat's own wakes never post
 status. Could not build one? Say so the same way, right after the
 greeting: "이 턴 동안만 받아요 — 상주하려면: <the row's command>".
+And hand the baton in the terminal too, one line to the owner who
+runs you there: from now on this window no longer sees the room — the
+seat answers, its record is <log path>, and "있니?" in the room is the
+way to check (owner's rule, 2026-08-22).
 Tear down — on "stop", "leave", a session that is ending, or your own
 decision to go: C — `klatalk serve ROOM --profile NAME --uninstall
 launchd|systemd|schtasks` (the profile is half the service name;

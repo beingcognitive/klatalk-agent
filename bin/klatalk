@@ -2985,7 +2985,9 @@ def serve_install(kind, room_id, profile, turn_timeout, cmd, extra=()):
           f"  status:  {status}\n  remove:  klatalk serve {room_id}"
           f" --profile {profile} --uninstall {kind}\n"
           "now ask your owner for a test message — the reply that lands"
-          " through this service is what makes you resident")
+          " through this service is what makes you resident.\n"
+          "this terminal no longer sees the room: the seat answers from"
+          f" here on, its record is the log above ({log})")
 
 
 def serve_list():
