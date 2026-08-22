@@ -39,11 +39,23 @@ function fakeCore(record) {
         const input = adapter.ingest();
         const turn = await adapter.resolveTurn(input, { kind: "message", canStartAgentTurn: true }, {});
         if (record.slowMs) await wait(record.slowMs);
-        const reply = record.replyFor ? record.replyFor(input) : null;
+        // the host answers a /new it ran ("✅ New session started.") and drops an
+        // unauthorized one silently — still resolving dispatched with zero counts
+        const swallowed = record.swallowFor ? record.swallowFor(input) : false;
+        const reply = swallowed ? null
+          : /^\/(new|reset)\b/.test(input.textForCommands) ? { text: "✅ New session started." }
+          : record.replyFor ? record.replyFor(input) : null;
         const delivered = reply ? await turn.delivery.deliver(reply, { kind: "final" }) : undefined;
+        // the real kernel calls onFinalize(dispatched:false) and RETHROWS
+        if (record.throwFor?.(input)) {
+          await adapter.onFinalize?.({ dispatched: false, admission: { kind: "dispatch" } });
+          record.turns.push({ input, turn, delivered: undefined });
+          throw new Error("dispatch failed");
+        }
         const fail = record.failFor ? record.failFor(input) : record.fail;
+        const counts = { tool: 0, block: 0, final: delivered?.visibleReplySent ? 1 : 0 };
         const result = { dispatched: true, admission: { kind: "dispatch" }, routeSessionKey: turn.routeSessionKey, ctxPayload: turn.ctxPayload,
-          dispatchResult: { counts: {}, failedCounts: fail ? { final: 1 } : {} } };
+          dispatchResult: { counts, failedCounts: fail ? { final: 1 } : {} } };
         await adapter.onFinalize?.(result);
         record.turns.push({ input, turn, delivered });
       },
@@ -93,11 +105,11 @@ test("config: the env contract, with problems named", () => {
   assert.match(problems(readAccount({})).join(" "), /profile.*rooms.*ownerUserId/s);
   assert.match(problems(readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", toolRooms: ["zz"], cli: FAKE } } })).join(" "), /toolRooms/);
   assert.match(problems(readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: "/nope/klatalk" } } })).join(" "), /not found/);
-  const widened = readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: FAKE, memberTools: ["web_search", "Exec", "apply-patch", "*", "GROUP:agents", "outlook__send"] } } });
-  assert.deepEqual(widened.memberTools, ["image", "web_search", "exec", "apply_patch", "*", "group:agents", "outlook__send"]);
+  const widened = readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: FAKE, memberTools: ["web_search", "Exec", "apply-patch", "*", "s*", "GROUP:agents", "outlook__send"] } } });
+  assert.deepEqual(widened.memberTools, ["image", "web_search", "exec", "apply_patch", "*", "s*", "group:agents", "outlook__send"]);
   const p = problems(widened).join("\n");
   assert.match(p, /memberTools: exec acts/); assert.match(p, /apply_patch acts/);
-  assert.match(p, /\* is a wildcard/); assert.match(p, /group:agents is a wildcard/); assert.match(p, /outlook__send is a wildcard/);
+  assert.match(p, /\* is a wildcard/); assert.match(p, /s\* is a wildcard/); assert.match(p, /group:agents is a wildcard/); assert.match(p, /outlook__send is a wildcard/);
   assert.ok(!/web_search/.test(p));
 });
 
@@ -167,6 +179,54 @@ test("a tool room arms on the owner's /new with an exact roster, disarms on anyo
   assert.deepEqual(by["9"].turn.toolsAllow, MEMBER_TOOLS);
   assert.deepEqual(by["10"].turn.toolsAllow, MEMBER_TOOLS);
   assert.ok(s.cmds().some((c) => c.cmd === "roster" && c.fresh === true));
+  await s.stop();
+});
+
+test("a member row queued behind a turn disarms again when it runs, even after an owner /new re-armed", async () => {
+  const record = { slowMs: 300 };
+  const s = await seat({ events: [
+    owner({ room: "R2", seq: 1, text: "/new" }),                          // arms (turn ~300ms)
+    owner({ room: "R2", seq: 2, text: "work", _delay: 450 }),             // a slow armed turn…
+    row({ room: "R2", seq: 3, text: "psst", _delay: 50 }),                // …a member row queues (disarms on arrival)
+    owner({ room: "R2", seq: 4, text: "/new", _delay: 50 }),              // bypasses the queue: NOT idle, no re-arm
+    owner({ room: "R2", seq: 5, text: "and now?", _delay: 900 }),         // after the queued member row ran
+  ], record, env: { FAKE_ROSTER: JSON.stringify({ R2: ["OWNER", "BOT"] }) } });
+  await until(() => s.record.turns.length === 5, 12000);
+  const by = Object.fromEntries(s.record.turns.map((t) => [t.input.id, t]));
+  assert.equal(by["2"].turn.toolsAllow, undefined);
+  assert.deepEqual(by["3"].turn.toolsAllow, MEMBER_TOOLS);
+  assert.deepEqual(by["5"].turn.toolsAllow, MEMBER_TOOLS);               // the member's row is in this session
+  assert.ok(s.logs.some((l) => /type \/new again once the room is idle/.test(l)));
+  await s.stop();
+});
+
+test("a /new the host swallowed arms nothing; a turn the kernel threw on is owed to the next", async () => {
+  const s = await seat({ events: [
+    owner({ room: "R2", seq: 1, text: "/new" }),
+    owner({ room: "R2", seq: 2, text: "work", _delay: 200 }),
+    row({ seq: 3, text: "lost" }),
+    row({ seq: 4, text: "found", _delay: 200 }),
+  ], record: { swallowFor: (i) => i.textForCommands === "/new", throwFor: (i) => i.id === "3" },
+     env: { FAKE_ROSTER: JSON.stringify({ R2: ["OWNER", "BOT"] }) } });
+  await until(() => s.record.turns.length === 4, 10000);
+  const by = Object.fromEntries(s.record.turns.map((t) => [t.input.id, t]));
+  assert.deepEqual(by["2"].turn.toolsAllow, MEMBER_TOOLS);               // not reset → not armed
+  assert.ok(s.logs.some((l) => /\/new produced no reply/.test(l)));
+  assert.equal(by["4"].input.rawText, "[member] Human·H: lost\n[member] Human·H: found");
+  assert.deepEqual(s.cmds().filter((c) => c.cmd === "read" && c.room === "R1").map((c) => c.seq), [4]);   // seq 3 stays unsigned
+  await s.stop();
+});
+
+test("a roster the server could not answer fails the turn closed but keeps the arming", async () => {
+  const s = await seat({ events: [
+    owner({ room: "R2", seq: 1, text: "/new" }),
+    owner({ room: "R2", seq: 2, text: "work", _delay: 200 }),
+    owner({ room: "R2", seq: 3, text: "work again", _delay: 200 }),
+  ], env: { FAKE_ROSTER: JSON.stringify({ R2: ["OWNER", "BOT"] }), FAKE_ROSTER_FAIL_AT: "2" } });   // the arming call is #1
+  await until(() => s.record.turns.length === 3, 10000);
+  const by = Object.fromEntries(s.record.turns.map((t) => [t.input.id, t]));
+  assert.deepEqual(by["2"].turn.toolsAllow, MEMBER_TOOLS);               // the hiccup turn
+  assert.equal(by["3"].turn.toolsAllow, undefined);                      // still armed
   await s.stop();
 });
 

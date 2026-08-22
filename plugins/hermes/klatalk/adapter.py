@@ -302,6 +302,9 @@ class KlatalkAdapter(BasePlatformAdapter):
         self._tool_room_told: Dict[str, bool] = {} # room_id -> last logged eligibility
         self._tool_armed: set = set()              # tool rooms armed by the owner's /new
         self._roster_stale: set = set()            # rooms whose roster refresh failed
+        self._tool_turn: Dict[str, bool] = {}      # room -> the turn now delivering is a tool turn
+        self._spoke: Dict[str, float] = {}         # room -> when the seat last posted a line
+        self._control_at: Dict[str, float] = {}    # room -> when an owner control line was handed over
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -545,8 +548,8 @@ class KlatalkAdapter(BasePlatformAdapter):
             return False
         ok = (room_id in self._tool_armed and room_id not in self._roster_stale
               and self._roster_exact(room_id))
-        if not ok:
-            self._tool_armed.discard(room_id)
+        if not ok and room_id not in self._roster_stale:
+            self._tool_armed.discard(room_id)      # the server answered: not the two of them
         if self._tool_room_told.get(room_id) is not ok:
             self._tool_room_told[room_id] = ok
             if not ok:
@@ -701,8 +704,8 @@ class KlatalkAdapter(BasePlatformAdapter):
         if room_id in self.settings.tool_rooms:
             if not is_owner:
                 self._tool_armed.discard(room_id)      # someone else wrote into this session
-            else:
-                await self._refresh_room(room_id)      # the verdict rides on a live roster
+            elif room_id in self._tool_armed:
+                await self._refresh_room(room_id)      # an armed verdict rides on a live roster
         # the wake filter FIRST: a row that wakes nothing must not cost a
         # download — only the AI-name test needs the body, and only for text
         probe = kt.clean(payload.get("text") or "") if payload.get("type") == "text" else ""
@@ -740,6 +743,7 @@ class KlatalkAdapter(BasePlatformAdapter):
                 return
             # an owner's /stop, /approve, bare "yes": Hermes matches these on
             # the raw text and bypasses the active-session guard itself
+            self._control_at[room_id] = time.time()
             await self.handle_message(event)
             return
         if busy and key:
@@ -755,14 +759,23 @@ class KlatalkAdapter(BasePlatformAdapter):
             # for one charge a day); rows joining a held slot ride free.
             if key not in self._pending_messages and not self._turn_allowed(
                     room_id, sender_id if event.metadata.get("klatalk_owner") else ""):
-                self._remember(room_id, f"{marker} {who}: {_oneline(text)}")
+                self._owe_back(room_id, event, marker, who, text)
                 return
             self._merge_pending(key, event)
             return
         if not self._turn_allowed(room_id, sender_id if event.metadata.get("klatalk_owner") else ""):
+            self._owe_back(room_id, event, marker, who, text)
             return
         self._handed[room_id] = time.time()
         await self.handle_message(event)
+
+    def _owe_back(self, room_id: str, event: MessageEvent, marker: str, who: str, text: str) -> None:
+        """_event_for already popped the buffer into this event: a refusal
+        gives those lines back, then the row — or the next turn's read mark
+        covers rows the model never saw."""
+        for line in (event.metadata or {}).get("klatalk_context") or []:
+            self._remember(room_id, line)
+        self._remember(room_id, f"{marker} {who}: {_oneline(text)}")
 
     def _event_for(self, room_id: str, ev: dict, text: str,
                    media_urls: List[str], media_types: List[str]) -> MessageEvent:
@@ -914,6 +927,18 @@ class KlatalkAdapter(BasePlatformAdapter):
         except Exception:
             return datetime.now(tz=timezone.utc)
 
+    async def _dispatch_active_session_command(self, event: MessageEvent, session_key: str,
+                                               cmd: str) -> None:
+        """An owner's /new or /stop while a turn runs takes Hermes's busy
+        command path, which never calls on_processing_complete — the read
+        mark and the tool-room arming would be skipped. Run the hook
+        ourselves, unless a pending row is about to be drained into the
+        reset session (its own turn signs, and must not arm)."""
+        await super()._dispatch_active_session_command(event, session_key, cmd)
+        if session_key in self._pending_messages:
+            return
+        await self.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """The read mark is a signature of judgment: sign through the
         highest seq this turn's event carried, only when the turn
@@ -926,14 +951,30 @@ class KlatalkAdapter(BasePlatformAdapter):
         # Hermes owns the session guard from here: its drain runs the
         # pending slot (if any) while the key stays in _active_sessions, so
         # the adapter's own "just handed over" flag can go
-        self._handed.pop(room_id, None)
-        if outcome != ProcessingOutcome.SUCCESS:
-            return
+        handed = self._handed.pop(room_id, None)
         md = event.metadata or {}
+        if outcome != ProcessingOutcome.SUCCESS:
+            # listen_core's cursor is already past these rows: keep what this
+            # failed turn carried for the next one, or its read mark would
+            # cover text the model never saw (mini-review, 1/2 + symmetry)
+            if "klatalk_marker" in md and not md.get("klatalk_control"):
+                owed = list(md.get("klatalk_context") or []) + [
+                    f"{md['klatalk_marker']} {md['klatalk_who']}: {md['klatalk_body']}"]
+                rows = owed + self._context.get(room_id, [])
+                self._context[room_id] = rows[-CONTEXT_ROWS:]
+            return
         if md.get("klatalk_control") and room_id in self.settings.tool_rooms and re.match(
                 r"^/(?:new|reset)(?:\s|$)", md.get("klatalk_body") or "", re.I):
             # the owner's own fresh session, taken while the roster is
-            # exactly the two of them: the one thing that arms a tool room
+            # exactly the two of them: the one thing that arms a tool room.
+            # SUCCESS with no response is still SUCCESS to Hermes — the
+            # command's own reply ("New session started") is the proof it
+            # ran, so the seat must have posted since the line was handed over
+            since = max(handed or 0.0, self._control_at.pop(room_id, 0.0))
+            if self._spoke.get(room_id, 0.0) < since:
+                logger.warning("[%s] room %s: /new produced no reply — not run by this"
+                               " Hermes; tools stay off", PLATFORM, _short(room_id))
+                return
             await self._refresh_room(room_id)
             if room_id not in self._roster_stale and self._roster_exact(room_id):
                 self._tool_armed.add(room_id)
@@ -1003,6 +1044,7 @@ class KlatalkAdapter(BasePlatformAdapter):
                             raise
                         await asyncio.sleep(2.0 * (2 ** attempt))
                 delivered.append(str(seq))
+                self._spoke[chat_id] = time.time()
                 reply_seq = None                    # quote once
         except SystemExit:
             logger.critical("[%s] the core tried to exit during send", PLATFORM)
@@ -1083,11 +1125,11 @@ class KlatalkAdapter(BasePlatformAdapter):
         if room is None or chat_id not in self.settings.rooms:
             return SendResult(success=False, error="not one of this seat's rooms",
                               error_kind="not_found")
-        if not self._tool_room_ok(chat_id) and not _under_media_cache(path):
+        if not self._tool_turn.get(chat_id) and not _under_media_cache(path):
             # the host uploads any local path the reply text merely MENTIONS
             # (base.py extract_local_files → send_document): not a tool
-            # call, so the member toolset does not gate it. Outside a tool
-            # room only the agent's own artifacts (the media caches) may leave.
+            # call, so the member toolset does not gate it. Outside a TOOL
+            # TURN only the agent's own artifacts (the media caches) may leave.
             logger.warning("[%s] refusing to upload %s: outside the agent's media cache",
                            PLATFORM, os.path.basename(str(path)))
             return SendResult(success=False, error="file outside the agent's media cache",
@@ -1145,7 +1187,10 @@ class KlatalkAdapter(BasePlatformAdapter):
         if (self.settings.owner_id and uid == self.settings.owner_id
                 and getattr(source, "klatalk_owner_only", False) is True
                 and self._tool_room_ok(chat)):
+            self._tool_turn[chat] = True           # the delivery gate follows the turn
             return ["hermes-cli"]
+        if chat:
+            self._tool_turn.pop(chat, None)
         # never "safe": it carries web_search/web_extract (a member's line
         # could have the room's text sent to an arbitrary URL) and, without
         # the sentinel, every enabled MCP server

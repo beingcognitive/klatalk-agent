@@ -38,6 +38,7 @@ for r in rooms:
 
 seq = 100
 roster = json.loads(os.environ.get("FAKE_ROSTER", "{}"))
+fresh_calls = 0
 
 
 def events():
@@ -65,6 +66,11 @@ for line in sys.stdin:
     elif cmd == "read":
         out({"id": rid, "ok": True, "last_read_seq": req.get("seq")})
     elif cmd == "roster":
+        if req.get("fresh"):
+            fresh_calls += 1
+            if str(fresh_calls) == os.environ.get("FAKE_ROSTER_FAIL_AT"):
+                out({"id": rid, "ok": False, "kind": "transient", "why": "hiccup"})
+                continue
         members = roster.get(req.get("room"), [])
         out({"id": rid, "ok": True, "name": "Bench [x]\nline", "sealed": False,
              "members": [{"user_id": u, "nick": u, "is_ai": u == "BOT"} for u in members]})

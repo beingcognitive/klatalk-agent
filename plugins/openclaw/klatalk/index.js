@@ -40,9 +40,10 @@ const STABLE_AFTER = 60_000;             // a bridge this old resets the backoff
 const NEVER_HELLO_MAX = 5;               // bridges that die before hello: give up after this many
 // Tools are where the boundary lives, not the prompt: a non-owner turn (and
 // the owner's outside an armed tool room) gets image understanding and
-// nothing that leaves the room or touches this machine — no web (a
-// member's line could have the room's text sent to an arbitrary URL), no
-// exec, files, sessions, cron, messaging. `memberTools` widens it on purpose.
+// nothing that touches this machine — no exec, files, sessions, cron,
+// messaging — and, by default, no web (a member's line could have the
+// room's text sent to an arbitrary URL). `memberTools` widens it on purpose,
+// web included; the machine-side tools it can never add.
 const MEMBER_TOOLS = ["image"];
 const FORBIDDEN_MEMBER_TOOLS = new Set([
   "exec", "process", "code_execution", "read", "write", "edit", "apply_patch",
@@ -59,7 +60,12 @@ const CORE_DIGEST_FILE = path.join(HERE, "core.sha256");
 // The bridge is run from the bytes that were hashed, handed over on fd 3 —
 // never from a second read of the path (a swap between hash and spawn
 // would otherwise run unverified code with the account's token).
-const LOADER = "import os,sys; p=sys.argv[1]; sys.argv=sys.argv[1:]; " +
+// `-c` puts the process CWD at sys.path[0] — every import the verified
+// core makes would resolve in whatever directory the gateway runs in. Put
+// the CLI's own directory back, as running the file by path would (os and
+// sys are already in sys.modules when this line runs).
+const LOADER = "import os,sys; p=os.path.abspath(sys.argv[1]); sys.argv=sys.argv[1:]; " +
+  "sys.path[0]=os.path.dirname(p); " +
   "g={'__name__':'__main__','__file__':p,'__package__':None,'__builtins__':__builtins__}; " +
   "exec(compile(os.fdopen(3,'rb').read(),p,'exec'),g)";
 
@@ -134,7 +140,9 @@ export function problems(a) {
     if (!a.rooms.includes(r)) out.push(`toolRooms: ${short(r)} is not one of rooms`);
   }
   for (const t of a.memberTools) {
-    if (t === "*" || t === "bundle-mcp" || t.includes("__") || t.startsWith("group:")) {
+    // the host compiles EVERY allow entry as a glob ("s*" reaches
+    // sessions_spawn, "w*" reaches web_fetch): no wildcard at all
+    if (t.includes("*") || t === "bundle-mcp" || t.includes("__") || t.startsWith("group:")) {
       out.push(`memberTools: ${t} is a wildcard, a bundle or a group — it would open tools to every member`);
     } else if (FORBIDDEN_MEMBER_TOOLS.has(t)) {
       out.push(`memberTools: ${t} acts on this machine or leaves the room`);
@@ -486,15 +494,17 @@ function remember(state, ev) {
   state.context.set(ev.room, rows.slice(-CONTEXT_ROWS));
 }
 
-/** Exactly the owner and this seat, nobody else, nobody missing — asked of
- * the server, not of a frame cache (member:* is a non-durable broadcast). */
+/** true / false / "unknown": exactly the owner and this seat, nobody else,
+ * nobody missing — asked of the server, not of a frame cache (member:* is a
+ * non-durable broadcast). "unknown" = we could not ask; a hiccup is not a
+ * roster change. */
 async function rosterExact(state, room) {
-  if (!state.bridge || !state.meId) return false;
+  if (!state.bridge || !state.meId) return "unknown";
   let members;
   try {
     members = (await state.bridge.cmd({ cmd: "roster", room, fresh: true })).members ?? [];
   } catch {
-    return false;
+    return "unknown";
   }
   const ids = new Set(members.map((m) => m.user_id).filter(Boolean));
   return ids.size === 2 && ids.has(state.account.ownerUserId) && ids.has(state.meId);
@@ -509,11 +519,9 @@ async function rosterExact(state, room) {
  * a gateway restart starts disarmed. */
 async function toolRoomOk(state, room) {
   if (!state.account.toolRooms.includes(room)) return false;
-  const ok = state.armed.has(room) && (await rosterExact(state, room));
-  if (!ok) {
-    state.armed.delete(room);
-    state.context.delete(room);          // whatever was buffered is not the owner's alone
-  }
+  const verdict = state.armed.has(room) ? await rosterExact(state, room) : false;
+  const ok = verdict === true;           // "unknown" fails this turn closed, keeps the arming
+  if (verdict === false) state.armed.delete(room);   // the buffer stays: the next turn's read mark owes it
   if (state.toolRoomTold.get(room) !== ok) {
     state.toolRoomTold.set(room, ok);
     if (!ok) state.log.warn?.(`[${CHANNEL}] room ${short(room)}: tool turns are off — the owner's /new in a room that holds only the owner and the seat arms them`);
@@ -549,9 +557,15 @@ function enqueue(state, ev) {
   void (async () => {
     try {
       while (true) {
-        const rows = state.queue.get(ev.room) ?? [];
+        const queued = state.queue.get(ev.room) ?? [];
         state.queue.delete(ev.room);
-        if (!rows.length) break;
+        if (!queued.length) break;
+        // one turn is one turn: a flood while the previous one ran must not
+        // build an unbounded prompt — the same cap remember() has
+        const rows = queued.length > CONTEXT_ROWS + 1 ? queued.slice(-(CONTEXT_ROWS + 1)) : queued;
+        if (rows.length !== queued.length) {
+          state.log.warn?.(`[${CHANNEL}] room ${short(ev.room)}: ${queued.length - rows.length} rows elided from this turn (flood)`);
+        }
         try {
           await handleRows(state, rows, false);
         } catch (e) {
@@ -568,6 +582,9 @@ async function handleRows(state, rows, control) {
   const { account, accountId, cfg, core, log, setStatus } = state;
   const bridge = state.bridge;
   if (!bridge) { for (const r of rows) remember(state, r); return; }
+  // the arrival-time disarm can be undone by a queue-bypassing /new before
+  // these rows run: apply the verdict again as they enter the session
+  if (account.toolRooms.includes(rows[0].room) && rows.some((r) => r.owner !== true)) state.armed.delete(rows[0].room);
   const ev = rows[rows.length - 1];
   const isOwner = ev.owner === true;
   const marker = markerOf(ev);
@@ -599,6 +616,7 @@ async function handleRows(state, rows, control) {
   const roomName = state.names.get(ev.room) ?? (await roomLabel(state, ev.room));
   // tools: the owner alone, in an armed tool room, with nobody else's rows in the turn
   const toolTurn = isOwner && context.length === 0 && (await toolRoomOk(state, ev.room));
+  let answered = false;                  // this turn actually put something in the room
   let signed = false;
   try {
     await core.inbound.run({
@@ -656,7 +674,11 @@ async function handleRows(state, rows, control) {
             recordInboundSession: core.session.recordInboundSession,
             dispatchReplyWithBufferedBlockDispatcher: core.reply.dispatchReplyWithBufferedBlockDispatcher,
             delivery: {
-              deliver: (payload) => deliver(state, ev.room, payload, ev.seq, toolTurn),
+              deliver: async (payload) => {
+                const r = await deliver(state, ev.room, payload, ev.seq, toolTurn);
+                if (r?.visibleReplySent) answered = true;
+                return r;
+              },
               onDelivered: (_p, _i, result) => { if (result?.visibleReplySent) setStatus({ accountId, lastOutboundAt: Date.now() }); },
               onError: (err, info) => log.error?.(`[${CHANNEL}] ${info.kind} reply to ${short(ev.room)} failed: ${err?.kind ?? err?.name ?? err}`),
             },
@@ -673,8 +695,20 @@ async function handleRows(state, rows, control) {
           if (!result?.dispatched || failed) return;
           if (control && /^\s*\/(?:new|reset)(?:\s|$)/i.test(text) && account.toolRooms.includes(ev.room)) {
             // the owner's own fresh session, taken while the roster is exactly
-            // the two of them: the one thing that arms a tool room
-            if (await rosterExact(state, ev.room)) {
+            // the two of them and nothing else is running or waiting for this
+            // room (a queued row would enter the reset session after it):
+            // the one thing that arms a tool room
+            // `dispatched` only says the pipeline ran: OpenClaw drops an
+            // unauthorized whole-message /new silently (commands.allowFrom
+            // without this owner) and still reports dispatched — a session
+            // that was not reset must not arm. The command answers when it
+            // ran ("✅ New session started."): that reply is the proof.
+            const idle = !state.running.has(ev.room) && !(state.queue.get(ev.room)?.length);
+            if (!answered) {
+              log.warn?.(`[${CHANNEL}] room ${short(ev.room)}: /new produced no reply — this OpenClaw did not run it (commands.allowFrom / ownerAllowFrom?); tools stay off`);
+            } else if (!idle) {
+              log.warn?.(`[${CHANNEL}] room ${short(ev.room)}: /new while a turn was running or waiting — type /new again once the room is idle to arm tools`);
+            } else if ((await rosterExact(state, ev.room)) === true) {
               state.armed.add(ev.room);
               state.context.delete(ev.room);
               state.toolRoomTold.delete(ev.room);
@@ -786,7 +820,7 @@ const outbound = {
     if (!seat?.bridge || !seat.account.rooms.includes(room)) throw new Error("klatalk seat is not running for that room");
     const p = localPath(mediaUrl);
     if (!p) throw new Error("klatalk sends local media files only");
-    if (!uploadable(seat, p) && !(await toolRoomOk(seat, room))) throw new Error("klatalk: file outside the seat's media roots");
+    if (!uploadable(seat, p) && (await toolRoomOk(seat, room)) !== true) throw new Error("klatalk: file outside the seat's media roots");
     const kind = IMAGE_EXT.has(path.extname(p).toLowerCase()) ? "image" : "file";
     const r = await seat.bridge.cmd({ cmd: "attach", room, path: p, kind });
     if (text?.trim()) await seat.bridge.cmd({ cmd: "send", room, text: text.trim() });

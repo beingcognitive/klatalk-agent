@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -214,7 +215,11 @@ class TestInbound(AdapterBase):
         owner, member = self.handled
         self.assertTrue(owner.text.startswith("[owner] 해줘"))
         self.assertTrue(owner.allow_gateway_control)
-        self.assertTrue(member.text.startswith("[member] /stop"))
+        # the failed owner turn's row rides in front (owed to this turn); the
+        # member's /stop is the last line — data, never a command
+        lines = member.text.split("\n")
+        self.assertTrue(lines[0].startswith("[owner] "))
+        self.assertTrue(lines[-1].startswith("[member] ") and lines[-1].endswith(": /stop"))
         self.assertFalse(member.allow_gateway_control)
         self.assertFalse(member.is_command())          # a member's /stop is data
         self.assertEqual(member.user_name, f"Guest·{self.OTHER[:8]}")
@@ -266,9 +271,12 @@ class TestInbound(AdapterBase):
         self.deliver(self.message(self.OTHER, "b2", seq=8))
         self.assertEqual(len(self.adapter._turns[self.ROOM]), 2)
         self.adapter._pending_messages.pop(key)
+        self.adapter._context[self.ROOM] = ["[member] Bot·ai-user-: earlier chatter"]
         self.deliver(self.message(self.OTHER, "b3", seq=9))        # budget gone: not merged, kept
         self.assertNotIn(key, self.adapter._pending_messages)
-        self.assertEqual(len(self.adapter._context[self.ROOM]), 1)
+        # … together with the context _event_for had already popped (mini-review)
+        self.assertEqual([l.split(": ", 1)[1] for l in self.adapter._context[self.ROOM]],
+                         ["earlier chatter", "b3"])
         self.adapter._context.pop(self.ROOM)
         self.adapter._active_sessions.pop(key)
         self.adapter._pending_messages.pop(key, None)
@@ -676,6 +684,11 @@ class TestV15Round(AdapterBase):
         self.assertFalse(self.handled[0].source.klatalk_owner_only and self.adapter._tool_room_ok(self.ROOM))
         self.adapter._handed.clear()
         self.deliver(self.message(self.OWNER, "/new", seq=7))
+        # SUCCESS without the command's own reply = Hermes did not run it
+        self.run_async(self.adapter.on_processing_complete(self.handled[1], ProcessingOutcome.SUCCESS))
+        self.assertNotIn(self.ROOM, self.adapter._tool_armed)
+        self.adapter._control_at[self.ROOM] = time.time() - 1
+        self.adapter._spoke[self.ROOM] = time.time()                 # "✅ New session started."
         self.run_async(self.adapter.on_processing_complete(self.handled[1], ProcessingOutcome.SUCCESS))
         self.assertIn(self.ROOM, self.adapter._tool_armed)
         self.assertEqual(self.adapter.toolsets_for_source(self.handled[0].source), ["hermes-cli"])
@@ -752,6 +765,42 @@ class TestV15Round(AdapterBase):
         self.assertEqual(calls, [self.ROOM])
         self.deliver({"kind": "system", "seq": 4, "sealed": False, "payload": {"type": "system", "text": "x"}})
         self.assertEqual(calls, [self.ROOM])
+
+
+    def test_a_failed_turn_leaves_its_rows_to_the_next_and_a_busy_new_still_arms(self):
+        self.deliver(self.message(self.AI, "chatter", seq=5), self.message(self.OTHER, "ask", seq=6))
+        self.run_async(self.adapter.on_processing_complete(self.handled[0], ProcessingOutcome.FAILURE))
+        self.adapter._handed.clear()
+        self.deliver(self.message(self.OWNER, "again", seq=7))
+        self.assertEqual([l.split(": ", 1)[1] for l in self.handled[1].text.split("\n")],
+                         ["chatter", "ask", "again"])
+        # /new while a turn runs takes Hermes's busy command path (no completion
+        # hook): the adapter runs it itself — unless a pending row will drain
+        self.adapter.settings.tool_rooms = {self.ROOM}
+        self._two()
+        seen = []
+
+        async def fake_super(self_, event, session_key, cmd):
+            seen.append(cmd)
+        import klatalk.adapter as A
+        orig = A.BasePlatformAdapter._dispatch_active_session_command
+        A.BasePlatformAdapter._dispatch_active_session_command = fake_super
+        try:
+            key = self.adapter._room_key(self.ROOM)
+            self.adapter._handed.clear()
+            self.deliver(self.message(self.OWNER, "/new", seq=8))
+            ev = self.handled[2]
+            self.adapter._spoke[self.ROOM] = time.time() + 1             # the command answered
+            self.run_async(self.adapter._dispatch_active_session_command(ev, key, "new"))
+            self.assertEqual(seen, ["new"])
+            self.assertIn(self.ROOM, self.adapter._tool_armed)
+            self.adapter._tool_armed.discard(self.ROOM)
+            self.adapter._pending_messages[key] = ev                  # a row waits for the reset session
+            self.run_async(self.adapter._dispatch_active_session_command(ev, key, "new"))
+            self.assertNotIn(self.ROOM, self.adapter._tool_armed)
+        finally:
+            A.BasePlatformAdapter._dispatch_active_session_command = orig
+            self.adapter._pending_messages.pop(key, None)
 
 
 class TestSecurityAudit(AdapterBase):

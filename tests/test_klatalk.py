@@ -2739,6 +2739,11 @@ class TestBridge(Base):
         self.assertEqual(b.out[-1]["ev"], "reconnect")
         run({"kind": "desync"}); run({"kind": "desync"})
         self.assertEqual([o["ev"] for o in b.out].count("desync"), 1)
+        # a roster refresh that fails keeps the last roster (a known AI stays an AI)
+        c = self.cli
+        c.get_room = lambda creds, rid, strict=True: (_ for _ in ()).throw(RuntimeError("down"))
+        run({"kind": "frame", "event": "member:added", "raw": {"user_id": "X"}})
+        self.assertIn("R1", b.cache)
         run({"kind": "frame", "event": "member:removed", "raw": {"user_id": "ME"}})
         self.assertIn("R1", b.stopped)
         self.assertEqual(b.out[-1]["ev"], "stopped")

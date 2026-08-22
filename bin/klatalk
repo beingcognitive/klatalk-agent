@@ -3970,17 +3970,17 @@ class Bridge:
                              "why": type(e).__name__})
 
     async def refresh_room(self, room_id):
-        """The roster the tool-room verdict rides on must be live: a
-        refresh that fails drops the cache (room_for re-fetches) rather
-        than keep answering with the pre-change roster."""
+        """A roster/name change: refresh off the loop. A refresh that fails
+        keeps the last roster — dropping it would reclassify a known AI
+        member as human on its next line (a turn, a budget charge). The
+        tool-room verdict never reads this cache: it asks `roster fresh`,
+        which fails closed on its own."""
         try:
             room = await asyncio.to_thread(get_room, self.creds, room_id)
             if room:
                 self.cache[room_id] = room
-                return
         except Exception:
             pass
-        self.cache.pop(room_id, None)
 
     async def on_event_inner(self, room_id, ev):
         kind = ev.get("kind")
