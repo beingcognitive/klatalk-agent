@@ -25,6 +25,7 @@ never appear in any output (allowlist).
   klatalk listen ROOM                   # long-running listen — marks nothing
   klatalk serve ROOM -- CMD             # resident loop: new messages → one headless turn
   klatalk serve ROOM --install launchd -- CMD   # …as a service (launchd | systemd | schtasks)
+  klatalk serve --list                  # every seat installed on this machine
   klatalk fetch /uploads/... -o out.jpg # download an attachment (server paths)
   klatalk bind                          # owner binding — the phone tap signs
   klatalk request-approval ROOM --action …   # float an approval card in the room
@@ -2670,6 +2671,41 @@ def serve_install(kind, room_id, profile, turn_timeout, cmd, extra=()):
           " through this service is what makes you resident")
 
 
+def serve_list():
+    """Every seat installed on this machine, whoever installed it — a
+    service the owner forgot is the one that keeps spending tokens
+    (owner's question, 2026-08-22). Each line ends with its remove command."""
+    import glob
+    found = []
+    for path in glob.glob(os.path.expanduser(
+            "~/Library/LaunchAgents/com.klatalk.serve.*.plist")):
+        found.append(("launchd", os.path.basename(path)[:-6], path))
+    for path in glob.glob(os.path.expanduser(
+            "~/.config/systemd/user/com.klatalk.serve.*.service")):
+        found.append(("systemd", os.path.basename(path)[:-8], path))
+    for path in glob.glob(os.path.join(HOME, "serve-*-*.cmd")):
+        stem = os.path.basename(path)[6:-4]          # <room8>-<profile>; a
+        room8, prof = stem[:8], stem[9:]             # room id's first 8 are hex
+        found.append(("schtasks", f"com.klatalk.serve.{room8}.{prof}", path))
+    if not found:
+        print("no seats installed on this machine")
+        return
+    for kind, label, path in sorted(found):
+        _, _, _, room8, profile = label.split(".", 4)
+        log = os.path.join(HOME, f"serve-{room8}-{profile}.log")
+        last = ""
+        try:
+            with open(log, errors="replace") as f:
+                tail = [ln for ln in f.read().splitlines() if ln.startswith("[serve]")]
+            last = tail[-1] if tail else "(no [serve] line yet)"
+        except OSError:
+            last = "(no log)"
+        print(f"{kind:8} room {room8}…  profile {profile}\n"
+              f"         {last}\n"
+              f"         remove: klatalk serve <ROOM starting {room8}> --profile"
+              f" {profile} --uninstall {kind}")
+
+
 def serve_uninstall(kind, room_id, profile):
     label = service_label(room_id, profile)
     if kind == "launchd":
@@ -2715,6 +2751,11 @@ def cmd_serve(args):
     cmd = list(args.cmd or [])
     if cmd[:1] == ["--"]:
         cmd = cmd[1:]
+    if getattr(args, "list_seats", False):
+        serve_list()
+        return
+    if not args.room:
+        sys.exit("serve needs ROOM (or --list)")
     profile = profile_name(args)
     if getattr(args, "uninstall", None):
         serve_uninstall(args.uninstall, args.room, profile)
@@ -2962,7 +3003,10 @@ def build_parser():
                         " never signed read starts at the current last_seq)")
     s.add_argument("--timeout", type=float, default=None,
                    help="give up after N seconds (exit 3)")
-    s = add("serve", cmd_serve); s.add_argument("room")
+    s = add("serve", cmd_serve); s.add_argument("room", nargs="?")
+    s.add_argument("--list", action="store_true", dest="list_seats",
+                   help="every seat installed on this machine, with its log's"
+                        " last line and remove command")
     s.add_argument("--max-turns", type=int, default=None,
                    help="stop after N turns (default: run until killed)")
     s.add_argument("--turn-timeout", type=float, default=600,
