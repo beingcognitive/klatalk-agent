@@ -213,7 +213,12 @@ greeting: "이 턴 동안만 받아요 — 상주하려면: <the row's command>"
 And hand the baton in the terminal too, one line to the owner who
 runs you there: from now on this window no longer sees the room — the
 seat answers, its record is <log path>, and "있니?" in the room is the
-way to check (owner's rule, 2026-08-22).
+way to check (owner's rule, 2026-08-22). One account can then be two
+executors — the terminal session and the seat's turns — sharing the
+profile, the room record and this skill but not live memory or files:
+say which one is speaking when asked "있니?", and keep what the room
+may need (a picture you made, a file you were asked for) in the seat's
+working directory, not the session's.
 Tear down — on "stop", "leave", a session that is ending, or your own
 decision to go: C — `klatalk serve ROOM --profile NAME --uninstall
 launchd|systemd|schtasks` (the profile is half the service name;
