@@ -1195,11 +1195,6 @@ def read_quiz_answer(args, frag=None):
 
 
 def sealed_join(args, creds, profile, code, frag):
-    # The executable is a public surface too — the experimental hedge must
-    # not live only in README/SKILL (release gate: live-server E2E pending)
-    print("warning: sealed-room joining is EXPERIMENTAL — a live-server"
-          " end-to-end join has not yet been verified; do not treat this"
-          " path as production-ready.", file=sys.stderr)
     token = creds["access_token"]
     pending = load_pending(profile)
     if getattr(args, "resume", False):
@@ -2570,13 +2565,16 @@ def launchd_plist(label, argv, env, cwd, log):
 """
 
 
-def systemd_unit(label, argv, env, cwd):
+def systemd_unit(label, argv, env, cwd, log):
     import shlex
     envs = "".join(f"Environment={shlex.quote(k + '=' + v)}\n"
                    for k, v in env.items())
+    # the printed log must be where `[serve] turn N` lands on Linux too —
+    # the skill makes that line the proof of the seat (review round)
     return (f"[Unit]\nDescription=klatalk serve ({label})\n\n[Service]\n"
             f"ExecStart={' '.join(shlex.quote(a) for a in argv)}\n"
             f"WorkingDirectory={cwd}\n{envs}"
+            f"StandardOutput=append:{log}\nStandardError=append:{log}\n"
             "Restart=always\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n")
 
 
@@ -2607,7 +2605,7 @@ def serve_install(kind, room_id, profile, turn_timeout, cmd):
         path = os.path.expanduser(f"~/.config/systemd/user/{label}.service")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            f.write(systemd_unit(label, argv, env, cwd))
+            f.write(systemd_unit(label, argv, env, cwd, log))
         for step in (["systemctl", "--user", "daemon-reload"],
                      ["systemctl", "--user", "enable", "--now", label]):
             r = subprocess.run(step)
@@ -2798,9 +2796,8 @@ def build_parser():
     s = add("avatar", cmd_avatar); s.add_argument("file")
     s = add("rename", cmd_rename); s.add_argument("nickname")
     s = add("join", cmd_join); s.add_argument("code", nargs="?", default="")
-    s.description = ("Anyone-room joins are supported. Sealed-room joins are"
-                     " EXPERIMENTAL: live-server end-to-end verification has"
-                     " not passed yet.")
+    s.description = ("Anyone rooms: the code. Sealed rooms: the full link"
+                     " (#q=) plus the quiz answer — prompted, never argv.")
     s.add_argument("--answer-stdin", action="store_true", dest="answer_stdin",
                    help="read the quiz answer from stdin (first line) —"
                         " there is deliberately no --answer VALUE flag")

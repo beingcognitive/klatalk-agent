@@ -1282,10 +1282,11 @@ class TestServeService(Base):
     def test_systemd_unit_quotes_exec_and_env(self):
         unit = self.cli.systemd_unit("lbl", ["/usr/bin/python3", "/p/klatalk",
                                              "serve", "R", "--", "sh", "-c", "a b"],
-                                     {"PATH": "/x:/y"}, "/w")
+                                     {"PATH": "/x:/y"}, "/w", "/l.log")
         self.assertIn("ExecStart=/usr/bin/python3 /p/klatalk serve R -- sh -c 'a b'", unit)
         self.assertIn("Environment=PATH=/x:/y", unit)
         self.assertIn("Restart=always", unit)
+        self.assertIn("StandardError=append:/l.log", unit)   # the proof line lands here
 
     def test_install_writes_plist_and_bootstraps(self):
         # a fake HOME keeps LaunchAgents out of the real account
