@@ -370,8 +370,13 @@ async def do_send(creds, room_id, text, reply_to=None, payload=None,
         # Only the reason travels — a reply body is server-shaped and the
         # output allowlist applies to it too (review round)
         resp = reply.get("response") if isinstance(reply.get("response"), dict) else {}
-        raise SendRejected(str(resp.get("reason") or resp.get("error")
-                               or reply.get("status") or "rejected"))
+        reason = resp.get("reason") or resp.get("error") or reply.get("status")
+        # A rejection reason is server-shaped text: a nested value is never
+        # serialized whole and only a plain token travels (post-fix round)
+        if not isinstance(reason, str) \
+                or not re.fullmatch(r"[A-Za-z0-9 _.,:'()-]{1,120}", reason):
+            reason = "rejected"
+        raise SendRejected(reason)
     seq = reply["response"]["seq"]
     # Sending means having read up to that point — the convention that
     # prevents a stale unread "1" from lingering
@@ -2452,9 +2457,11 @@ def _jpeg_orientation(data):
             e = ">" if t[:2] == b"MM" else "<"
             off = struct.unpack(e + "I", t[4:8])[0]
             n = struct.unpack(e + "H", t[off:off + 2])[0]
-            for k in range(min(n, 64)):
+            room = max(0, (len(t) - off - 2) // 12)   # entries that fit
+            for k in range(min(n, room, 512)):
                 q = off + 2 + k * 12
-                if struct.unpack(e + "H", t[q:q + 2])[0] == 0x0112:
+                tag, vtype, count = struct.unpack(e + "HHI", t[q:q + 8])
+                if tag == 0x0112 and vtype == 3 and count == 1:
                     return struct.unpack(e + "H", t[q + 8:q + 10])[0]
             return 1
         i += 2 + length
@@ -2506,10 +2513,26 @@ def _image_size(data):
         return 0, 0
     if data[4:8] == b"ftyp" and data[8:12] in (b"heic", b"heix", b"heim",
                                                b"heis", b"mif1", b"msf1"):
-        j = data.find(b"ispe")                # ISO-BMFF: 'ispe' vflags w h
-        if j >= 0 and len(data) >= j + 16:
-            return struct.unpack(">II", data[j + 8:j + 16])
-        return 0, 0
+        # ISO-BMFF: 'ispe' = vflags w h. A grid-tiled HEIC (every iPhone
+        # photo, every macOS .heic) lists the TILE's ispe before the
+        # image's — the first match read 3840x2160 as 512x512 (post-fix
+        # round, measured). Scan inside the 'meta' box only and keep the
+        # largest; 'mdat' may hold those four bytes by chance.
+        meta = data.find(b"meta")
+        j, end = (meta if meta >= 0 else 0), len(data)
+        if meta >= 4:
+            n = struct.unpack(">I", data[meta - 4:meta])[0]
+            if 8 < n <= len(data) - (meta - 4):
+                end = meta - 4 + n
+        best = (0, 0)
+        while True:
+            j = data.find(b"ispe", j + 1, end)
+            if j < 0 or len(data) < j + 16:
+                break
+            w, h = struct.unpack(">II", data[j + 8:j + 16])
+            if 0 < w <= 65535 and 0 < h <= 65535 and w * h > best[0] * best[1]:
+                best = (w, h)
+        return best
     return 0, 0
 
 
@@ -2517,14 +2540,20 @@ def uploads_path(url):
     """The one definition of 'a bare /uploads/ path' — the url the server
     hands back and the url a member pastes into fetch are the same
     question, so they get the same answer. None = refuse."""
-    parts = urllib.parse.urlsplit(url or "")
+    url = url or ""
+    # urlsplit silently drops tab/CR/LF — refuse them on the raw string,
+    # and refuse every control byte after decoding (_CTRL spares \t and
+    # \n on purpose: it is the display sanitizer, a path spares nothing)
+    if re.search(r"[\x00-\x1f\x7f-\x9f]", url):
+        return None
+    parts = urllib.parse.urlsplit(url)
     if parts.scheme or parts.netloc or parts.query or parts.fragment:
         return None
     path = urllib.parse.unquote(parts.path)
     if (path != posixpath.normpath(path)
             or not path.startswith("/uploads/")
             or any(c in path for c in ("\\", "\x00", "%"))
-            or _CTRL.search(path)):
+            or re.search(r"[\x00-\x1f\x7f-\x9f]", path)):
         return None
     return path
 

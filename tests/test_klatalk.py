@@ -37,6 +37,10 @@ def load_cli(home):
     return mod
 
 
+async def _coro(v):
+    return v
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -1658,7 +1662,8 @@ class TestAttachments(Base):
         self.assertTrue(seen["url"].endswith("/v1/rooms/R/uploads"))
         self.assertEqual(seen["auth"], "Bearer T")
         self.assertIn(b'name="file"; filename="upload.png"', seen["body"])   # neutral name
-        self.assertNotIn(b"SECRET", seen["body"])
+        self.assertNotIn(b"T", seen["body"][:0])      # (the token rides the header, never the body — checked below)
+        self.assertNotIn(b"Bearer", seen["body"])
         for bad in (b'{"url": "/uploads/../v1/me"}', b'{"url": "https://evil/uploads/R/x"}',
                     b'{"url": "/uploads/OTHER/x.png"}', b'{"url": "/uploads/R/x.png?next=1"}'):
             self.cli.OPENER = self._opener(200, bad)
@@ -1692,6 +1697,48 @@ class TestAttachments(Base):
         _, body = self.cli.multipart_body("file", 'a"\r\nContent-Type: x\r\n\r\nP.txt', "text/plain", b"real")
         self.assertEqual(body.count(b"\r\nContent-Type:"), 1)     # one header line, ours
         self.assertEqual(body.count(b"\r\n\r\n"), 1)              # exactly one header/body break
+
+    def test_post_fix_round_heic_meta_scan_reason_allowlist_path_controls(self):
+        import struct
+        def box(t, payload): return struct.pack(">I", 8 + len(payload)) + t + payload
+        ftyp = box(b"ftyp", b"heic" + b"\x00" * 8)
+        decoy = box(b"free", b"ispe" + bytes(4) + struct.pack(">II", 17, 19))
+        tile = box(b"ispe", bytes(4) + struct.pack(">II", 512, 512))
+        full = box(b"ispe", bytes(4) + struct.pack(">II", 3840, 2160))
+        meta = box(b"meta", bytes(4) + box(b"iprp", box(b"ipco", tile + full)))
+        self.assertEqual(self.cli.image_size(ftyp + decoy + meta), (3840, 2160))
+        # rejection reasons: a plain token travels, anything else collapses
+        async def run(reply):
+            class WS:
+                async def close(self): pass
+            self.cli.ws_connect = lambda tok: _coro(WS())
+            self.cli.ws_join = lambda ws, rid: _coro("room:R")
+            self.cli.ws_push = lambda ws, topic, ev, body, ref: _coro(reply)
+            try:
+                await self.cli.do_send({"access_token": "T"}, "R", "hi")
+            except self.cli.SendRejected as e:
+                return str(e)
+        for reply, want in [({"status": "error", "response": {"reason": "invalid_message"}}, "invalid_message"),
+                            ({"status": "error", "response": {"reason": {"access_token": "S"}}}, "rejected"),
+                            ({"status": "error", "response": {"reason": "\x1b[2Jx"}}, "rejected")]:
+            self.assertEqual(asyncio.run(run(reply)), want)
+        # paths: tab/newline raw or encoded never pass
+        for bad in ("/uploads/a%0Ab", "/uploads/a%09b", "/uploads/a\nb", "/uploads/a\tb"):
+            self.assertIsNone(self.cli.uploads_path(bad), bad)
+        self.assertEqual(self.cli.uploads_path("/uploads/R/x.png"), "/uploads/R/x.png")
+        # EXIF orientation beyond the 64th entry still counts
+        entries = b"".join(struct.pack(">HHIHH", 0x0200 + k, 3, 1, 1, 0) for k in range(70))
+        entries += struct.pack(">HHIHH", 0x0112, 3, 1, 6, 0)
+        tiff = b"MM\x00\x2a" + struct.pack(">I", 8) + struct.pack(">H", 71) + entries + struct.pack(">I", 0)
+        exif = b"Exif\x00\x00" + tiff
+        app1 = b"\xff\xe1" + struct.pack(">H", len(exif) + 2) + exif
+        sof = (b"\xff\xc0" + struct.pack(">H", 17) + b"\x08" + struct.pack(">HH", 480, 640) + b"\x03" + b"\x00" * 9)
+        self.assertEqual(self.cli.image_size(b"\xff\xd8" + app1 + sof), (480, 640))
+
+    def test_upload_413_is_named(self):
+        self.cli.OPENER = self._opener(413, b"")
+        with self.assertRaisesRegex(SystemExit, "size ceiling"):
+            self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"x")
 
 
 if __name__ == "__main__":
