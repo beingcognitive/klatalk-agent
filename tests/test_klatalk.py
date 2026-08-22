@@ -115,7 +115,7 @@ class TestUrlGuard(Base):
             "",
         ]
         for path in hostile:
-            with self.subTest(path=path), self.assertRaises(SystemExit):
+            with self.subTest(path=path), self.assertRaises(self.cli.KlatalkError):
                 self.cli.api_url(path)
 
     def test_accepts_server_paths(self):
@@ -157,7 +157,7 @@ class TestUrlGuard(Base):
         # stage (this case breaks if the guards overreach). With no
         # account, the SystemExit must cite something other than a guard
         # message.
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(self.cli.KlatalkError) as ctx:
             self.cli.cmd_fetch(fetch_args("/uploads/a.jpg"))
         self.assertNotIn("only /uploads/", str(ctx.exception))
         self.assertNotIn("with -o", str(ctx.exception))
@@ -206,13 +206,13 @@ class TestUrlGuard(Base):
         def avatar_args(path):
             return type("A", (), {"file": path, "profile": None})()
 
-        with self.assertRaisesRegex(SystemExit, "must be one of"):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "must be one of"):
             self.cli.cmd_avatar(avatar_args("photo.gif"))
 
         big = os.path.join(self.tmp, "big.png")
         with open(big, "wb") as f:
             f.write(b"\x00" * (self.cli.AVATAR_MAX_BYTES + 1))
-        with self.assertRaisesRegex(SystemExit, "ceiling"):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "ceiling"):
             self.cli.cmd_avatar(avatar_args(big))
 
         boundary, body = self.cli.multipart_body(
@@ -289,16 +289,16 @@ class TestSecretsNeverPrinted(Base):
 
     def test_die_on_hides_token_fields(self):
         buf = io.StringIO()
-        with contextlib.redirect_stderr(buf), self.assertRaises(SystemExit):
+        with contextlib.redirect_stderr(buf), self.assertRaises(self.cli.KlatalkError):
             self.cli.die_on(401, {"error": "bad", "access_token": "SECRET-A"})
         self.assertNotIn("SECRET-A", buf.getvalue())
         # The old key-name denylist broke one nesting level deep — the
         # allowlist must never serialize a structured payload
-        with contextlib.redirect_stderr(buf), self.assertRaises(SystemExit):
+        with contextlib.redirect_stderr(buf), self.assertRaises(self.cli.KlatalkError):
             self.cli.die_on(401, {"error": {"access_token": "SECRET-NESTED"}})
         self.assertNotIn("SECRET-NESTED", buf.getvalue())
         # …while a plain error code still reads through
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(self.cli.KlatalkError) as ctx:
             self.cli.die_on(422, {"error": "quiz_required"})
         self.assertIn("quiz_required", str(ctx.exception))
 
@@ -306,7 +306,7 @@ class TestSecretsNeverPrinted(Base):
         # Phoenix changeset failures arrive as {"errors": {field: [msgs]}} —
         # the field NAME must read through (else "nickname taken" prints as
         # request_failed), the VALUES must not (any string could be a secret)
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(self.cli.KlatalkError) as ctx:
             self.cli.die_on(422, {"errors": {"nickname": ["SECRET-VALUE"]}})
         self.assertIn("nickname", str(ctx.exception))
         self.assertNotIn("SECRET-VALUE", str(ctx.exception))
@@ -347,7 +347,7 @@ class TestProfiles(Base):
 
     def test_rejects_path_traversal(self):
         for bad in ["../../etc/x", "a/b", "", "x" * 65]:
-            with self.subTest(p=bad), self.assertRaises(SystemExit):
+            with self.subTest(p=bad), self.assertRaises(self.cli.KlatalkError):
                 self.cli.cred_path(bad)
 
     def test_maps_default_and_named(self):
@@ -462,7 +462,7 @@ class TestNewCommands(Base):
 
         self.cli.do_send = fake_send
         # sealed detection goes to the network — stub it to a plain room
-        self.cli.get_room = lambda creds, room: {"encryption_mode": "plain"}
+        self.cli.get_room = lambda creds, room: {"id": "R", "encryption_mode": "plain"}
         self._write_creds("default", "Paren")
         self.cli.cmd_like(argparse_ns(room="R", seq=42, remove=False))
         r = sent["payload"]["reaction"]
@@ -513,8 +513,14 @@ class TestReadIsJudgment(Base):
             return FakeWS()
 
         self.cli.ws_connect = fake_connect
-        self.cli.rest = lambda *a, **k: (200, {"messages": [
-            {"seq": 5, "content": {}}, {"seq": 6, "content": {}}]})
+        def fake_rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":        # cold start: no read mark → last_seq
+                return 200, {"rooms": [{"id": "R", "encryption_mode": "plain",
+                                        "last_seq": 4, "my_last_read_seq": 0,
+                                        "members": []}]}
+            return 200, {"messages": [{"seq": 5, "content": {}},
+                                      {"seq": 6, "content": {}}]}
+        self.cli.rest = fake_rest
         inbox = os.path.join(self.tmp, "inbox.jsonl")
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(KeyboardInterrupt):
@@ -1044,7 +1050,7 @@ class TestTokenOriginBinding(Base):
         self._write_creds({"access_token": "tok-secret",
                            "api": "https://api.klatalk.com"})
         self.cli.API = "https://impostor.example"
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(self.cli.KlatalkError) as cm:
             self.cli.load_creds("default")
         self.assertIn("different origin", str(cm.exception))
         # the refusal names origins only — never the token
@@ -1055,7 +1061,7 @@ class TestTokenOriginBinding(Base):
         self._write_creds({"access_token": "tok-secret",
                            "api": "https://api.klatalk.com"})
         self.cli.API = "http://api.klatalk.com"
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(self.cli.KlatalkError):
             self.cli.load_creds("default")
 
     def test_matching_origin_loads(self):
@@ -1512,11 +1518,11 @@ class TestAttachments(Base):
         self.assertEqual(payload, {"type": "file", "url": None, "name": "r.pdf", "size": 10,
                                    "mime": "application/pdf", "text": "(파일) r.pdf"})
         bad = os.path.join(self.tmp, "x.exe"); open(bad, "wb").write(b"MZ")
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(self.cli.KlatalkError) as cm:
             self.cli.attachment_payload(bad, "file")
         self.assertIn("must be one of", str(cm.exception))
         fake = os.path.join(self.tmp, "f.png"); open(fake, "wb").write(b"PNG?")
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(self.cli.KlatalkError) as cm:
             self.cli.attachment_payload(fake, "image")
         self.assertIn("dimensions", str(cm.exception))
 
@@ -1545,7 +1551,9 @@ class TestAttachments(Base):
         self.cli.upload_to_room = lambda *a: "/uploads/R/y.png"
         self.cli.sealed_preflight = lambda *a: None
         sealed = []
-        self.cli.sealed_send = lambda args, creds, profile, rid, payload, reply_to=None: sealed.append(payload)
+        async def fake_sealed(creds, profile, rid, payload, reply_to=None, read_through=None):
+            sealed.append(payload); return 9
+        self.cli.sealed_send_async = fake_sealed
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=None,
@@ -1573,11 +1581,11 @@ class TestAttachments(Base):
                     raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(body))
             return O()
         self.cli.OPENER = opener(429, b'{"error": "upload_quota"}')
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(self.cli.KlatalkError) as cm:
             self.cli.upload_to_room(creds, "R", "a.png", "image/png", b"x")
         self.assertIn("quota", str(cm.exception))
         self.cli.OPENER = opener(415, b'{"error": "unsupported_type"}')
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(self.cli.KlatalkError) as cm:
             self.cli.upload_to_room(creds, "R", "a.png", "image/png", b"x")
         self.assertIn("file type", str(cm.exception))
 
@@ -1635,14 +1643,14 @@ class TestAttachments(Base):
         self.assertEqual(self.cli.attachment_payload(big, "file")[3]["size"], self.cli.MAX_ATTACHMENT)
         with open(big, "ab") as f:
             f.write(b"\x00")
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(self.cli.KlatalkError):
             self.cli.attachment_payload(big, "file")
         link = os.path.join(self.tmp, "l.pdf"); os.symlink(big, link)
-        with self.assertRaisesRegex(SystemExit, "regular file"):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "regular file"):
             self.cli.attachment_payload(link, "file")
         os.makedirs(self.home, exist_ok=True)
         inside = os.path.join(self.home, "creds.txt"); open(inside, "wb").write(b"x")
-        with self.assertRaisesRegex(SystemExit, "profile directory"):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "profile directory"):
             self.cli.attachment_payload(inside, "file")
         self.assertEqual(self.cli.FILE_TYPES[".csv"], "text/csv")
         self.assertEqual(self.cli.IMAGE_TYPES[".heic"], "image/heic")
@@ -1668,10 +1676,10 @@ class TestAttachments(Base):
         for bad in (b'{"url": "/uploads/../v1/me"}', b'{"url": "https://evil/uploads/R/x"}',
                     b'{"url": "/uploads/OTHER/x.png"}', b'{"url": "/uploads/R/x.png?next=1"}'):
             self.cli.OPENER = self._opener(200, bad)
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(self.cli.KlatalkError):
                 self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"x")
         self.cli.OPENER = self._opener(200, b"<html>oops</html>")
-        with self.assertRaisesRegex(SystemExit, "non-JSON"):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "non-JSON"):
             self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"x")
 
     def test_blocked_sealed_room_uploads_nothing_and_unknown_room_is_named(self):
@@ -1682,7 +1690,7 @@ class TestAttachments(Base):
         ups = []
         self.cli.upload_to_room = lambda *a: ups.append(a) or "/uploads/R/x.png"
         self.cli.mark_desync("default", "R", "test")
-        with self.assertRaisesRegex(SystemExit, "nothing was uploaded"), contextlib.redirect_stderr(io.StringIO()):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "nothing was uploaded"), contextlib.redirect_stderr(io.StringIO()):
             self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=None,
                                           image=png, file=None))
         self.assertEqual(ups, [])
@@ -1738,8 +1746,440 @@ class TestAttachments(Base):
 
     def test_upload_413_is_named(self):
         self.cli.OPENER = self._opener(413, b"")
-        with self.assertRaisesRegex(SystemExit, "size ceiling"):
+        with self.assertRaisesRegex(self.cli.KlatalkError, "size ceiling"):
             self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"x")
+
+
+class TestCoreLibrary(Base):
+    """core-v1.4 — the CLI as a library a gateway daemon embeds. The
+    contract: helpers raise KlatalkError (never SystemExit), importing has
+    no side effects, sealed state is locked across processes, reception
+    and sending are callable from an event loop."""
+
+    # -- exception mode ------------------------------------------------
+
+    def test_sys_exit_lives_only_in_the_cli_layer(self):
+        # A SystemExit escaping an asyncio task kills the whole daemon —
+        # every other platform included. Only the command layer may exit.
+        import ast
+        allowed = {"main", "profile_name", "sealed_join", "serve_install",
+                   "serve_uninstall"}
+        tree = ast.parse(open(BIN).read())
+        offenders = []
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name.startswith("cmd_") or node.name in allowed:
+                continue
+            for n in ast.walk(node):
+                is_exit = (isinstance(n, ast.Call)
+                           and isinstance(n.func, ast.Attribute)
+                           and n.func.attr == "exit"
+                           and isinstance(n.func.value, ast.Name)
+                           and n.func.value.id == "sys")
+                is_raise = (isinstance(n, ast.Raise) and n.exc is not None
+                            and "SystemExit" in ast.dump(n.exc))
+                if is_exit or is_raise:
+                    offenders.append(f"{node.name}:{n.lineno}")
+        self.assertEqual(offenders, [])
+
+    def test_http_failures_map_to_error_classes(self):
+        c = self.cli
+        cases = [(401, c.KlatalkAuth), (403, c.KlatalkMembership),
+                 (404, c.KlatalkMembership), (429, c.KlatalkQuota),
+                 (500, c.KlatalkTransient), (503, c.KlatalkTransient),
+                 (422, c.KlatalkError)]
+        for status, cls in cases:
+            with self.subTest(status=status), self.assertRaises(cls):
+                c.die_on(status, {"error": "x"})
+        # every one of them is a KlatalkError — one except clause suffices
+        for status, _ in cases:
+            with self.assertRaises(c.KlatalkError):
+                c.die_on(status, {"error": "x"})
+
+    def test_unreachable_server_is_transient_not_exit(self):
+        class O:
+            def open(self, req, timeout=0):
+                raise urllib.error.URLError("connection refused")
+        self.cli.OPENER = O()
+        with self.assertRaises(self.cli.KlatalkTransient):
+            self.cli.rest("GET", "/v1/rooms")
+
+    def test_socket_rpc_failures_raise_not_exit(self):
+        class Silent:
+            async def send(self, raw):
+                pass
+
+            async def recv(self):
+                await asyncio.sleep(3600)
+
+        class Refusing:
+            async def send(self, raw):
+                self.last = json.loads(raw)
+
+            async def recv(self):
+                f = self.last
+                return json.dumps([f[0], f[1], f[2], "phx_reply",
+                                   {"status": "error",
+                                    "response": {"reason": "not_a_member"}}])
+        self.cli.RPC_TIMEOUT = 0.05
+        with self.assertRaises(self.cli.KlatalkTransient):
+            asyncio.run(self.cli.ws_push(Silent(), "room:R", "read:mark",
+                                         {"seq": 1}, "2"))
+        with self.assertRaises(self.cli.KlatalkMembership) as cm:
+            asyncio.run(self.cli.ws_join(Refusing(), "R"))
+        self.assertIn("not_a_member", str(cm.exception))
+
+    def test_missing_credentials_are_auth_errors(self):
+        with self.assertRaises(self.cli.KlatalkAuth):
+            self.cli.load_creds("nobody")
+
+    # -- import without side effects ----------------------------------
+
+    def test_import_is_silent_and_configure_rebinds(self):
+        out, err = io.StringIO(), io.StringIO()
+        os.environ["KLATALK_API"] = "http://plain.example"   # would warn in main()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                mod = load_cli(self.home)
+        finally:
+            os.environ.pop("KLATALK_API", None)
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
+        self.assertEqual(mod.API, "http://plain.example")
+        cfg = mod.configure(mod.ClientConfig(api="https://other.example/",
+                                             home=self.tmp, mls_bin="/x/mls"))
+        self.assertEqual(mod.API, "https://other.example")
+        self.assertEqual(mod.API_HOST, "other.example")
+        self.assertTrue(mod.WS.startswith("wss://other.example/"))
+        self.assertEqual(mod.HOME, self.tmp)
+        self.assertEqual(mod.MLS_BIN, "/x/mls")
+        self.assertEqual(cfg.api, "https://other.example")
+        # warn() is the one outlet the core speaks through — rebindable
+        got = []
+        mod.warn = got.append
+        mod.warn("x")
+        self.assertEqual(got, ["x"])
+
+    # -- locks ----------------------------------------------------------
+
+    @unittest.skipIf(os.name != "posix", "fcntl locks")
+    def test_room_lock_is_reentrant_in_a_thread_and_exclusive_across_processes(self):
+        import subprocess as sp
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        with self.cli.room_lock("default", "R"):
+            with self.cli.room_lock("default", "R"):    # nested: no deadlock
+                pass
+        path = os.path.join(self.cli.mls_dir("default"), "lock-R")
+        holder = sp.Popen([sys.executable, "-c",
+                           "import fcntl,sys,time; f=open(sys.argv[1],'w');"
+                           "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True);"
+                           "time.sleep(3)", path], stdout=sp.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            self.cli.LOCK_TIMEOUT = 0.3
+            with self.assertRaises(self.cli.KlatalkMls) as cm:
+                with self.cli.room_lock("default", "R"):
+                    pass
+            self.assertIn("lock", str(cm.exception))
+        finally:
+            holder.kill()
+            holder.wait()
+        # released: the lock is ours again
+        with self.cli.room_lock("default", "R"):
+            pass
+
+    # -- reception core -------------------------------------------------
+
+    def _fake_ws(self, frames, sent):
+        class FakeWS:
+            def __init__(self):
+                self.frames = list(frames)
+
+            async def send(self, raw):
+                sent.append(json.loads(raw))
+
+            async def recv(self):
+                f = sent[-1]
+                return json.dumps([f[0], f[1], f[2], "phx_reply",
+                                   {"status": "ok", "response": {}}])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.frames:
+                    raise KeyboardInterrupt           # one lap, then out
+                return json.dumps(self.frames.pop(0))
+
+            async def close(self):
+                pass
+
+        async def connect(token):
+            return FakeWS()
+        return connect
+
+    def test_listen_core_backfills_once_and_starts_at_the_read_mark(self):
+        sent, got = [], []
+        pages = []
+
+        def fake_rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":
+                return 200, {"rooms": [{"id": "R", "encryption_mode": "plain",
+                                        "last_seq": 9, "my_last_read_seq": 4,
+                                        "members": []}]}
+            pages.append(path)
+            return 200, {"messages": [{"seq": 5, "content": {"payload": {"type": "text", "text": "a"}}},
+                                      {"seq": 6, "content": {"payload": {"type": "text", "text": "b"}}}]}
+        self.cli.rest = fake_rest
+        self.cli.ws_connect = self._fake_ws([
+            [None, None, "room:R", "message:new",
+             {"seq": 6, "content": {"payload": {"type": "text", "text": "b"}}}],  # raced the backfill
+            [None, None, "room:R", "message:new",
+             {"seq": 7, "content": {"payload": {"type": "text", "text": "c"}}}],
+            [None, None, "room:R", "member:joined", {"user_id": "x"}],
+        ], sent)
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default",
+                                             "R", got.append))
+        self.assertIn("after_seq=4", pages[0])              # cold start = read mark
+        kinds = [(e["kind"], e.get("seq")) for e in got]
+        self.assertEqual(kinds, [("joined", None), ("message", 5), ("message", 6),
+                                 ("message", 7), ("frame", None)])
+        self.assertEqual(got[1]["payload"], {"type": "text", "text": "a"})
+        self.assertEqual(got[4]["event"], "member:joined")
+        # reception never signs
+        self.assertEqual([f for f in sent if f[3] == "read:mark"], [])
+
+    def test_listen_core_accepts_a_coroutine_consumer(self):
+        sent, got = [], []
+        self.cli.rest = lambda m, p, body=None, token=None: (
+            (200, {"rooms": [{"id": "R", "encryption_mode": "plain", "last_seq": 0,
+                              "my_last_read_seq": 0, "members": []}]})
+            if p == "/v1/rooms" else (200, {"messages": []}))
+        self.cli.ws_connect = self._fake_ws(
+            [[None, None, "room:R", "message:new", {"seq": 1, "content": {}}]], sent)
+
+        async def on_event(ev):
+            await asyncio.sleep(0)
+            got.append(ev["kind"])
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default",
+                                             "R", on_event))
+        self.assertEqual(got, ["joined", "message"])
+
+    def test_listen_core_stops_on_membership_loss_but_retries_transients(self):
+        calls = {"n": 0}
+
+        def flaky_rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":
+                return 200, {"rooms": [{"id": "R", "encryption_mode": "plain",
+                                        "last_seq": 0, "my_last_read_seq": 0,
+                                        "members": []}]}
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise self.cli.KlatalkTransient("503")
+            raise self.cli.KlatalkMembership("HTTP 403: forbidden")
+        self.cli.rest = flaky_rest
+        self.cli.ws_connect = self._fake_ws([], [])
+        got = []
+
+        async def run():
+            # the first lap backs off (1s) — shrink it by patching sleep
+            real = asyncio.sleep
+            self.cli.asyncio.sleep = lambda d: real(0)
+            try:
+                await self.cli.listen_core({"access_token": "T"}, "default",
+                                           "R", got.append)
+            finally:
+                self.cli.asyncio.sleep = real
+        with self.assertRaises(self.cli.KlatalkMembership):
+            asyncio.run(run())
+        self.assertEqual([e["kind"] for e in got], ["joined", "reconnect", "joined"])
+
+    def test_events_after_pages_to_the_end(self):
+        seen = []
+
+        def fake_rest(method, path, body=None, token=None):
+            seen.append(path)
+            after = int(re.search(r"after_seq=(\d+)", path).group(1))
+            if after == 0:
+                return 200, {"messages": [{"seq": i, "content": {}} for i in range(1, 201)]}
+            return 200, {"messages": [{"seq": 201, "content": {}}]}
+        self.cli.rest = fake_rest
+        evs = self.cli.events_after({"access_token": "T"}, "default", "R", 0, False)
+        self.assertEqual(len(evs), 201)
+        self.assertEqual(len(seen), 2)
+        self.assertIn("after_seq=200", seen[1])
+
+    # -- sending --------------------------------------------------------
+
+    def test_read_through_is_the_only_thing_that_moves_the_read_mark(self):
+        sent = []
+
+        class FakeWS:
+            async def send(self, raw):
+                sent.append(json.loads(raw))
+
+            async def recv(self):
+                f = sent[-1]
+                resp = {"seq": 11} if f[3] == "message:send" else {}
+                return json.dumps([f[0], f[1], f[2], "phx_reply",
+                                   {"status": "ok", "response": resp}])
+
+            async def close(self):
+                pass
+
+        async def connect(token):
+            return FakeWS()
+        self.cli.ws_connect = connect
+        creds = {"access_token": "T", "nickname": "n"}
+
+        def marks():
+            return [f[4]["seq"] for f in sent if f[3] == "read:mark"]
+        self.assertEqual(asyncio.run(self.cli.do_send(creds, "R", "hi")), 11)
+        self.assertEqual(marks(), [])                       # a daemon signs later
+        asyncio.run(self.cli.do_send(creds, "R", "hi", read_through=7))
+        self.assertEqual(marks(), [7])
+        asyncio.run(self.cli.do_send(creds, "R", "hi",
+                                     read_through=self.cli.READ_THROUGH_SENT))
+        self.assertEqual(marks(), [7, 11])                  # the CLI convention
+
+    def test_cmd_send_keeps_the_send_marks_read_convention(self):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli.write_private(self.cli.cred_path("default"),
+                               lambda f: json.dump({"user_id": "u", "nickname": "n",
+                                                    "access_token": "T"}, f))
+        room = {"id": "R", "name": "X", "encryption_mode": "plain", "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        calls = []
+
+        async def fake_send(creds, room_id, text, **kw):
+            calls.append(kw.get("read_through")); return 3
+        self.cli.do_send = fake_send
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.cli.cmd_send(argparse_ns(room="R", text="hi", text_stdin=False,
+                                          reply=None, image=None, file=None))
+        self.assertEqual(calls, [self.cli.READ_THROUGH_SENT])
+        self.assertIn("sent seq 3", out.getvalue())
+
+    def _sealed_stubs(self, sends):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli._sealed_pump = lambda creds, profile, room_id: []
+        self.cli.verify_roster = lambda creds, profile, room_id, quick=False: True
+        self.cli.mls_op = lambda creds, profile, op, payload=None: (
+            {"epoch": 4} if op == "group-epoch" else {"ct_b64": "Q1Q="})
+        counter = {"n": 20}
+
+        async def fake_send(creds, room_id, text, reply_to=None, payload=None,
+                            content=None, client_msg_id=None, read_through=None):
+            sends.append((client_msg_id, content, reply_to, read_through))
+            if content.get("payload", {}).get("ct") == "REJECT":
+                raise self.cli.SendRejected("invalid_message")
+            counter["n"] += 1
+            return counter["n"]
+        self.cli.do_send = fake_send
+
+    def test_sealed_send_returns_seq_and_journals_its_own_plaintext(self):
+        sends = []
+        self._sealed_stubs(sends)
+        creds = {"user_id": "me", "device_id": "d1", "access_token": "T"}
+        seq = self.cli.sealed_send(creds, "default", "R", {"type": "text", "text": "hi"},
+                                   reply_to=2, read_through=self.cli.READ_THROUGH_SENT)
+        self.assertEqual(seq, 21)
+        self.assertEqual(sends[0][1], {"v": 2, "alg": "mls10", "payload": {"ct": "Q1Q="}})
+        self.assertEqual(sends[0][2:], (2, self.cli.READ_THROUGH_SENT))
+        recs = self.cli.ledger_read("default", "R")
+        self.assertEqual([(r["seq"], r["own"], r["payload"]["text"]) for r in recs],
+                         [(21, True, "hi")])
+        self.assertFalse(os.path.exists(self.cli.outbox_path("default", "R")))
+
+    def test_sealed_send_settles_a_stale_outbox_then_sends_the_new_one(self):
+        sends = []
+        self._sealed_stubs(sends)
+        creds = {"user_id": "me", "device_id": "d1", "access_token": "T"}
+        self.cli.replace_private(self.cli.outbox_path("default", "R"), lambda f: f.write(
+            json.dumps({"client_msg_id": "old-id", "epoch": 3, "reply_to": None,
+                        "content": {"v": 2, "alg": "mls10", "payload": {"ct": "T0xE"}},
+                        "payload": {"type": "text", "text": "old"}})))
+        with contextlib.redirect_stderr(io.StringIO()):
+            seq = self.cli.sealed_send(creds, "default", "R",
+                                       {"type": "text", "text": "new"})
+        # old bytes first (same id, same ciphertext), then the new utterance —
+        # in ONE call; nobody is told to "rerun"
+        self.assertEqual([s[0] for s in sends][0], "old-id")
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(seq, 22)
+        texts = [r["payload"]["text"] for r in self.cli.ledger_read("default", "R")]
+        self.assertEqual(texts, ["old", "new"])
+        self.assertFalse(os.path.exists(self.cli.outbox_path("default", "R")))
+
+    def test_sealed_send_clears_a_rejected_stale_journal_and_still_sends(self):
+        sends = []
+        self._sealed_stubs(sends)
+        creds = {"user_id": "me", "device_id": "d1", "access_token": "T"}
+        self.cli.replace_private(self.cli.outbox_path("default", "R"), lambda f: f.write(
+            json.dumps({"client_msg_id": "old-id", "epoch": 3, "reply_to": None,
+                        "content": {"v": 2, "alg": "mls10", "payload": {"ct": "REJECT"}},
+                        "payload": {"type": "text", "text": "old"}})))
+        with contextlib.redirect_stderr(io.StringIO()):
+            seq = self.cli.sealed_send(creds, "default", "R",
+                                       {"type": "text", "text": "new"})
+        self.assertEqual(seq, 21)
+        texts = [r["payload"]["text"] for r in self.cli.ledger_read("default", "R")]
+        self.assertEqual(texts, ["new"])
+
+    def test_sealed_send_refuses_a_desynced_room_with_a_typed_error(self):
+        sends = []
+        self._sealed_stubs(sends)
+        self.cli.mark_desync("default", "R", "test")
+        with self.assertRaises(self.cli.KlatalkDesync):
+            self.cli.sealed_send({"user_id": "me", "device_id": "d1", "access_token": "T"},
+                                 "default", "R", {"type": "text", "text": "x"})
+        self.assertEqual(sends, [])
+
+    def test_send_message_routes_by_room_kind(self):
+        calls = []
+
+        async def plain(creds, room_id, text, **kw):
+            calls.append(("plain", room_id, kw.get("payload"))); return 1
+
+        async def sealed(creds, profile, room_id, payload, reply_to=None, read_through=None):
+            calls.append(("sealed", room_id, payload)); return 2
+        self.cli.do_send, self.cli.sealed_send_async = plain, sealed
+        creds = {"access_token": "T"}
+        asyncio.run(self.cli.send_message(creds, "p", {"id": "A", "encryption_mode": "plain"}, text="hi"))
+        asyncio.run(self.cli.send_message(creds, "p", {"id": "B", "encryption_mode": "mls10"}, text="hi"))
+        self.assertEqual(calls, [("plain", "A", {"type": "text", "text": "hi"}),
+                                 ("sealed", "B", {"type": "text", "text": "hi"})])
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": []})
+        with self.assertRaises(self.cli.KlatalkMembership):
+            asyncio.run(self.cli.send_message(creds, "p", "NOPE", text="hi"))
+
+    # -- attachments in --------------------------------------------------
+
+    def test_fetch_upload_caps_bytes_while_streaming(self):
+        reads = []
+
+        class O:
+            def open(self_, req, timeout=0):
+                class R(io.BytesIO):
+                    status = 200
+
+                    def read(self, n=-1):
+                        reads.append(n)
+                        return super().read(n)
+                return R(b"x" * 1000)
+        self.cli.OPENER = O()
+        creds = {"access_token": "T"}
+        self.assertEqual(self.cli.fetch_upload(creds, "/uploads/R/a.png", 1000), b"x" * 1000)
+        with self.assertRaises(self.cli.KlatalkQuota):
+            self.cli.fetch_upload(creds, "/uploads/R/a.png", 999)
+        self.assertTrue(all(n <= 1 << 16 for n in reads))     # never the whole body at once
+        with self.assertRaises(self.cli.KlatalkUsage):
+            self.cli.fetch_upload(creds, "https://evil/uploads/R/a.png", 10)
+        with self.assertRaises(self.cli.KlatalkUsage):
+            self.cli.fetch_upload(creds, "/uploads/R/a.png", 0)
+
 
 
 if __name__ == "__main__":
