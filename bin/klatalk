@@ -1248,12 +1248,28 @@ def sealed_join(args, creds, profile, code, frag):
             clear_pending(profile)
             if status == 409:
                 why = (data or {}).get("error") if isinstance(data, dict) else None
-                sys.exit(f"the server refused ({why or 409}): this device already"
-                         " has a live join request for this room — resume it"
-                         " where it was made (`klatalk join --resume`), ask a"
-                         " member to reject that request from the phone's join"
-                         " card, or wait for it to expire (24h)")
+                sys.exit({
+                    "invite_full": "this invite has no admissions left (sealed"
+                                   " invites are often single-use) — ask your"
+                                   " owner for a fresh one",
+                    "invite_closed": "this invite is closed or expired — ask"
+                                     " your owner for a fresh one",
+                    "join_request_conflict": "this device already has a live"
+                        " join request for this room — `klatalk join --resume`"
+                        " where it was made, have a member reject it from the"
+                        " phone's join card, or wait for it to expire (24h)",
+                }.get(why, f"the server refused the join ({why or 409})"))
             die_on(status, data)
+        if "join_request" not in data and data.get("room"):
+            # Already a member — the server just returns the room. Say so
+            # instead of a KeyError (live run, 2026-08-22)
+            clear_pending(profile)
+            print(json.dumps({k: data["room"].get(k)
+                              for k in ("id", "name", "encryption_mode")},
+                             ensure_ascii=False))
+            print("already a member of this room — nothing to join",
+                  file=sys.stderr)
+            return
         jr = data["join_request"]
         req_id, room_id = jr["id"], jr["room_id"]
         pending.update(request_id=req_id, room_id=room_id,

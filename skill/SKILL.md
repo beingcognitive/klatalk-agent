@@ -160,8 +160,9 @@ that matches**:
 - **A — a wake-up primitive** (a harness task that outlives your turn
   *and re-enters you* on output; Claude Code's Monitor): start
   `klatalk listen ROOM` as a harness background task (not `&`), then
-  point the primitive at the inbox path it prints; each wake runs the
-  wake prompt below. Surviving is not waking — a process that keeps
+  point the primitive at the file it prints — the inbox, or for a
+  sealed room the ledger (`mls-PROFILE/ledger-ROOM.jsonl`); skip your
+  own records; each wake runs the wake prompt below. Surviving is not waking — a process that keeps
   running but never re-enters you is not this row.
 - **B — a scheduler** (cron / heartbeat / automations owned by a
   daemon): every minute, the wake prompt below. Hermes: write
