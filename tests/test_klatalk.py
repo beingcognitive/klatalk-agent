@@ -18,6 +18,7 @@ import re
 import stat
 import sys
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1766,7 +1767,9 @@ class TestCoreLibrary(Base):
                    "serve_uninstall"}
         tree = ast.parse(open(BIN).read())
         offenders = []
-        for node in tree.body:
+        top = list(tree.body) + [n for c in tree.body if isinstance(c, ast.ClassDef)
+                                 for n in c.body]        # methods run on import too
+        for node in top:
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             if node.name.startswith("cmd_") or node.name in allowed:
@@ -1869,7 +1872,7 @@ class TestCoreLibrary(Base):
         with self.cli.room_lock("default", "R"):
             with self.cli.room_lock("default", "R"):    # nested: no deadlock
                 pass
-        path = os.path.join(self.cli.mls_dir("default"), "lock-R")
+        path = os.path.join(self.cli.mls_dir("default"), "lock-room-R")
         holder = sp.Popen([sys.executable, "-c",
                            "import fcntl,sys,time; f=open(sys.argv[1],'w');"
                            "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True);"
@@ -1877,7 +1880,7 @@ class TestCoreLibrary(Base):
         try:
             self.assertEqual(holder.stdout.readline().strip(), "held")
             self.cli.LOCK_TIMEOUT = 0.3
-            with self.assertRaises(self.cli.KlatalkMls) as cm:
+            with self.assertRaises(self.cli.KlatalkBusy) as cm:
                 with self.cli.room_lock("default", "R"):
                     pass
             self.assertIn("lock", str(cm.exception))
@@ -1985,13 +1988,9 @@ class TestCoreLibrary(Base):
 
         async def run():
             # the first lap backs off (1s) — shrink it by patching sleep
-            real = asyncio.sleep
-            self.cli.asyncio.sleep = lambda d: real(0)
-            try:
-                await self.cli.listen_core({"access_token": "T"}, "default",
-                                           "R", got.append)
-            finally:
-                self.cli.asyncio.sleep = real
+            self.cli.backoff_sleep = lambda d: asyncio.sleep(0)
+            await self.cli.listen_core({"access_token": "T"}, "default",
+                                       "R", got.append)
         with self.assertRaises(self.cli.KlatalkMembership):
             asyncio.run(run())
         self.assertEqual([e["kind"] for e in got], ["joined", "reconnect", "joined"])
@@ -2062,6 +2061,15 @@ class TestCoreLibrary(Base):
         self.assertEqual(calls, [self.cli.READ_THROUGH_SENT])
         self.assertIn("sent seq 3", out.getvalue())
 
+    def _sealed_send(self, *a, **k):
+        return asyncio.run(self.cli.sealed_send_async(*a, **k))
+
+    def _age_outbox(self, seconds=600):
+        # a journal from a crashed process, not one still on the wire
+        p = self.cli.outbox_path("default", "R")
+        t = time.time() - seconds
+        os.utime(p, (t, t))
+
     def _sealed_stubs(self, sends):
         os.makedirs(self.home, mode=0o700, exist_ok=True)
         self.cli._sealed_pump = lambda creds, profile, room_id: []
@@ -2083,7 +2091,7 @@ class TestCoreLibrary(Base):
         sends = []
         self._sealed_stubs(sends)
         creds = {"user_id": "me", "device_id": "d1", "access_token": "T"}
-        seq = self.cli.sealed_send(creds, "default", "R", {"type": "text", "text": "hi"},
+        seq = self._sealed_send(creds, "default", "R", {"type": "text", "text": "hi"},
                                    reply_to=2, read_through=self.cli.READ_THROUGH_SENT)
         self.assertEqual(seq, 21)
         self.assertEqual(sends[0][1], {"v": 2, "alg": "mls10", "payload": {"ct": "Q1Q="}})
@@ -2101,8 +2109,9 @@ class TestCoreLibrary(Base):
             json.dumps({"client_msg_id": "old-id", "epoch": 3, "reply_to": None,
                         "content": {"v": 2, "alg": "mls10", "payload": {"ct": "T0xE"}},
                         "payload": {"type": "text", "text": "old"}})))
+        self._age_outbox()
         with contextlib.redirect_stderr(io.StringIO()):
-            seq = self.cli.sealed_send(creds, "default", "R",
+            seq = self._sealed_send(creds, "default", "R",
                                        {"type": "text", "text": "new"})
         # old bytes first (same id, same ciphertext), then the new utterance —
         # in ONE call; nobody is told to "rerun"
@@ -2121,8 +2130,9 @@ class TestCoreLibrary(Base):
             json.dumps({"client_msg_id": "old-id", "epoch": 3, "reply_to": None,
                         "content": {"v": 2, "alg": "mls10", "payload": {"ct": "REJECT"}},
                         "payload": {"type": "text", "text": "old"}})))
+        self._age_outbox()
         with contextlib.redirect_stderr(io.StringIO()):
-            seq = self.cli.sealed_send(creds, "default", "R",
+            seq = self._sealed_send(creds, "default", "R",
                                        {"type": "text", "text": "new"})
         self.assertEqual(seq, 21)
         texts = [r["payload"]["text"] for r in self.cli.ledger_read("default", "R")]
@@ -2133,7 +2143,7 @@ class TestCoreLibrary(Base):
         self._sealed_stubs(sends)
         self.cli.mark_desync("default", "R", "test")
         with self.assertRaises(self.cli.KlatalkDesync):
-            self.cli.sealed_send({"user_id": "me", "device_id": "d1", "access_token": "T"},
+            self._sealed_send({"user_id": "me", "device_id": "d1", "access_token": "T"},
                                  "default", "R", {"type": "text", "text": "x"})
         self.assertEqual(sends, [])
 
@@ -2181,6 +2191,339 @@ class TestCoreLibrary(Base):
             self.cli.fetch_upload(creds, "/uploads/R/a.png", 0)
 
 
+
+class TestCoreFixRound(TestCoreLibrary):
+    """core-v1.4 133 round 1 — each test pins one reviewer finding."""
+
+    def _room_rest(self, messages_by_after, room=None, fail_first=None):
+        calls = {"rooms": 0}
+        room = room or {"id": "R", "encryption_mode": "plain", "last_seq": 4,
+                        "my_last_read_seq": 4, "members": []}
+
+        def fake_rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":
+                calls["rooms"] += 1
+                if fail_first and calls["rooms"] <= fail_first:
+                    raise self.cli.KlatalkTransient("503")
+                return 200, {"rooms": [room]}
+            after = int(re.search(r"after_seq=(\d+)", path).group(1))
+            page = messages_by_after(after)
+            if isinstance(page, Exception):
+                raise page
+            return 200, {"messages": page}
+        self.cli.rest = fake_rest
+        return calls
+
+    def _laps_ws(self, laps, sent):
+        """A ws factory whose n-th connection yields laps[n] frames, then
+        ends the loop with KeyboardInterrupt once the laps run out."""
+        state = {"n": 0}
+        outer = self
+
+        class FakeWS:
+            def __init__(self, frames):
+                self.frames = list(frames)
+
+            async def send(self, raw):
+                sent.append(json.loads(raw))
+
+            async def recv(self):
+                f = sent[-1]
+                return json.dumps([f[0], f[1], f[2], "phx_reply",
+                                   {"status": "ok", "response": {}}])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.frames:
+                    raise KeyboardInterrupt
+                item = self.frames.pop(0)
+                if isinstance(item, Exception):
+                    raise item
+                return json.dumps(item)
+
+            async def close(self):
+                pass
+
+        async def connect(token):
+            i = state["n"]; state["n"] += 1
+            if i >= len(laps):
+                raise KeyboardInterrupt
+            return FakeWS(laps[i])
+        self.cli.backoff_sleep = lambda d: asyncio.sleep(0)
+        return connect
+
+    @staticmethod
+    def _msg(seq, text="t"):
+        return {"seq": seq, "content": {"payload": {"type": "text", "text": text}}}
+
+    def _frame(self, seq):
+        return [None, None, "room:R", "message:new", self._msg(seq)]
+
+    def test_consumer_failure_does_not_advance_the_cursor(self):
+        # 4/6: a raising on_event used to leave `seen` past the row forever
+        self._room_rest(lambda after: [self._msg(5), self._msg(6)] if after == 4
+                        else [self._msg(6)] if after == 5 else [])
+        sent, got, failed = [], [], {"once": False}
+        self.cli.ws_connect = self._laps_ws([[], [self._frame(7)]], sent)
+
+        def on_event(ev):
+            if ev["kind"] == "message" and ev["seq"] == 6 and not failed["once"]:
+                failed["once"] = True
+                raise OSError("disk full")
+            got.append((ev["kind"], ev.get("seq")))
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T", "user_id": "me"},
+                                             "default", "R", on_event))
+        self.assertEqual(got, [("joined", None), ("message", 5), ("reconnect", None),
+                               ("joined", None), ("message", 6), ("message", 7)])
+
+    def test_plain_events_mark_our_own(self):
+        me = "me-1234"
+        ev = self.cli.normalize_plain({"seq": 1, "sender_id": me, "content": {}}, me)
+        self.assertTrue(ev["own"])
+        self.assertEqual(ev["sender_binding"], "ok")
+        self.assertFalse(self.cli.normalize_plain({"seq": 1, "sender_id": "x", "content": {}}, me)["own"])
+        self.assertFalse(self.cli.normalize_plain({"seq": 1, "sender_id": me, "content": {}})["own"])
+
+    def test_sealed_events_carry_the_sender_binding(self):
+        rec = {"seq": 3, "kind": "application", "sender_id": "u", "payload": {"type": "text", "text": "x"},
+               "sender_binding_failed": True}
+        self.assertEqual(self.cli.normalize_sealed(rec)["sender_binding"], "failed")
+        rec = {"seq": 3, "kind": "application", "sender_id": "u", "payload": {}, "sender_binding": "unresolved"}
+        self.assertEqual(self.cli.normalize_sealed(rec)["sender_binding"], "unresolved")
+        self.assertEqual(self.cli.normalize_sealed({"seq": 4, "kind": "handshake", "added": ["d"]})["sender_binding"], "ok")
+
+    def test_channel_close_backs_off_with_an_event(self):
+        self._room_rest(lambda after: [])
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[[None, None, "room:R", "phx_close", {}]], []], sent)
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R",
+                                             lambda ev: got.append((ev["kind"], ev.get("raw")))))
+        kinds = [k for k, _ in got]
+        self.assertEqual(kinds, ["joined", "reconnect", "joined"])
+        self.assertIn("phx_close", got[1][1])
+
+    def test_initial_transient_is_retried_inside(self):
+        self._room_rest(lambda after: [], fail_first=2)
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[]], sent)
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R",
+                                             lambda ev: got.append(ev["kind"])))
+        self.assertEqual(got, ["reconnect", "reconnect", "joined"])
+
+    def test_non_retryable_4xx_stops_the_listener(self):
+        self._room_rest(lambda after: self.cli.KlatalkUsage("HTTP 422: bad"))
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[], []], sent)
+        with self.assertRaises(self.cli.KlatalkUsage):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R",
+                                             lambda ev: got.append(ev["kind"])))
+        self.assertEqual(got, ["joined"])          # no reconnect lap
+        self.assertIs(self.cli.error_class(422), self.cli.KlatalkUsage)
+        self.assertIs(self.cli.error_class(426), self.cli.KlatalkUsage)
+
+    def test_lock_contention_is_transient_for_the_listener(self):
+        self.assertTrue(issubclass(self.cli.KlatalkBusy, self.cli.KlatalkTransient))
+        self.assertGreater(self.cli.LOCK_TIMEOUT, self.cli.MLS_OP_TIMEOUT)
+        self._room_rest(lambda after: self.cli.KlatalkBusy("lock held"))
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[], []], sent)
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R",
+                                             lambda ev: got.append(ev["kind"])))
+        self.assertEqual(got, ["joined", "reconnect", "joined", "reconnect"])
+
+    def test_reconnect_event_carries_only_the_type_of_a_foreign_error(self):
+        self._room_rest(lambda after: [])
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[RuntimeError("SECRET-BODY")], []], sent)
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R",
+                                             lambda ev: got.append(ev)))
+        rec = [e for e in got if e["kind"] == "reconnect"][0]
+        self.assertEqual(rec["raw"], "RuntimeError")
+
+    def test_backfill_delivers_page_by_page(self):
+        pages = {4: [self._msg(i) for i in range(5, 205)], 204: [self._msg(205)]}
+        self._room_rest(lambda after: pages.get(after, []))
+        sent, got = [], []
+        self.cli.ws_connect = self._laps_ws([[]], sent)
+        seen_at_205 = {}
+
+        def on_event(ev):
+            got.append(ev.get("seq"))
+            if ev.get("seq") == 5:
+                seen_at_205["first_page_delivered_before_second_fetch"] = True
+        with self.assertRaises(KeyboardInterrupt):
+            asyncio.run(self.cli.listen_core({"access_token": "T"}, "default", "R", on_event))
+        self.assertEqual([s for s in got if s], list(range(5, 206)))
+
+    def test_do_listen_hole_refill_keeps_the_cursor_at_the_received_max(self):
+        inbox = os.path.join(self.tmp, "inbox.jsonl")
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        for seq in (1, 2, 3, 5, 6):
+            self.cli.record(inbox, {"topic": "room:R", "event": "message:new", "payload": self._msg(seq)})
+        self._room_rest(lambda after: [self._msg(4), self._msg(5), self._msg(6)] if after == 3 else [],
+                        room={"id": "R", "encryption_mode": "plain", "last_seq": 6,
+                              "my_last_read_seq": 0, "members": []})
+        sent = []
+        self.cli.ws_connect = self._laps_ws([[]], sent)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                asyncio.run(self.cli.do_listen({"access_token": "T"}, "R", inbox, profile="default"))
+        with open(inbox) as f:
+            seqs = [json.loads(l)["payload"]["seq"] for l in f]
+        self.assertEqual(seqs, [1, 2, 3, 5, 6, 4])       # the hole refilled once
+        self.assertEqual(self.cli.listen_cursor_read("default", "R"), 6)
+
+    def test_do_listen_sealed_writes_message_decrypted_rows(self):
+        inbox = os.path.join(self.tmp, "inbox.jsonl")
+        os.makedirs(self.cli.mls_dir("default"), exist_ok=True)
+        self._room_rest(lambda after: [], room={"id": "R", "encryption_mode": "mls10",
+                                                "last_seq": 2, "my_last_read_seq": 0, "members": []})
+        rec = {"seq": 1, "kind": "application", "sender_id": "u", "payload": {"type": "text", "text": "hi"}}
+        self.cli.sealed_pump = lambda creds, profile, room_id: []
+        ledger = []                               # empty at cold start…
+        self.cli.ledger_read = lambda profile, room_id: list(ledger)
+        sent = []
+        # …then a live frame lands and the pump (stubbed) has put the row in
+        self.cli.ws_connect = self._laps_ws([[[None, None, "room:R", "message:new", {"seq": 1}]]], sent)
+        real_pump = self.cli.sealed_pump
+        self.cli.sealed_pump = lambda creds, profile, room_id: ledger.append(rec) if not ledger else None
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(KeyboardInterrupt):
+                asyncio.run(self.cli.do_listen({"access_token": "T"}, "R", inbox, profile="default"))
+        self.assertIn("sealed room", out.getvalue())
+        with open(inbox) as f:
+            rows = [json.loads(l) for l in f]
+        self.assertEqual(rows, [{"topic": "room:R", "event": "message:decrypted", "payload": rec}])
+        self.assertFalse(os.path.exists(self.cli.listen_cursor_path("default", "R")))
+
+    # -- sealed sends --------------------------------------------------
+
+    def test_outbox_survives_an_unknown_outcome(self):
+        sends = []
+        self._sealed_stubs(sends)
+
+        async def lost(*a, **k):
+            raise self.cli.KlatalkTransient("no reply")
+        self.cli.do_send = lost
+        creds = {"user_id": "me", "device_id": "d1", "access_token": "T"}
+        with self.assertRaises(self.cli.KlatalkTransient):
+            self._sealed_send(creds, "default", "R", {"type": "text", "text": "x"})
+        journal, age = self.cli._outbox_load("default", "R")
+        self.assertIsNotNone(journal)
+        self.assertEqual(journal["payload"]["text"], "x")
+        # and a second sender right after sees it as in flight, not stale
+        self._sealed_stubs(sends)
+        with self.assertRaises(self.cli.KlatalkBusy):
+            self._sealed_send(creds, "default", "R", {"type": "text", "text": "y"})
+
+    def test_outbox_clear_respects_ownership(self):
+        os.makedirs(self.cli.mls_dir("default"), exist_ok=True)
+        self.cli.replace_private(self.cli.outbox_path("default", "R"),
+                                 lambda f: f.write(json.dumps({"client_msg_id": "b", "content": {}})))
+        self.assertFalse(self.cli._outbox_clear("default", "R", "a"))
+        self.assertTrue(os.path.exists(self.cli.outbox_path("default", "R")))
+        self.assertTrue(self.cli._outbox_clear("default", "R", "b"))
+        self.assertFalse(os.path.exists(self.cli.outbox_path("default", "R")))
+
+    def test_concurrent_sealed_sends_in_one_process_are_serialised(self):
+        sends = []
+        self._sealed_stubs(sends)
+        gate = asyncio.Event()
+        real_send = self.cli.do_send
+
+        async def slow_send(*a, **k):
+            await gate.wait()
+            return await real_send(*a, **k)
+        self.cli.do_send = slow_send
+        creds = {"user_id": "me", "device_id": "d1", "access_token": "T"}
+
+        async def run():
+            t1 = asyncio.create_task(self.cli.sealed_send_async(creds, "default", "R", {"type": "text", "text": "one"}))
+            t2 = asyncio.create_task(self.cli.sealed_send_async(creds, "default", "R", {"type": "text", "text": "two"}))
+            await asyncio.sleep(0.2)
+            gate.set()
+            return await asyncio.gather(t1, t2)
+        seqs = asyncio.run(run())
+        self.assertEqual(sorted(seqs), [21, 22])
+        self.assertEqual([r["payload"]["text"] for r in self.cli.ledger_read("default", "R")], ["one", "two"])
+        self.assertFalse(os.path.exists(self.cli.outbox_path("default", "R")))
+
+    def test_roster_ladder_runs_outside_the_room_lock(self):
+        sends = []
+        self._sealed_stubs(sends)
+        seen = []
+        lock_path = os.path.join(self.cli.mls_dir("default"), "lock-room-R")
+
+        def verify(creds, profile, room_id, quick=False):
+            held = getattr(self.cli._lock_depth, "held", {}) or {}
+            seen.append((quick, held.get(lock_path, 0) > 0))
+            return True
+        self.cli.verify_roster = verify
+        self._sealed_send({"user_id": "me", "device_id": "d1", "access_token": "T"},
+                          "default", "R", {"type": "text", "text": "x"})
+        self.assertEqual(seen, [(False, False), (True, True)])   # ladder unlocked, re-check locked
+
+    # -- hygiene and platform -------------------------------------------
+
+    def test_mls_op_garbage_does_not_echo_helper_output(self):
+        os.makedirs(os.path.dirname(self.cli.MLS_BIN), exist_ok=True)
+        open(self.cli.MLS_BIN, "w").close()
+
+        class R:
+            returncode, stdout, stderr = 0, '{"receipts":[{"plaintext_b64":"U0VDUkVU"}]}x', "e"
+        self.cli.subprocess.run = lambda *a, **k: R()
+        self.cli._MLS_VERSION_SHOWN = True
+        with self.assertRaises(self.cli.KlatalkMls) as cm:
+            self.cli.mls_op({"device_id": "d"}, "default", "ingest", {})
+        self.assertNotIn("U0VDUkVU", str(cm.exception))
+
+    def test_windows_has_no_fcntl_and_the_lock_is_a_noop(self):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli._fcntl = None
+        with self.cli.room_lock("default", "R"):
+            with self.cli.room_lock("default", "R"):
+                pass
+        self.assertEqual(self.cli._lock_depth.held.get(
+            os.path.join(self.cli.mls_dir("default"), "lock-room-R")), 0)
+
+    def test_attachment_404_is_not_membership_loss(self):
+        class O:
+            def open(self_, req, timeout=0):
+                raise urllib.error.HTTPError(req.full_url, 404, "x", {}, io.BytesIO(b"{}"))
+        self.cli.OPENER = O()
+        with self.assertRaises(self.cli.KlatalkError) as cm:
+            self.cli.fetch_upload({"access_token": "T"}, "/uploads/R/a.png", 10)
+        self.assertNotIsInstance(cm.exception, self.cli.KlatalkMembership)
+
+    def test_cmd_read_prints_both_confirmations(self):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli.write_private(self.cli.cred_path("default"),
+                               lambda f: json.dump({"access_token": "T"}, f))
+        answers = iter([7, None])
+
+        async def do_read(creds, room_id, seq):
+            return next(answers)
+        self.cli.do_read = do_read
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cli.cmd_read(argparse_ns(room="R", seq=7))
+            self.cli.cmd_read(argparse_ns(room="R", seq=7))
+        self.assertEqual(out.getvalue().splitlines(),
+                         ["read 7 (server confirmed 7)",
+                          "read 7 (no change — already read up to that point)"])
+
+
+
+for _n in [n for n in dir(TestCoreLibrary) if n.startswith("test_")]:
+    setattr(TestCoreFixRound, _n, None)   # helpers are inherited, tests are not
 
 if __name__ == "__main__":
     unittest.main()

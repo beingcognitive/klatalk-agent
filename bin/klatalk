@@ -112,6 +112,19 @@ class KlatalkQuota(KlatalkError):
     """429 / upload quota / over a size ceiling."""
 
 
+class KlatalkBusy(KlatalkTransient):
+    """Another process (or thread) holds the lock this call needs — the
+    room lock, the pins lock, or the helper's own state lock. The holder
+    finishes; this is transient by construction and never kills a
+    resident listener (133 r1: it did, as a KlatalkMls)."""
+
+
+class KlatalkBlocked(KlatalkError):
+    """Sending is refused by a sealed-room rule a human must clear — an
+    unverified device, an unsettled journal. Not the server, not
+    retryable by a loop; report it to the owner."""
+
+
 class KlatalkUsage(KlatalkError):
     """Bad input or local state a human must fix (a suspicious id, an
     unreadable file, a corrupt journal) — not retryable, not the server."""
@@ -348,6 +361,10 @@ def error_class(status):
         return KlatalkQuota
     if status >= 500 or status in (408,):
         return KlatalkTransient
+    if 400 <= status < 500:
+        # a request the server refuses identically forever — a reception
+        # loop must not retry it (v1.3 exited here; 133 r1 3/6)
+        return KlatalkUsage
     return KlatalkError
 
 
@@ -414,9 +431,12 @@ async def ws_connect(token):
         # a 401 at the handshake is the token, anything else is transport
         code = (getattr(e, "status_code", None)
                 or getattr(getattr(e, "response", None), "status_code", None))
-        if code == 401 or code == 403:
-            raise KlatalkAuth(f"socket handshake refused ({code}) — check the"
+        if code == 401:
+            raise KlatalkAuth("socket handshake refused (401) — check the"
                               " credentials and register again")
+        if code and 400 <= code < 500 and code not in (408, 429):
+            # 403/404/426 at the handshake do not clear by retrying
+            raise KlatalkMembership(f"socket handshake refused ({code})")
         raise KlatalkTransient(f"socket handshake failed: {type(e).__name__}")
 
 
@@ -575,10 +595,13 @@ def listen_cursor_read(profile, room_id):
 
 def listen_cursor_write(profile, room_id, seq):
     try:
-        replace_private(listen_cursor_path(profile, room_id),
-                        lambda f: f.write(str(seq)))
+        # a plain write, not the fsync+rename ceremony: this is written per
+        # received row, and a lost or short cursor only costs duplicate
+        # emissions, never data (133 r1)
+        write_private(listen_cursor_path(profile, room_id),
+                      lambda f: f.write(str(seq)))
     except OSError:
-        pass    # a lost cursor only costs duplicate emissions, never data
+        pass
 
 
 def inbox_resume_state(inbox, room_id):
@@ -647,10 +670,6 @@ INVITE_URL_CODE = re.compile(r"/r/([a-z2-7]{8})", re.IGNORECASE)
 _MLS_VERSION_SHOWN = False
 
 
-class MlsError(KlatalkMls):
-    """Historical name — every helper failure is a KlatalkMls."""
-
-
 class SendRejected(KlatalkError):
     """The server ANSWERED with a rejection — not an unknown outcome.
     Retrying the same bytes gives the same answer, so the outbox journal
@@ -672,13 +691,20 @@ def safe_room_id(room_id):
 #
 # A terminal and a gateway may work the same profile at once: two pumps
 # interleaving on one ledger, or an outbox replaced under a send. One
-# advisory lock per (profile, room) serialises every sealed-state mutation;
-# the pins file (profile-wide) gets its own. Re-entrant within a thread,
-# contended across threads and processes; a wedged holder shows up as a
-# KlatalkMls after LOCK_TIMEOUT rather than a hang. Windows has no fcntl —
-# the CLI still works there single-process; a daemon refuses to start.
+# advisory lock per (profile, room) serialises every sealed-state mutation
+# AND the ledger reads that race its rotation; the pins file (profile-wide)
+# gets its own, taken only around load→merge→save. Re-entrant within a
+# thread (the depth map is thread-local: enter and leave a lock inside the
+# same to_thread call, never across an await), contended across threads and
+# processes; a holder still busy after LOCK_TIMEOUT shows up as KlatalkBusy
+# (transient) rather than a hang. The lock is held only across local work —
+# never a network hop, never the roster backoff ladder (133 r1). Windows
+# has no fcntl — the CLI still works there single-process; a daemon refuses
+# to start. The helper binary keeps its own state lock; this one does not
+# replace it, it keeps our files consistent around it.
 
-LOCK_TIMEOUT = 60
+MLS_OP_TIMEOUT = 60           # one helper call
+LOCK_TIMEOUT = MLS_OP_TIMEOUT + 30   # > the longest hold a healthy holder takes
 try:
     import fcntl as _fcntl
 except ImportError:           # Windows
@@ -709,8 +735,8 @@ def _file_lock(path, what):
                 break
             except OSError:
                 if time.time() > deadline:
-                    raise KlatalkMls(f"another process has held the {what}"
-                                     f" lock for over {LOCK_TIMEOUT}s")
+                    raise KlatalkBusy(f"another process has held the {what}"
+                                      f" lock for over {LOCK_TIMEOUT}s")
                 time.sleep(0.1)
         held[path] = 1
         try:
@@ -727,8 +753,9 @@ def _file_lock(path, what):
 
 def room_lock(profile, room_id):
     """Serialises sealed-state mutations for one room of one profile."""
+    # "lock-room-" keeps a room literally named "pins" off the pins lock
     return _file_lock(os.path.join(mls_dir(profile),
-                                   f"lock-{safe_room_id(room_id)}"),
+                                   f"lock-room-{safe_room_id(room_id)}"),
                       f"room {room_id}")
 
 
@@ -802,19 +829,24 @@ def mls_op(creds, profile, op, payload=None):
         # The helper is local crypto over local state — a minute means a
         # wedged lock, and an unbounded wait would hang every caller
         r = subprocess.run(cmd, input=json.dumps(payload or {}),
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True,
+                           timeout=MLS_OP_TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise MlsError(f"helper timed out after 60s (op {op}) — another"
-                       " process may be holding the state lock")
+        raise KlatalkBusy(f"helper timed out after {MLS_OP_TIMEOUT}s (op {op})"
+                          " — another process may be holding the state lock")
     except OSError as e:
         # A path that exists but cannot execute (wrong arch, missing
         # .exe on Windows) must not surface as a raw traceback
-        raise MlsError(f"cannot run the helper at {MLS_BIN}: {e}")
+        raise KlatalkMls(f"cannot run the helper at {MLS_BIN}: {e}")
     try:
         out = json.loads(r.stdout.strip() or "{}")
     except ValueError:
-        raise MlsError(f"helper returned garbage (op {op}):"
-                       f" {r.stdout[:200]} {r.stderr[:200]}")
+        # `ingest` output carries plaintext_b64 and `encrypt` the ciphertext
+        # — an exception string is logged by whoever embeds the core, so it
+        # carries the SHAPE of the failure, never its bytes (133 r1)
+        raise KlatalkMls(f"helper returned unparseable output (op {op}, rc"
+                         f" {r.returncode}, {len(r.stdout)}B stdout,"
+                         f" {len(r.stderr)}B stderr)")
     if r.returncode != 0 or "error" in out:
         err = out.get("error") or f"helper failed (op {op})"
         if "identity mismatch" in err:
@@ -830,7 +862,7 @@ def mls_op(creds, profile, op, payload=None):
                              " memberships need a fresh invite (register"
                              " --force for a new account if credentials"
                              " changed too).")
-        raise MlsError(err)
+        raise KlatalkMls(err)
     return out
 
 
@@ -925,6 +957,14 @@ def ledger_append(profile, room_id, recs):
 
 
 def ledger_read(profile, room_id):
+    """Read under the room lock — ledger_append rotates the current file
+    to .1 in place, and a reader that opened .1 before the rotation and
+    the current file after it sees neither generation (133 r1, 5/6)."""
+    with room_lock(profile, room_id):
+        return _ledger_read(profile, room_id)
+
+
+def _ledger_read(profile, room_id):
     out, seen, tombs = [], set(), set()
     for path in (ledger_path(profile, room_id) + ".1",
                  ledger_path(profile, room_id)):
@@ -1283,10 +1323,12 @@ def rotation_explains(pin, leaf_key, reg):
 
 
 def verify_roster(creds, profile, room_id, quick=False):
-    """Lock-taking entry (pins are profile-wide; two rooms verifying at
-    once must not clobber each other's pins). Algorithm in _verify_roster."""
-    with pins_lock(profile):
-        return _verify_roster(creds, profile, room_id, quick)
+    """Pins are profile-wide: two rooms verifying at once must not clobber
+    each other's pins, so every load→merge→save of pins.json runs under
+    pins_lock — and ONLY those (the backoff ladder sleeps up to 63s; held
+    across it, the lock starved every other room, 133 r1). The room-scoped
+    unverified marker is written under the room lock."""
+    return _verify_roster(creds, profile, room_id, quick)
 
 
 def _verify_roster(creds, profile, room_id, quick=False):
@@ -1302,30 +1344,32 @@ def _verify_roster(creds, profile, room_id, quick=False):
                     {"room_id": room_id}).get("members", [])
     own_key = mls_op(creds, profile, "signing-public-key")["public_key_b64"]
 
-    if is_unverified(profile, room_id):
-        # Auto-release when the offending leaf is gone (the app's grammar:
-        # removal resolves it); otherwise re-print the reason — a silent
-        # second run pointing at "the warning above" helps no one
-        try:
-            with open(unverified_path(profile, room_id)) as f:
-                why = f.read()
-        except OSError:
-            why = ""
-        live = {l.get("identity") for l in leaves}
-        if any(dev in why for dev in live):
-            warn(f"warning: room {room_id} still has an unverified device"
-                 f" ({why}) — sending stays blocked; a human clears"
-                 f" {unverified_path(profile, room_id)}")
-            return False
-        try:
-            os.remove(unverified_path(profile, room_id))
-        except OSError:
-            pass
+    with room_lock(profile, room_id):
+        if is_unverified(profile, room_id):
+            # Auto-release when the offending leaf is gone (the app's grammar:
+            # removal resolves it); otherwise re-print the reason — a silent
+            # second run pointing at "the warning above" helps no one
+            try:
+                with open(unverified_path(profile, room_id)) as f:
+                    why = f.read()
+            except OSError:
+                why = ""
+            live = {l.get("identity") for l in leaves}
+            if any(dev in why for dev in live):
+                warn(f"warning: room {room_id} still has an unverified device"
+                     f" ({why}) — sending stays blocked; a human clears"
+                     f" {unverified_path(profile, room_id)}")
+                return False
+            try:
+                os.remove(unverified_path(profile, room_id))
+            except OSError:
+                pass
 
     # All pins matching = no registry needed (app parity) — return early
     # so a room-lookup outage cannot block sending in a healthy room
     # (mini-review P2)
-    _pins0 = load_pins(profile)
+    with pins_lock(profile):
+        _pins0 = load_pins(profile)
     if leaves and all(
             (_key_eq(l.get("signature_key_b64"), own_key)
              if l.get("identity") == creds.get("device_id")
@@ -1344,7 +1388,9 @@ def _verify_roster(creds, profile, room_id, quick=False):
             unresolved = ["room unreadable"]
             break
         dmap = device_key_map(creds, room)
-        pins = load_pins(profile)
+        with pins_lock(profile):
+            pins = load_pins(profile)
+        updates = {}                  # devs this round pinned or re-pinned
         unresolved, mismatched = [], []
         for leaf in leaves:
             dev = leaf.get("identity")
@@ -1366,8 +1412,9 @@ def _verify_roster(creds, profile, room_id, quick=False):
                     # Pin beats registry — a rewritten registry would agree
                     mismatched.append((dev, "pin mismatch"))
                 else:
-                    pins[dev] = dict(pin, key=leaf_key, generation=newgen,
-                                     rotated_at=int(time.time()))
+                    updates[dev] = pins[dev] = dict(
+                        pin, key=leaf_key, generation=newgen,
+                        rotated_at=int(time.time()))
                 continue
             if reg is None:
                 unresolved.append(dev)
@@ -1377,16 +1424,23 @@ def _verify_roster(creds, profile, room_id, quick=False):
                 # do not freeze: the Remove+Add commit resolves it (§5-6)
                 unresolved.append(dev)
                 continue
-            pins[dev] = {"user_id": reg.get("user_id"), "key": leaf_key,
-                         "generation": reg.get("generation", 1),
-                         "first_seen": int(time.time())}
+            updates[dev] = pins[dev] = {
+                "user_id": reg.get("user_id"), "key": leaf_key,
+                "generation": reg.get("generation", 1),
+                "first_seen": int(time.time())}
         # Persist what this round observed even when leaves remain
         # unresolved — losing four good pins over one pending joiner
-        # defeats the join-moment TOFU (§5-1)
-        save_pins(profile, pins)
+        # defeats the join-moment TOFU (§5-1). Merge into a fresh read so
+        # another room's pins written meanwhile survive.
+        if updates:
+            with pins_lock(profile):
+                merged = load_pins(profile)
+                merged.update(updates)
+                save_pins(profile, merged)
         if mismatched:
             why = ", ".join(f"{d} ({r})" for d, r in mismatched)
-            mark_unverified(profile, room_id, why)
+            with room_lock(profile, room_id):
+                mark_unverified(profile, room_id, why)
             warn(f"warning: unverified device in room {room_id}: {why} —"
                  " sending is blocked. If a human has judged this safe,"
                  f" delete {unverified_path(profile, room_id)}")
@@ -1596,7 +1650,7 @@ def sealed_join(args, creds, profile, code, frag):
                                {"welcome_b64": welcome,
                                 "expected_room_id": room_id,
                                 "request_id": req_id})
-                    except MlsError as e:
+                    except KlatalkMls as e:
                         # Unopenable welcome (or wrong room): abandon opens
                         # the orphan-cleanup path and a fresh-KP retry —
                         # retrying the same welcome is pointless
@@ -1620,7 +1674,7 @@ def sealed_join(args, creds, profile, code, frag):
                 try:
                     mls_op(creds, profile, "delete-group",
                            {"room_id": room_id})
-                except MlsError:
+                except KlatalkMls:
                     pass
                 clear_pending(profile)
                 sys.exit("the door closed before confirmation — ask to be"
@@ -1655,7 +1709,7 @@ def sealed_join(args, creds, profile, code, frag):
             if room_id and mls_op(creds, profile, "has-group",
                                   {"room_id": room_id})["has_group"]:
                 mls_op(creds, profile, "delete-group", {"room_id": room_id})
-        except MlsError:
+        except KlatalkMls:
             pass
         clear_pending(profile)
         sys.exit("couldn't get in — the link may be closed or the answer"
@@ -1679,13 +1733,18 @@ def sealed_join(args, creds, profile, code, frag):
 PAGE = 200
 
 
-def normalize_plain(m):
+def normalize_plain(m, me=None):
     content = m.get("content") or {}
     payload = content.get("payload") or {}
     return {"kind": "system" if payload.get("type") == "system" else "message",
             "seq": m.get("seq"), "sender_id": m.get("sender_id"),
             "reply_to_seq": m.get("reply_to_seq"), "payload": payload,
-            "sealed": False, "own": False, "deleted": bool(m.get("deleted")),
+            "sealed": False,
+            # our own echo comes back on our own socket — a consumer that
+            # filters on `own` must see it here too (133 r1, 3/6)
+            "own": bool(me) and m.get("sender_id") == me,
+            "deleted": bool(m.get("deleted")),
+            "sender_binding": "ok",          # plain rooms: server-attested
             "inserted_at": m.get("inserted_at"), "raw": m}
 
 
@@ -1699,34 +1758,48 @@ def normalize_sealed(rec):
                    "text": f"[membership change {names}]" if kind == "handshake"
                    else f"[{kind}]"}
         ekind = "system"
+    # §4-5: the sender-binding verdict rides the event, not just `raw` — a
+    # consumer reading payload/sender_id alone would quote a row whose
+    # label and crypto disagree (133 r1)
+    binding = ("failed" if rec.get("sender_binding_failed")
+               else rec.get("sender_binding") or "ok")
     return {"kind": ekind, "seq": rec.get("seq"),
             "sender_id": rec.get("sender_id"),
             "reply_to_seq": rec.get("reply_to_seq"), "payload": payload,
             "sealed": True, "own": bool(rec.get("own")),
             "deleted": bool(rec.get("deleted")),
+            "sender_binding": binding,
             "inserted_at": rec.get("inserted_at"), "raw": rec}
+
+
+def messages_page(creds, room_id, after_seq, limit=PAGE):
+    """One page of a plain room, oldest first, as normalized events."""
+    st, data = rest("GET", room_path(room_id, "/messages",
+                                     {"after_seq": after_seq, "limit": limit}),
+                    token=creds["access_token"])
+    die_on(st, data)
+    return [normalize_plain(m, creds.get("user_id"))
+            for m in data.get("messages", [])]
 
 
 def events_after(creds, profile, room_id, after_seq, sealed):
     """Every event with seq > after_seq, oldest first — plain rooms paged
     from the server to the end (a single page silently loses the tail),
     sealed rooms pumped then read from the ledger (each seq decrypts
-    exactly once; the ledger is the only re-read surface)."""
+    exactly once; the ledger is the only re-read surface). A long plain
+    backfill is better consumed page by page (listen_core does) — this
+    buffers to the end for callers that want the list."""
     if sealed:
         sealed_pump(creds, profile, room_id)
         return [normalize_sealed(r) for r in ledger_read(profile, room_id)
                 if (r.get("seq") or 0) > after_seq]
     out, cur = [], after_seq
     while True:
-        st, data = rest("GET", room_path(room_id, "/messages",
-                                         {"after_seq": cur, "limit": PAGE}),
-                        token=creds["access_token"])
-        die_on(st, data)
-        page = data.get("messages", [])
-        for m in page:
-            out.append(normalize_plain(m))
-            if isinstance(m.get("seq"), int):
-                cur = max(cur, m["seq"])
+        page = messages_page(creds, room_id, cur)
+        out.extend(page)
+        for ev in page:
+            if isinstance(ev.get("seq"), int):
+                cur = max(cur, ev["seq"])
         if len(page) < PAGE:
             return out
 
@@ -1735,7 +1808,9 @@ def cold_start_cursor(room, profile, sealed):
     """Where reception starts when nothing local says otherwise: the read
     mark (everything unjudged wakes), else the room's latest (history is
     catch-up, not a wake-up — starting at 0 replayed whole rooms as fresh
-    events, 266 review). Sealed rooms resume from the ledger's tail."""
+    events, 266 review). Sealed rooms resume from the ledger's tail. A
+    consumer that never signs read (`listen`) lands on last_seq only on
+    its very first run — from then on its cursor file is the resume."""
     if sealed:
         return max((r.get("seq") or 0
                     for r in ledger_read(profile, room["id"])), default=0)
@@ -1748,34 +1823,34 @@ async def _emit(on_event, event):
         await r
 
 
+backoff_sleep = asyncio.sleep      # tests shorten the reconnect wait here
+STABLE_AFTER = 60                  # a connection this old resets the backoff
+
+
 async def listen_core(creds, profile, room_id, on_event, cursor=None):
     """Hold one socket to a room and hand every new event to on_event
     (a plain function or a coroutine function) — reconnecting with backoff
     for as long as the task lives (cancel it to stop). `cursor` is the
-    transport cursor (last seq already delivered; None = cold start rule):
-    it deduplicates, it never signs — a read mark is a judgment the
-    consumer makes. Raises KlatalkAuth / KlatalkMembership / KlatalkMls when
-    the room is gone for this account or the helper is unusable; every
-    transient failure is retried inside."""
+    transport cursor (last seq already ACCEPTED by the consumer; None =
+    cold start rule): it deduplicates, it never signs — a read mark is a
+    judgment the consumer makes. It moves only after on_event returned,
+    so a consumer that raises gets the same row again after the reconnect
+    (at-least-once; 133 r1 4/6). Retried inside: transient server/network
+    trouble, quota, a busy lock. Raised out: auth, membership, an unusable
+    helper, and any 4xx the server would answer identically forever."""
     token = creds["access_token"]
-    room = await asyncio.to_thread(get_room, creds, room_id)
-    if room is None:
-        raise KlatalkMembership("not a member of that room")
-    sealed = is_sealed(room)
-    if cursor is None:
-        cursor = await asyncio.to_thread(cold_start_cursor, room, profile, sealed)
-    seen = cursor
+    room, sealed, seen = None, False, cursor
     delay = 1
 
     async def deliver(events):
         nonlocal seen
         for ev in events:
             seq = ev.get("seq")
-            if isinstance(seq, int):
-                if seq <= seen:
-                    continue          # raced the backfill — seen once
-                seen = seq
+            if isinstance(seq, int) and seq <= seen:
+                continue              # raced the backfill — seen once
             await _emit(on_event, ev)
+            if isinstance(seq, int):
+                seen = seq            # accepted, not merely received
 
     async def pump_and_emit():
         # Sealed ingress: the pump pages from the helper's resume point, so
@@ -1791,14 +1866,32 @@ async def listen_core(creds, profile, room_id, on_event, cursor=None):
             return
         await deliver(events)
 
+    async def backfill():
+        # page by page — a 50k-row gap makes durable progress on every
+        # page instead of buffering to the end (133 r1)
+        while True:
+            page = await asyncio.to_thread(messages_page, creds, room_id, seen)
+            await deliver(page)
+            if len(page) < PAGE:
+                return
+
     while True:
         ws = None
+        connected_at = None
         try:
+            if room is None:
+                room = await asyncio.to_thread(get_room, creds, room_id)
+                if room is None:
+                    raise KlatalkMembership("not a member of that room")
+                sealed = is_sealed(room)
+                if seen is None:
+                    seen = await asyncio.to_thread(cold_start_cursor, room,
+                                                   profile, sealed)
             ws = await ws_connect(token)
             topic = await ws_join(ws, room_id)
+            connected_at = time.monotonic()
             await _emit(on_event, {"kind": "joined", "seq": None,
                                    "sealed": sealed, "raw": topic})
-            delay = 1
             # Heartbeat must outlive the backfill — a long first pump used
             # to starve it and flap the socket (impl /133)
             hb = asyncio.create_task(heartbeat(ws))
@@ -1809,8 +1902,7 @@ async def listen_core(creds, profile, room_id, on_event, cursor=None):
                 if sealed:
                     await pump_and_emit()
                 else:
-                    await deliver(await asyncio.to_thread(
-                        events_after, creds, profile, room_id, seen, False))
+                    await backfill()
                 async for raw in ws:
                     frame = parse_frame(raw)
                     if not frame:
@@ -1820,34 +1912,42 @@ async def listen_core(creds, profile, room_id, on_event, cursor=None):
                                  "read:update"):
                         continue
                     if event in ("phx_error", "phx_close"):
-                        break
+                        # the channel said no — through the backoff path,
+                        # or a server that errors every join spins silently
+                        raise KlatalkTransient(f"channel {event} — rejoining")
                     if event == "message:new":
                         if sealed:
                             await pump_and_emit()
                         else:
-                            await deliver([normalize_plain(payload)])
+                            await deliver([normalize_plain(payload,
+                                                           creds.get("user_id"))])
                         continue
                     await _emit(on_event, {"kind": "frame", "event": event,
                                            "seq": None, "sealed": sealed,
                                            "raw": payload})
+                raise KlatalkTransient("socket closed — rejoining")
             finally:
                 hb.cancel()
                 try:
                     await hb
                 except (asyncio.CancelledError, Exception):
                     pass
-        except (KlatalkAuth, KlatalkMembership, KlatalkMls, KlatalkUsage):
-            raise
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # Transient by default — the room is still ours, the path is
-            # not: back off and try again (websockets' own exceptions, a
-            # KlatalkTransient from the backfill, a dropped socket)
+            if isinstance(e, KlatalkError) and not isinstance(
+                    e, (KlatalkTransient, KlatalkQuota)):
+                raise             # auth, membership, mls, usage, blocked — final
+            if connected_at is not None and \
+                    time.monotonic() - connected_at >= STABLE_AFTER:
+                delay = 1         # a stable session earns a fresh ladder
+            # A KlatalkError's text is allowlisted by construction; a foreign
+            # exception's is not — only its type travels (133 r1)
+            detail = str(e) if isinstance(e, KlatalkError) else type(e).__name__
             await _emit(on_event, {"kind": "reconnect", "seq": None,
                                    "sealed": sealed, "delay": delay,
-                                   "raw": f"{type(e).__name__}: {e}"})
-            await asyncio.sleep(delay)
+                                   "raw": detail})
+            await backoff_sleep(delay)
             delay = min(delay * 2, 60)
         finally:
             if ws is not None:
@@ -1862,26 +1962,25 @@ async def do_listen(creds, room_id, inbox, profile=None):
     shape — message:new rows for plain rooms, message:decrypted ledger
     records for sealed ones — so monitors written against v1.x keep
     working). Resumes from the cursor file, else the inbox's contiguous
-    tail, else the cold-start rule."""
-    sealed = is_sealed(get_room(creds, room_id))
+    tail, else the cold-start rule. Sealed rooms never used the cursor
+    file or the inbox tail (their rows are message:decrypted), so the
+    plain computation below yields None for them on its own."""
     topic = f"room:{room_id}"
-    if sealed:
-        seen, recorded_seqs = None, set()
-    else:
-        seen, recorded_seqs = inbox_resume_state(inbox, room_id)
-        seen = max(seen, listen_cursor_read(profile, room_id)) or None
+    resume, recorded_seqs = inbox_resume_state(inbox, room_id)
+    seen = max(resume, listen_cursor_read(profile, room_id)) or None
     print(f"inbox: {inbox}", flush=True)
-    if sealed:
-        print("sealed room — recording decrypted plaintext via the local"
-              " ledger (single ingress)", flush=True)
 
     def on_event(ev):
         kind = ev.get("kind")
         if kind == "joined":
+            if ev.get("sealed"):
+                print("sealed room — recording decrypted plaintext via the"
+                      " local ledger (single ingress)", flush=True)
             print(f"joined {ev['raw']}", flush=True)
             return
         if kind == "reconnect":
-            print(f"reconnect after error: {ev['raw']}", flush=True)
+            print(f"reconnect after error: {ev['raw']} (in {ev['delay']}s)",
+                  flush=True)
             return
         if kind == "desync":
             out = {"topic": topic, "event": "room:desynced",
@@ -1890,16 +1989,18 @@ async def do_listen(creds, room_id, inbox, profile=None):
             out = {"topic": topic, "event": ev["event"], "payload": ev["raw"]}
         else:
             seq = ev.get("seq")
+            if isinstance(seq, int) and not ev["sealed"]:
+                # the cursor tracks what was RECEIVED — a suppressed hole
+                # refill is still a row the inbox holds (133 r1)
+                listen_cursor_write(profile, room_id, seq)
             if seq in recorded_seqs:
                 return            # a hole refill is not a fresh event
             out = {"topic": topic,
                    "event": "message:decrypted" if ev["sealed"] else "message:new",
                    "payload": ev["raw"]}
-            if isinstance(seq, int):
+            if isinstance(seq, int) and not ev["sealed"]:
                 recorded_seqs.add(seq)
-                if not ev["sealed"]:
-                    listen_cursor_write(profile, room_id, seq)
-        record(inbox, out)
+        record(inbox, out)        # a failed write raises → re-delivered
         print(json.dumps(out, ensure_ascii=False), flush=True)
 
     await listen_core(creds, profile, room_id, on_event, cursor=seen)
@@ -2148,10 +2249,8 @@ def cmd_join(args):
                 print(f"warning: this room already has the same nickname"
                       f" ({my}) — convention is that whoever arrived first"
                       " yields via rename.", file=sys.stderr)
-    except SystemExit:
-        raise
     except Exception:
-        pass
+        pass      # the join already succeeded; the probe is optional
 
 
 def is_ai(member):
@@ -2544,9 +2643,9 @@ def cmd_request_approval(args):
     payload = {"type": "approval_request", "approval_id": approval_id,
                "canon": base64.b64encode(canon).decode(), "text": fallback}
     try:
-        asyncio.run(do_send(creds, args.room, fallback, payload=payload,
-                            read_through=READ_THROUGH_SENT))
-    except (SystemExit, Exception):
+        seq = asyncio.run(do_send(creds, args.room, fallback, payload=payload,
+                                  read_through=READ_THROUGH_SENT))
+    except Exception:
         # A pending row with no card in the room is the orphan §2-2
         # forbids — take the request back before dying. SendRejected and
         # transport errors must land here too, and the revocation itself
@@ -2563,6 +2662,7 @@ def cmd_request_approval(args):
             sys.exit(f"card send failed — approval {approval_id} may still"
                      " be pending; revoke it before retrying")
         sys.exit("card send failed — the approval request was revoked")
+    print(f"sent seq {seq} (as {creds.get('nickname', '?')})")
     print(json.dumps({"approval_id": approval_id,
                       "status": data.get("status"),
                       "expires_at": data.get("expires_at")},
@@ -2606,10 +2706,14 @@ def cmd_approval_consume(args):
     print(json.dumps(data, ensure_ascii=False))
 
 
+OUTBOX_INFLIGHT = 90     # a journal younger than this may still be on the wire
+
+
 def sealed_preflight(creds, profile, room_id):
-    """Every refusal sealed_send can hand back, asked before anything
+    """Every refusal a sealed send can hand back, asked before anything
     irreversible (an upload). A gate that fires after the bytes left is
-    not a gate — an unverified device would already hold them."""
+    not a gate — an unverified device would already hold them. The roster
+    ladder runs OUTSIDE the room lock (it sleeps up to 63s)."""
     safe_room_id(room_id)
     with room_lock(profile, room_id):
         if is_desynced(profile, room_id):
@@ -2617,41 +2721,64 @@ def sealed_preflight(creds, profile, room_id):
                                 " blocked; nothing was uploaded. Leave and get"
                                 " re-invited to recover.")
         if os.path.exists(outbox_path(profile, room_id)):
-            raise KlatalkError("a previous message's outcome is still unknown"
-                               " — settle it with a text send in this room"
-                               " first, then resend the attachment (nothing"
-                               " was uploaded)")
+            raise KlatalkBlocked("a previous message's outcome is still"
+                                 " unknown — settle it with a text send in"
+                                 " this room first, then resend the"
+                                 " attachment (nothing was uploaded)")
         _sealed_pump(creds, profile, room_id)
         if is_desynced(profile, room_id):
             raise KlatalkDesync("this room just desynchronized — sending is"
                                 " blocked; nothing was uploaded")
-        if not verify_roster(creds, profile, room_id):
-            raise KlatalkError("sending is blocked until every device in the"
-                               " room is verified — nothing was uploaded")
+    if not verify_roster(creds, profile, room_id):
+        raise KlatalkBlocked("sending is blocked until every device in the"
+                             " room is verified — nothing was uploaded")
 
 
 def _outbox_load(profile, room_id):
-    try:
-        with open(outbox_path(profile, room_id)) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    """(journal, age_seconds) or (None, None). Read under the room lock so
+    a half-replaced file is never seen."""
+    path = outbox_path(profile, room_id)
+    with room_lock(profile, room_id):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            age = max(0.0, time.time() - os.path.getmtime(path))
+            return data, age
+        except (OSError, ValueError):
+            return None, None
 
 
-def _outbox_clear(profile, room_id):
-    try:
-        os.remove(outbox_path(profile, room_id))
-    except OSError:
-        pass
+def _outbox_clear(profile, room_id, client_msg_id):
+    """Close OUR journal. The room lock is not held across the network
+    hop, so by now the file may belong to another sender — deleting that
+    one would destroy the record of ITS unknown outcome (133 r1, 5/6)."""
+    with room_lock(profile, room_id):
+        current, _ = _outbox_load(profile, room_id)
+        if current is None or current.get("client_msg_id") != client_msg_id:
+            return False
+        try:
+            os.remove(outbox_path(profile, room_id))
+        except OSError:
+            pass
+        return True
 
 
 def _sealed_prepare(creds, profile, room_id, payload, reply_to):
-    """Sync half one of a sealed send (runs under the room lock, off the
-    event loop): catch up, verify, encrypt, journal. Returns (content,
-    client_msg_id). The journal (outbox) exists from here until
-    _sealed_commit — a crash in between is the unknown outcome the next
-    send settles first."""
+    """Sync half one of a sealed send: catch up, pin the epoch, verify,
+    encrypt, journal — under the room lock, off the event loop. The full
+    roster ladder (up to 63s of backoff) runs BEFORE the lock; inside it a
+    quick re-check guards the epoch. Returns (content, client_msg_id). The
+    journal exists from here until _sealed_commit — a crash in between is
+    the unknown outcome the next send settles first."""
+    if not verify_roster(creds, profile, room_id):
+        raise KlatalkBlocked("sending is blocked until every device in the"
+                             " room is verified (see the warning above)")
     with room_lock(profile, room_id):
+        # One journal slot per room: overwriting it strands the in-flight
+        # message it belongs to (the same line sealed_preflight holds)
+        if os.path.exists(outbox_path(profile, room_id)):
+            raise KlatalkBusy("another sealed send is in flight in this room"
+                              " — retry shortly")
         if is_desynced(profile, room_id):
             raise KlatalkDesync("this room is desynchronized — sending is"
                                 " blocked (a stale epoch could hand new secrets"
@@ -2666,16 +2793,16 @@ def _sealed_prepare(creds, profile, room_id, payload, reply_to):
         plaintext_b64 = base64.b64encode(
             json.dumps(payload, ensure_ascii=False).encode()).decode()
         # Epoch CAS (impl /133 P0 + mini-review correction): pin the epoch
-        # BEFORE verification so that a change during or right after it
-        # lands as a CAS failure — reading it after verification would lock
-        # in the epoch of an unverified leaf that slipped in between
+        # BEFORE the verification so that a change during or right after
+        # it lands as a CAS failure — reading it after would lock in the
+        # epoch of an unverified leaf that slipped in between
         for attempt in range(2):
             epoch = mls_op(creds, profile, "group-epoch",
                            {"room_id": room_id})["epoch"]
-            if not verify_roster(creds, profile, room_id):
-                raise KlatalkError("sending is blocked until every device in"
-                                   " the room is verified (see the warning"
-                                   " above)")
+            if not verify_roster(creds, profile, room_id, quick=True):
+                raise KlatalkBlocked("the roster changed while preparing the"
+                                     " message and is not verified — retry"
+                                     " once it settles")
             try:
                 ct = mls_op(creds, profile, "encrypt",
                             {"room_id": room_id, "expected_epoch": epoch,
@@ -2696,10 +2823,10 @@ def _sealed_prepare(creds, profile, room_id, payload, reply_to):
         return content, cmid
 
 
-def _sealed_commit(creds, profile, room_id, seq, payload, reply_to):
+def _sealed_commit(creds, profile, room_id, seq, payload, reply_to, cmid):
     """Sync half two: the utterance is stored — write its plaintext to the
     ledger (our own message decrypts exactly zero times; the send moment is
-    the ONLY moment its plaintext exists, §4-2) and close the journal."""
+    the ONLY moment its plaintext exists, §4-2) and close our journal."""
     with room_lock(profile, room_id):
         if seq and payload is not None:
             ledger_append(profile, room_id,
@@ -2708,56 +2835,72 @@ def _sealed_commit(creds, profile, room_id, seq, payload, reply_to):
                             "sender_device": creds.get("device_id"),
                             "reply_to_seq": reply_to,
                             "payload": payload}])
-        _outbox_clear(profile, room_id)
+        _outbox_clear(profile, room_id, cmid)
+
+
+_send_gates = {}      # (profile, room_id) -> asyncio.Lock, per event loop
+
+
+def _send_gate(profile, room_id):
+    loop = asyncio.get_running_loop()
+    key = (id(loop), profile, room_id)
+    gate = _send_gates.get(key)
+    if gate is None:
+        gate = _send_gates[key] = asyncio.Lock()
+    return gate
 
 
 async def sealed_send_async(creds, profile, room_id, payload, reply_to=None,
                             read_through=None):
     """Send `payload` into a sealed room and return its seq. Every MLS
     helper call runs in a worker thread under the room lock, so a gateway's
-    event loop never stalls on local crypto. An unknown-outcome predecessor
-    in the outbox is settled FIRST — same id, same ciphertext (the server
-    absorbs duplicates via client_msg_id) — and then, in the same call, the
-    new utterance goes out; it is never swallowed or substituted (impl
-    /133 P0, mini-review 2/2; core-v1.4 removed the "rerun" exit — a
+    event loop never stalls on local crypto. Sends into one room from one
+    process are serialised (the journal has one slot); a journal left by
+    ANOTHER process is settled first when it is old enough to be a crash
+    (same id, same ciphertext — the server absorbs duplicates via
+    client_msg_id) and refused as busy while it may still be on the wire.
+    Then, in the same call, the new utterance goes out — never swallowed
+    or substituted (impl /133 P0; core-v1.4 removed the "rerun" exit — a
     daemon has nobody to rerun it)."""
     safe_room_id(room_id)
-    stale = await asyncio.to_thread(_outbox_load, profile, room_id)
-    if stale:
-        warn("note: settling a previous message whose outcome was unknown"
-             " (same id, same ciphertext) before sending the new one")
+    async with _send_gate(profile, room_id):
+        stale, age = await asyncio.to_thread(_outbox_load, profile, room_id)
+        if stale:
+            if age is not None and age < OUTBOX_INFLIGHT:
+                raise KlatalkBusy("another sealed send may still be in flight"
+                                  f" in this room (journal {age:.0f}s old)"
+                                  " — retry shortly")
+            warn("note: settling a previous message whose outcome was unknown"
+                 " (same id, same ciphertext) before sending the new one")
+            try:
+                seq0 = await do_send(creds, room_id, "",
+                                     reply_to=stale.get("reply_to"),
+                                     content=stale["content"],
+                                     client_msg_id=stale["client_msg_id"])
+            except SendRejected as e:
+                await asyncio.to_thread(_outbox_clear, profile, room_id,
+                                        stale["client_msg_id"])
+                warn(f"note: the earlier message was rejected ({e}) — journal"
+                     " cleared")
+            else:
+                await asyncio.to_thread(_sealed_commit, creds, profile, room_id,
+                                        seq0, stale.get("payload"),
+                                        stale.get("reply_to"),
+                                        stale["client_msg_id"])
+        content, cmid = await asyncio.to_thread(_sealed_prepare, creds, profile,
+                                                room_id, payload, reply_to)
         try:
-            seq0 = await do_send(creds, room_id, "",
-                                 reply_to=stale.get("reply_to"),
-                                 content=stale["content"],
-                                 client_msg_id=stale["client_msg_id"])
-        except SendRejected as e:
-            await asyncio.to_thread(_outbox_clear, profile, room_id)
-            warn(f"note: the earlier message was rejected ({e}) — journal"
-                 " cleared")
-        else:
-            await asyncio.to_thread(_sealed_commit, creds, profile, room_id,
-                                    seq0, stale.get("payload"),
-                                    stale.get("reply_to"))
-    content, cmid = await asyncio.to_thread(_sealed_prepare, creds, profile,
-                                            room_id, payload, reply_to)
-    try:
-        seq = await do_send(creds, room_id, "", reply_to=reply_to,
-                            content=content, client_msg_id=cmid,
-                            read_through=read_through)
-    except SendRejected:
-        await asyncio.to_thread(_outbox_clear, profile, room_id)
-        raise
-    await asyncio.to_thread(_sealed_commit, creds, profile, room_id, seq,
-                            payload, reply_to)
-    return seq
-
-
-def sealed_send(creds, profile, room_id, payload, reply_to=None,
-                read_through=None):
-    """Sync convenience for the CLI and tests — returns the seq."""
-    return asyncio.run(sealed_send_async(creds, profile, room_id, payload,
-                                         reply_to, read_through))
+            seq = await do_send(creds, room_id, "", reply_to=reply_to,
+                                content=content, client_msg_id=cmid,
+                                read_through=read_through)
+        except SendRejected:
+            # an ANSWERED rejection: the journal must not survive it
+            await asyncio.to_thread(_outbox_clear, profile, room_id, cmid)
+            raise
+        # an unknown outcome (transport error) leaves the journal in place
+        await asyncio.to_thread(_sealed_commit, creds, profile, room_id, seq,
+                                payload, reply_to, cmid)
+        return seq
 
 
 async def send_message(creds, profile, room, payload=None, *, text=None,
@@ -3604,7 +3747,9 @@ def open_upload(creds, path):
     try:
         return OPENER.open(req, timeout=60)
     except urllib.error.HTTPError as e:
-        raise error_class(e.code)(f"HTTP {e.code}: attachment fetch refused")
+        # a missing or forbidden upload says nothing about room membership
+        cls = KlatalkError if e.code in (403, 404) else error_class(e.code)
+        raise cls(f"HTTP {e.code}: attachment fetch refused")
     except urllib.error.URLError as e:
         raise KlatalkTransient(f"could not reach {API}: {e.reason}")
     except (TimeoutError, OSError) as e:
