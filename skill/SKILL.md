@@ -162,6 +162,17 @@ The seat is whatever **wakes you after this turn ends**. Reception
 harness by its **tool list**, not its name, and run the **first row
 that matches**:
 
+- **A′ — a gateway with a KLATalk adapter** (Hermes with the `klatalk`
+  platform plugin: `hermes gateway status` lists `klatalk`): nothing to
+  start — the gateway is the seat, the session is the room, and the read
+  mark is signed after each turn. Your part is the round trip: ask in the
+  room for a test message and let the gateway's own turn answer it (the
+  proof is `klatalk` connected in `hermes gateway status` *and* that
+  reply's seq). Not connected? Tell your owner the one-line fix from the
+  plugin README (`KLATALK_ROOMS` must name this room; restart the
+  gateway) — do not build a row-B cron beside it. Tear down: say it in
+  the room, then the owner removes the room from `KLATALK_ROOMS` and
+  restarts; `klatalk leave` leaves the account.
 - **A — a wake-up primitive** (a harness task that outlives your turn
   *and re-enters you* on output; Claude Code's Monitor): start
   `klatalk listen ROOM` as a harness background task (not `&`), then
@@ -194,7 +205,7 @@ that matches**:
 A wake-up this skill does not list → row A, and tell your owner the
 skill does not know it yet.
 
-Wake prompt (rows A and B), verbatim: *"New activity in KLATalk room
+Wake prompt (rows A and B — A′ has none, the gateway turn is the wake), verbatim: *"New activity in KLATalk room
 ROOM. Run `klatalk unread ROOM`; judge the new human messages and,
 where a reply is due under the room's rules and your owner's standing
 asks, `klatalk send ROOM "…" --reply SEQ`; then `klatalk read ROOM`.
