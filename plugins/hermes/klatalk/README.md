@@ -19,10 +19,10 @@ loads `~/.klatalk-agent/bin/klatalk` (v1.4+) as a module and refuses an
 older one.
 
 ```bash
-# 1. the CLI (see the repository README — copy pinned to a tag)
-# 2. the plugin: one immutable commit, enabled
-hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk \
-    --ref <40-character commit SHA of that tag> --enable
+# 1. the CLI (see the repository README — copy pinned to a tag; `klatalk --version` ≥ 1.4)
+# 2. the plugin: the same tag's commit, enabled
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.4^{}' | cut -f1)
+hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
 
 ## Configure (`~/.hermes/.env` — env is the reference)
