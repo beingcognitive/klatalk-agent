@@ -199,8 +199,9 @@ class TestRegistrationAndConfig(AdapterBase):
 
 class TestInbound(AdapterBase):
     def test_owner_and_member_events_are_marked_and_gated(self):
-        self.deliver(self.message(self.OWNER, "해줘", seq=6),
-                     self.message(self.OTHER, "/stop", seq=7))
+        self.deliver(self.message(self.OWNER, "해줘", seq=6))
+        self.run_async(self.adapter.on_processing_complete(self.handled[0], ProcessingOutcome.FAILURE))
+        self.deliver(self.message(self.OTHER, "/stop", seq=7))
         owner, member = self.handled
         self.assertTrue(owner.text.startswith("[owner] 해줘"))
         self.assertTrue(owner.allow_gateway_control)
@@ -261,6 +262,7 @@ class TestInbound(AdapterBase):
         first = self.handled[0]
         key = self.adapter._session_key_for(first)
         self.adapter._active_sessions[key] = object()          # Hermes: turn running
+        self.adapter._handed.clear()                           # (its registration landed)
         self.deliver(self.message(self.OTHER, "second", seq=7),
                      self.message(self.OWNER, "third", seq=8))
         self.assertEqual(len(self.handled), 1)                  # no busy-path entry
@@ -310,6 +312,45 @@ class TestInbound(AdapterBase):
         self.assertEqual(len(self.handled), 2)                  # straight to handle_message
         self.assertEqual(self.handled[1].text, "/stop")
         self.assertNotIn(key, self.adapter._pending_messages)
+
+
+    def test_rows_right_after_a_handover_merge_before_hermes_registers(self):
+        # bench 5: a row landing between handle_message and Hermes's session
+        # registration (startup-restore drain) must not take the busy path
+        self.deliver(self.message(self.OWNER, "first", seq=6))
+        self.assertEqual(len(self.handled), 1)
+        key = self.adapter._session_key_for(self.handled[0])
+        self.assertNotIn(key, self.adapter._active_sessions)   # Hermes has not registered yet
+        self.deliver(self.message(self.OWNER, "second", seq=7))
+        self.assertEqual(len(self.handled), 1)
+        self.assertIn(key, self.adapter._pending_messages)
+        self.run_async(self.adapter.on_processing_complete(self.handled[0], ProcessingOutcome.CANCELLED))
+        self.adapter._pending_messages.pop(key)
+        self.deliver(self.message(self.OWNER, "third", seq=8))  # the room is free again
+        self.assertEqual(len(self.handled), 2)
+
+    def test_stale_control_lines_from_the_backlog_are_dropped(self):
+        self.adapter._live_from[self.ROOM] = 10                 # joined when the room was at 10
+        self.deliver(self.message(self.OWNER, "/stop", seq=9),  # last night's /stop
+                     self.message(self.OWNER, "what did I miss?", seq=10),
+                     self.message(self.OWNER, "/stop", seq=11))
+        self.assertEqual([e.text for e in self.handled], ["[owner] what did I miss?", "/stop"])
+
+
+    def test_rows_wait_for_hermes_startup_restore(self):
+        class Runner:
+            _startup_restore_in_progress = True
+        runner = Runner()
+        self.adapter.gateway_runner = runner
+
+        async def run():
+            t = asyncio.create_task(self.adapter._on_event(self.ROOM, self.message(self.OWNER, "hi", seq=6)))
+            await asyncio.sleep(0.5)
+            self.assertEqual(self.handled, [])                  # parked, not handed over
+            runner._startup_restore_in_progress = False
+            await asyncio.wait_for(t, 5)
+        self.run_async(run())
+        self.assertEqual(len(self.handled), 1)
 
     def test_read_mark_follows_success_only(self):
         marks = []
@@ -364,6 +405,7 @@ class TestInbound(AdapterBase):
         def refuse(data, ext):
             raise ValueError("not an image")
         self.A.cache_image_from_bytes = refuse
+        self.adapter._handed.clear()                             # turn 1 reported back
         self.deliver(self.message(self.OWNER, "", seq=7,
                                   payload={"type": "image", "url": "/uploads/r/b.heic"}))
         self.assertEqual(self.handled[1].media_urls, [])

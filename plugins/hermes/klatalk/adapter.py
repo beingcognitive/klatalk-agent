@@ -47,6 +47,8 @@ CORE_MIN_VERSION = (1, 4, 0)       # the CLI that raises instead of exiting
 SEND_BUDGET = (60, 60.0)           # server: 60 messages / 60 s per device
 CONNECT_BUDGET = 25.0              # the runner gives connect() ~30 s
 ROOM_RETRY = 30.0                  # an unexpected room-loop crash waits this long
+TURN_MAX_AGE = 900.0               # a handed-over turn that never reports back frees the room
+RESTORE_WAIT = 90.0                # how long inbound rows wait for Hermes's startup restore
 DEFAULT_CLI = "~/.klatalk-agent/bin/klatalk"
 
 # Hermes matches control input against the RAW event text: is_command()
@@ -213,6 +215,8 @@ class KlatalkAdapter(BasePlatformAdapter):
         self._stopped: set = set()                 # rooms we left for good
         self._joined: Dict[str, asyncio.Event] = {}
         self._turns: Dict[str, List[float]] = {}   # room_id -> turn stamps (budget)
+        self._handed: Dict[str, float] = {}        # room_id -> when a turn was handed over
+        self._live_from: Dict[str, int] = {}       # room_id -> last_seq at join (backlog line)
         self._sends: List[float] = []              # token bucket (profile-wide)
         self._send_lock = asyncio.Lock()
         self._desync_told: set = set()
@@ -323,6 +327,10 @@ class KlatalkAdapter(BasePlatformAdapter):
                 if room is None:
                     raise kt.KlatalkMembership("not a member of that room")
                 self._rooms[room_id] = room
+                # rows at or below this seq are backlog (unjudged since the
+                # read mark): they still wake a turn, but a control line
+                # among them (/stop from last night) is stale — not replayed
+                self._live_from.setdefault(room_id, int(room.get("last_seq") or 0))
                 await kt.listen_core(self.creds, self.settings.profile, room_id,
                                      lambda ev, rid=room_id: self._on_event(rid, ev))
             except asyncio.CancelledError:
@@ -382,6 +390,18 @@ class KlatalkAdapter(BasePlatformAdapter):
         self._turns[room_id] = stamps
         return True
 
+    async def _after_startup_restore(self) -> None:
+        """On boot Hermes auto-resumes sessions a restart interrupted and
+        parks inbound rows in a restore queue meanwhile; draining that queue
+        into a resumed turn takes the busy path (bench 6: "⚡ Interrupting"
+        into the room). Our backlog waits until the restore window closes,
+        then meets the normal _active_sessions check."""
+        runner = getattr(self, "gateway_runner", None)
+        for _ in range(int(RESTORE_WAIT / 0.2)):
+            if not getattr(runner, "_startup_restore_in_progress", False):
+                return
+            await asyncio.sleep(0.2)
+
     def _session_key_for(self, event: MessageEvent) -> Optional[str]:
         try:
             from gateway.session import build_session_key
@@ -436,6 +456,7 @@ class KlatalkAdapter(BasePlatformAdapter):
             return
         sender_id = ev.get("sender_id") or ""
         payload = ev.get("payload") or {}
+        await self._after_startup_restore()
         # the wake filter FIRST: a row that wakes nothing must not cost a
         # download — only the AI-name test needs the body, and only for text
         probe = kt.clean(payload.get("text") or "") if payload.get("type") == "text" else ""
@@ -444,21 +465,32 @@ class KlatalkAdapter(BasePlatformAdapter):
         text, media_urls, media_types = await self._render(payload)
         event = self._event_for(room_id, ev, text, media_urls, media_types)
         key = self._session_key_for(event)
+        seq = ev.get("seq")
         if event.metadata.get("klatalk_control"):
+            if isinstance(seq, int) and seq <= self._live_from.get(room_id, 0):
+                logger.info("[%s] room %s: stale control line #%s from the backlog"
+                            " dropped", PLATFORM, _short(room_id), seq)
+                return
             # an owner's /stop, /approve, bare "yes": Hermes matches these on
             # the raw text and bypasses the active-session guard itself
             await self.handle_message(event)
             return
-        if key and key in self._active_sessions:
-            # A turn is running. Hermes's own pending slot holds rows that
-            # land mid-turn and its drain runs them as the next turn — using
-            # it directly (instead of handle_message) skips the busy handler
-            # that posts "↪ Redirected / ⚡ Interrupting / ⏳ Queued" into the
-            # chat. One machine, not two (133 r1, additive lens).
+        handed = self._handed.get(room_id)
+        busy = bool(key and key in self._active_sessions) or (
+            handed is not None and time.time() - handed < TURN_MAX_AGE)
+        if busy and key:
+            # A turn is running — or was just handed over and Hermes has not
+            # registered the session yet (startup-restore drain, bench 5).
+            # Hermes's own pending slot holds rows that land mid-turn and its
+            # drain runs them as the next turn — using it directly (instead
+            # of handle_message) skips the busy handler that posts "↪
+            # Redirected / ⚡ Interrupting / ⏳ Queued" into the chat. One
+            # machine, not two (133 r1, additive lens).
             self._merge_pending(key, event)
             return
         if not self._turn_allowed(room_id):
             return
+        self._handed[room_id] = time.time()
         await self.handle_message(event)
 
     def _event_for(self, room_id: str, ev: dict, text: str,
@@ -587,7 +619,13 @@ class KlatalkAdapter(BasePlatformAdapter):
         turn leaves the mark where it is — the next success carries it
         (the mark is monotonic)."""
         room_id = getattr(event.source, "chat_id", None)
-        if not room_id or outcome != ProcessingOutcome.SUCCESS:
+        if not room_id:
+            return
+        # Hermes owns the session guard from here: its drain runs the
+        # pending slot (if any) while the key stays in _active_sessions, so
+        # the adapter's own "just handed over" flag can go
+        self._handed.pop(room_id, None)
+        if outcome != ProcessingOutcome.SUCCESS:
             return
         seq = (event.metadata or {}).get("klatalk_max_seq")
         if not seq:
