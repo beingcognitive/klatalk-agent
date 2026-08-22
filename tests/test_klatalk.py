@@ -1468,5 +1468,115 @@ class TestServeService(Base):
         self.assertIn("(no log)", text)
 
 
+class TestAttachments(Base):
+    """send --image / --file: the phone's payload shapes, dimensions read
+    from the bytes, the upload endpoint's refusals said plainly."""
+
+    def _write_creds(self, profile, nickname):
+        os.makedirs(self.home, mode=0o700, exist_ok=True)
+        self.cli.write_private(
+            self.cli.cred_path(profile),
+            lambda f: json.dump({"user_id": "u", "nickname": nickname,
+                                 "access_token": "SECRET-A"}, f))
+
+    def _png(self, w, h):
+        import struct, zlib
+        ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
+        chunk = b"IHDR" + ihdr
+        return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + chunk
+                + struct.pack(">I", zlib.crc32(chunk) & 0xFFFFFFFF))
+
+    def test_image_size_reads_png_gif_jpeg_webp_headers(self):
+        import struct
+        self.assertEqual(self.cli.image_size(self._png(1179, 2556)), (1179, 2556))
+        self.assertEqual(self.cli.image_size(b"GIF89a" + struct.pack("<HH", 320, 200)), (320, 200))
+        jpeg = (b"\xff\xd8" + b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 10
+                + b"\xff\xc0" + struct.pack(">H", 17) + b"\x08" + struct.pack(">HH", 480, 640) + b"\x03" + b"\x00" * 9)
+        self.assertEqual(self.cli.image_size(jpeg), (640, 480))
+        webpx = (b"RIFF" + b"\x00" * 4 + b"WEBP" + b"VP8X" + struct.pack("<I", 10) + b"\x00" * 4
+                 + (299).to_bytes(3, "little") + (199).to_bytes(3, "little"))
+        self.assertEqual(self.cli.image_size(webpx), (300, 200))
+        self.assertEqual(self.cli.image_size(b"not an image"), (0, 0))
+
+    def test_attachment_payload_validates_like_the_server(self):
+        png = os.path.join(self.tmp, "a.png"); open(png, "wb").write(self._png(4, 3))
+        ctype, data, payload = self.cli.attachment_payload(png, "image")
+        self.assertEqual((ctype, payload), ("image/png", {"type": "image", "url": None, "w": 4, "h": 3}))
+        doc = os.path.join(self.tmp, "r.pdf"); open(doc, "wb").write(b"%PDF-1.4 x")
+        ctype, data, payload = self.cli.attachment_payload(doc, "file")
+        self.assertEqual(payload, {"type": "file", "url": None, "name": "r.pdf", "size": 10})
+        bad = os.path.join(self.tmp, "x.exe"); open(bad, "wb").write(b"MZ")
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.attachment_payload(bad, "file")
+        self.assertIn("must be one of", str(cm.exception))
+        fake = os.path.join(self.tmp, "f.png"); open(fake, "wb").write(b"PNG?")
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.attachment_payload(fake, "image")
+        self.assertIn("dimensions", str(cm.exception))
+
+    def test_send_image_uploads_then_sends_the_phone_payload(self):
+        self._write_creds("default", "Hermes")
+        png = os.path.join(self.tmp, "a.png"); open(png, "wb").write(self._png(7, 5))
+        room = {"id": "R", "name": "X", "encryption_mode": "plain", "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        ups, sends = [], []
+        self.cli.upload_to_room = lambda creds, rid, path, ctype, data: (
+            ups.append((rid, ctype, len(data))), "/uploads/R/x.png")[1]
+
+        async def fake_send(creds, room_id, text, reply_to=None, payload=None, **kw):
+            sends.append((room_id, text, reply_to, payload)); return 9
+        self.cli.do_send = fake_send
+        self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=3,
+                                      image=png, file=None))
+        self.assertEqual(ups, [("R", "image/png", len(self._png(7, 5)))])
+        self.assertEqual(sends, [("R", None, 3, {"type": "image", "url": "/uploads/R/x.png", "w": 7, "h": 5})])
+
+    def test_send_image_in_a_sealed_room_goes_through_sealed_send_with_a_note(self):
+        self._write_creds("default", "Hermes")
+        png = os.path.join(self.tmp, "a.png"); open(png, "wb").write(self._png(2, 2))
+        room = {"id": "R", "name": "X", "encryption_mode": "mls10", "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        self.cli.upload_to_room = lambda *a: "/uploads/R/y.png"
+        sealed = []
+        self.cli.sealed_send = lambda args, creds, profile, rid, payload, reply_to=None: sealed.append(payload)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=None,
+                                          image=png, file=None))
+        self.assertEqual(sealed, [{"type": "image", "url": "/uploads/R/y.png", "w": 2, "h": 2}])
+        self.assertIn("stored on the server as uploaded", err.getvalue())
+
+    def test_send_refuses_text_with_an_attachment(self):
+        self._write_creds("default", "Hermes")
+        png = os.path.join(self.tmp, "a.png"); open(png, "wb").write(self._png(2, 2))
+        room = {"id": "R", "name": "X", "encryption_mode": "plain", "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.cmd_send(argparse_ns(room="R", text="hi", text_stdin=False, reply=None,
+                                          image=png, file=None))
+        self.assertIn("attachment alone", str(cm.exception))
+
+    def test_upload_errors_are_named(self):
+        self._write_creds("default", "Hermes")
+        creds = {"access_token": "T"}
+
+        class Resp(urllib.error.HTTPError):
+            pass
+
+        def opener(code, body):
+            class O:
+                def open(self, req, timeout=0):
+                    raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(body))
+            return O()
+        self.cli.OPENER = opener(429, b'{"error": "upload_quota"}')
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.upload_to_room(creds, "R", "a.png", "image/png", b"x")
+        self.assertIn("quota", str(cm.exception))
+        self.cli.OPENER = opener(415, b'{"error": "unsupported_type"}')
+        with self.assertRaises(SystemExit) as cm:
+            self.cli.upload_to_room(creds, "R", "a.png", "image/png", b"x")
+        self.assertIn("file type", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,7 @@ never appear in any output (allowlist).
   klatalk unread [ROOM]                 # unread status — looking marks nothing
   klatalk messages ROOM --after-seq 10  # read the conversation
   klatalk send ROOM "hello"             # send (+ auto-read up to the sent seq)
+  klatalk send ROOM --image photo.png   # attachment as its own message (--file for documents)
   klatalk like ROOM 42 [--remove]       # heart reaction — lighter than words
   klatalk read ROOM [SEQ]               # mark as read (omit SEQ = latest)
   klatalk wait ROOM [--timeout N]       # block until a new message (exit 3 on idle)
@@ -2348,10 +2349,148 @@ def sealed_send(args, creds, profile, room_id, payload, reply_to=None):
         pass
 
 
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".webp": "image/webp", ".gif": "image/gif"}
+FILE_TYPES = {".pdf": "application/pdf", ".doc": "application/msword",
+              ".docx": "application/vnd.openxmlformats-officedocument"
+                       ".wordprocessingml.document",
+              ".xls": "application/vnd.ms-excel",
+              ".xlsx": "application/vnd.openxmlformats-officedocument"
+                       ".spreadsheetml.sheet",
+              ".ppt": "application/vnd.ms-powerpoint",
+              ".pptx": "application/vnd.openxmlformats-officedocument"
+                       ".presentationml.presentation",
+              ".txt": "text/plain", ".zip": "application/zip"}
+MAX_UPLOAD = 25_000_000                 # the server's ceiling
+
+
+def image_size(data):
+    """(w, h) from the header of a PNG / JPEG / GIF / WebP — the phone
+    sends dimensions with every image so timelines can lay out before the
+    bytes arrive; a CLI image must carry them too. Unknown → (0, 0)."""
+    import struct
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return struct.unpack(">II", data[16:24])
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return struct.unpack("<HH", data[6:10])
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            length = struct.unpack(">H", data[i + 2:i + 4])[0]
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return w, h
+            i += 2 + length
+        return 0, 0
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            w = int.from_bytes(data[24:27], "little") + 1
+            h = int.from_bytes(data[27:30], "little") + 1
+            return w, h
+        if chunk == b"VP8L":
+            b = data[21:25]
+            w = 1 + (((b[1] & 0x3F) << 8) | b[0])
+            h = 1 + (((b[3] & 0x0F) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6))
+            return w, h
+        if chunk == b"VP8 ":
+            w, h = struct.unpack("<HH", data[26:30])
+            return w & 0x3FFF, h & 0x3FFF
+    return 0, 0
+
+
+def upload_to_room(creds, room_id, path, ctype, data):
+    """POST the bytes to the room's upload endpoint (the phone's own
+    fallback path — multipart, member-only, server-side quota) and return
+    the /uploads/... url the message will name."""
+    boundary, body = multipart_body("file", os.path.basename(path), ctype, data)
+    req = urllib.request.Request(api_url(room_path(room_id, "/uploads")),
+                                 data=body, method="POST")
+    req.add_header("Authorization", f"Bearer {creds['access_token']}")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with OPENER.open(req, timeout=120) as resp:
+            payload = json.loads(resp.read() or b"{}")
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        try:
+            status, payload = e.code, json.load(e)
+        except Exception:
+            status, payload = e.code, {"error": str(e.reason)}
+    except urllib.error.URLError as e:
+        sys.exit(f"could not reach {API}: {e.reason}")
+    if status == 429 and (payload or {}).get("error") == "upload_quota":
+        sys.exit("upload refused: this device's upload quota is used up for now")
+    if status == 415:
+        sys.exit("upload refused: the server does not accept this file type")
+    die_on(status, payload)
+    url = (payload or {}).get("url")
+    if not url or not url.startswith("/uploads/"):
+        sys.exit("upload did not return an /uploads/ url")
+    return url
+
+
+def attachment_payload(path, kind):
+    """Read a local file once, validate it the way the server will, and
+    build the phone-compatible payload: image {url,w,h} or file
+    {url,name,size}. The url is filled in after the upload."""
+    ext = os.path.splitext(path)[1].lower()
+    types = IMAGE_TYPES if kind == "image" else FILE_TYPES
+    ctype = types.get(ext)
+    if not ctype:
+        sys.exit(f"{kind} must be one of {', '.join(sorted(types))}")
+    try:
+        with open(path, "rb") as f:
+            data = f.read(MAX_UPLOAD + 1)
+    except OSError as e:
+        sys.exit(f"cannot read {path}: {e.strerror}")
+    if len(data) > MAX_UPLOAD:
+        sys.exit(f"{kind} is over the 25 MB upload ceiling")
+    if kind == "image":
+        w, h = image_size(data)
+        if not w or not h:
+            sys.exit("could not read the image's dimensions — is it a real"
+                     " PNG/JPEG/GIF/WebP?")
+        return ctype, data, {"type": "image", "url": None, "w": w, "h": h}
+    return ctype, data, {"type": "file", "url": None,
+                         "name": os.path.basename(path), "size": len(data)}
+
+
 def cmd_send(args):
     profile = profile_name(args)
     creds = load_creds(profile)
     room = get_room(creds, args.room)
+    attach = getattr(args, "image", None) or getattr(args, "file", None)
+    if attach:
+        kind = "image" if getattr(args, "image", None) else "file"
+        if args.text is not None or getattr(args, "text_stdin", False):
+            sys.exit(f"--{kind} sends the attachment alone — text goes in"
+                     " its own message")
+        ctype, data, payload = attachment_payload(attach, kind)
+        if is_sealed(room):
+            # The phone does exactly this: the bytes are uploaded as they
+            # are and only the message naming them is sealed. Say so —
+            # a member may reasonably assume otherwise
+            print("note: in a sealed room the attachment's bytes are stored"
+                  " on the server as uploaded; only the message naming it is"
+                  " sealed (same as the phone app)", file=sys.stderr)
+        payload["url"] = upload_to_room(creds, room["id"], attach, ctype, data)
+        if is_sealed(room):
+            return sealed_send(args, creds, profile, args.room, payload,
+                               reply_to=args.reply)
+        try:
+            asyncio.run(do_send(creds, args.room, None, reply_to=args.reply,
+                                payload=payload))
+        except SendRejected as e:
+            sys.exit(f"send failed: {e}")
+        return
     if is_sealed(room):
         # §1's argv rule covers every process the plaintext crosses — in a
         # sealed room the message body is exactly what §7 protects
@@ -3007,6 +3146,12 @@ def build_parser():
                         " sealed rooms (argv shows up in ps)")
     s.add_argument("--reply", type=int, metavar="SEQ",
                    help="send as a reply to this seq (quote chip)")
+    s.add_argument("--image", metavar="FILE",
+                   help="send an image (png/jpg/webp/gif, ≤25 MB) as its own"
+                        " message — dimensions are read from the file")
+    s.add_argument("--file", metavar="FILE",
+                   help="send a document (pdf/doc/xls/ppt/txt/zip, ≤25 MB)"
+                        " as its own message")
     s = add("like", cmd_like); s.add_argument("room")
     s.add_argument("seq", type=int)
     s.add_argument("--remove", action="store_true", help="remove the heart")

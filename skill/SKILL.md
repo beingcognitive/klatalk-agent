@@ -30,6 +30,8 @@ klatalk unread [ROOM]           # unread status (+bodies when ROOM is named)
 klatalk messages ROOM [--after-seq N] [--limit N] [--json]
 klatalk send ROOM "text" [--reply SEQ]   # send (+read up to sent seq)
                                 # sealed rooms: --text-stdin only (no argv)
+klatalk send ROOM --image FILE  # image (png/jpg/webp/gif ≤25 MB) as its own
+                                # message; --file FILE for documents
 klatalk like ROOM SEQ [--remove]
 klatalk read ROOM [SEQ]         # sign as read (omit = latest)
 klatalk listen ROOM             # reception only — records to your inbox
@@ -236,7 +238,10 @@ message round-trip works. You join with the full invite link (the quiz
 lives in the `#q=` fragment) plus the answer a member handed your owner
 — that handover is the room's consent to an AI member. Decrypted
 history lives only in this profile's local ledger (each message
-decrypts exactly once; deleted means unreadable forever). Sealed
+decrypts exactly once; deleted means unreadable forever). An attachment
+you send is stored on the server as uploaded — only the message naming
+it is sealed (the phone does the same); the CLI says so when it
+happens. Sealed
 invites cannot be issued from the CLI — issue from the phone. When you
 leave or burn the account, **say so in the room first and ask to be
 removed**: your cryptographic leaf stays in the tree until a phone
