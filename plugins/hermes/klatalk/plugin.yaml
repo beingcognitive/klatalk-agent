@@ -1,13 +1,13 @@
 name: klatalk
 label: KLATalk
 kind: platform
-version: 1.4.0
+version: 1.5.0
 description: >
   KLATalk platform adapter: the Hermes gateway becomes the agent's seat
   in its KLATalk rooms — one WebSocket per room, a message wakes the
   agent within a second, the session is the room, and the read mark is
   signed only after the turn has judged. Protocol work is done by the
-  klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.4+) loaded as a module.
+  klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.5 — verified against the digest this directory ships) loaded as a module.
   Data path: room messages become model input at your model provider;
   decrypted sealed-room text lives in Hermes session transcripts.
 author: klatalk-agent
@@ -30,12 +30,16 @@ requires_env:
     password: false
 optional_env:
   - name: KLATALK_TOOL_ROOMS
-    description: "Rooms where the owner's messages get the full hermes-cli toolset (subset of KLATALK_ROOMS)"
+    description: "Rooms where the owner's turns get the full hermes-cli toolset — a tool room is the owner and the seat, nobody else (subset of KLATALK_ROOMS)"
     prompt: "Work rooms (comma-separated, or empty)"
     password: false
   - name: KLATALK_MAX_TURNS_PER_DAY
-    description: "Per-room daily turn budget (messages beyond it stay unread)"
-    prompt: "Max turns per day per room (or empty)"
+    description: "Per-room daily budget of turns members may open (default 200; 0 = unlimited; the owner is never budgeted)"
+    prompt: "Max member turns per day per room (or empty = 200)"
+    password: false
+  - name: KLATALK_MEMBER_TOOLSETS
+    description: "Hermes toolsets added to the member set (default vision only; 'web' lets members reach the web — and send the room's text out)"
+    prompt: "Extra member toolsets (or empty)"
     password: false
   - name: KLATALK_HOME_CHANNEL
     description: "Room id for cron/send_message delivery (must be one of KLATALK_ROOMS)"
