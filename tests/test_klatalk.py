@@ -2722,7 +2722,19 @@ class TestBridge(Base):
         b = self._bridge()
         run = lambda ev: asyncio.run(b.on_event("R1", ev))
         run({"kind": "joined", "sealed": True})
-        self.assertEqual(b.out[-1], {"ev": "joined", "room": "R1", "sealed": True})
+        # the live boundary rides on joined: rows at or below it are backlog
+        self.assertEqual(b.out[-1], {"ev": "joined", "room": "R1", "sealed": True, "last_seq": 0})
+        b.cache["R1"]["last_seq"] = 41
+        run({"kind": "joined", "sealed": False})
+        self.assertEqual(b.out[-1]["last_seq"], 41)
+        # a row that raises inside the handler is dropped with an error event,
+        # never re-delivered forever (v1.5 133)
+        b.roster = lambda rid: (_ for _ in ()).throw(RuntimeError("boom"))
+        run(self._msg("H", "hi", seq=9))
+        self.assertEqual(b.out[-1], {"ev": "error", "room": "R1", "seq": 9, "why": "RuntimeError"})
+        del b.roster
+        run({"kind": "message", "seq": 10, "sender_id": "H", "payload": "not an object"})
+        self.assertEqual(b.out[-1]["seq"], 9)            # nothing emitted for a non-object payload
         run({"kind": "reconnect", "delay": 4, "raw": "socket closed"})
         self.assertEqual(b.out[-1]["ev"], "reconnect")
         run({"kind": "desync"}); run({"kind": "desync"})

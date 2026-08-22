@@ -44,7 +44,7 @@ Hermes's install scanner reads this directory; the verdict is `safe`
 | `KLATALK_ROOMS` | room ids, comma-separated (no `all` — every room is a deliberate choice) | yes |
 | `KLATALK_OWNER_ID` | your `user_id`: the one member whose messages may direct the agent. **Settled from the terminal, never from the room** — whoever answers a question in the room fastest is not your owner | yes |
 | `KLATALK_ALLOW_ALL_USERS` | must be `true` — see "Who may steer" | yes |
-| `KLATALK_TOOL_ROOMS` | rooms where **the owner's** turns get the full `hermes-cli` toolset (terminal, files). **A tool room is the owner and the seat, nobody else**: the session is the room, so any other member's line — from last week too — is in the history a tool turn reads. The adapter checks the roster at every turn and gives no tools while a third member is present. A member who left still left their lines: `/new` before tool work | no |
+| `KLATALK_TOOL_ROOMS` | rooms where **the owner's** turns get the full `hermes-cli` toolset (terminal, files). **A tool room is the owner and the seat, nobody else**, and it is **armed by the owner's own `/new`** taken while the roster (re-read from the server) is exactly the two of them: the session is the room, so any other member's line — from last week too — is in the history a tool turn reads, and `/new` is what starts a session nobody else wrote into. Anyone else's row, any roster change and a gateway restart disarm it; the owner types `/new` again | no |
 | `KLATALK_MEMBER_TOOLSETS` | Hermes toolsets added to the member set (default `vision` only — see "Who may steer"). `web` gives members web search/extract and with it a way to send the room's text to an arbitrary URL; nothing that acts on this machine is accepted | no |
 | `KLATALK_MAX_TURNS_PER_DAY` | per-room daily budget of turns **members** may open (default 200; `0` = unlimited). The owner is never budgeted. Beyond it members' messages stay unread until the next turn, which still sees them as context | no |
 | `KLATALK_HOME_CHANNEL` | the one room `hermes send` / cron may deliver to (must be in `KLATALK_ROOMS`; default: the first room — without a home channel Hermes would post a "/sethome" notice into the conversation) | no |
@@ -90,9 +90,9 @@ Hermes's allowlist is bypassed), and the adapter draws the line itself:
   `[member] …` and is conversational input only — a member's "/stop" or
   "yes" never reaches the control path; a member's line is one line (every
   line separator is folded), and a nickname cannot carry brackets;
-- tools: `hermes-cli` only for the owner inside a `KLATALK_TOOL_ROOMS`
-  room that holds nobody else; everyone else, everywhere — and the owner
-  outside a tool room — gets `vision` and `no_mcp`: look at images, no
+- tools: `hermes-cli` only for the owner inside an **armed**
+  `KLATALK_TOOL_ROOMS` room (see the table); everyone else, everywhere —
+  and the owner outside one — gets `vision` and `no_mcp`: look at images, no
   web, no terminal, no files, no MCP server. (Hermes's `safe` toolset is
   **not** used: it carries the web tools, and without the `no_mcp`
   sentinel Hermes unions every enabled MCP server into any list.)
@@ -117,7 +117,10 @@ owner's account itself — from the terminal.
 - Humans wake a turn; an AI member only by calling the agent's name; a
   reaction never. Rows nobody was woken for (an AI member's line, a
   reaction, a member line the budget refused) ride into the next turn as
-  context, so the read mark that turn signs covers rows the model saw.
+  context, so the read mark that turn signs covers rows the model saw — and
+  a turn carrying anyone else's rows is never a tool turn. Rows that land
+  while a turn runs open the next turn together; that next turn counts
+  against the member budget like any other.
 - The read mark moves only after a successful turn, through the highest
   seq that turn saw. A failed turn leaves it — the next success carries it.
 - A gateway restart is the seat staying put: the room is not told.

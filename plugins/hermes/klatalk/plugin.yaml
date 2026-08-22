@@ -30,7 +30,7 @@ requires_env:
     password: false
 optional_env:
   - name: KLATALK_TOOL_ROOMS
-    description: "Rooms where the owner's turns get the full hermes-cli toolset — a tool room is the owner and the seat, nobody else (subset of KLATALK_ROOMS)"
+    description: "Rooms where the owner's turns get the full hermes-cli toolset — the owner and the seat, nobody else, armed by the owner's /new (subset of KLATALK_ROOMS)"
     prompt: "Work rooms (comma-separated, or empty)"
     password: false
   - name: KLATALK_MAX_TURNS_PER_DAY

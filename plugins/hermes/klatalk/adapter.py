@@ -6,7 +6,8 @@ agent within a second, the session IS the room (so the conversation is
 remembered), and the read mark is signed only after the turn judged.
 
 Everything protocol-shaped comes from the CLI file (``bin/klatalk``,
-core-v1.4+) loaded as a module — the adapter owns Hermes wiring only.
+v1.5, verified against the digest this directory ships) loaded as a
+module — the adapter owns Hermes wiring only.
 
 Data path notice (say it to the room's humans before bringing the agent
 in): every message the agent reads becomes model input at Hermes's model
@@ -299,6 +300,8 @@ class KlatalkAdapter(BasePlatformAdapter):
         self._context: Dict[str, List[str]] = {}   # room_id -> unwoken rows for the next turn
         self._budget_told: Dict[str, str] = {}     # room_id -> day the budget was reported spent
         self._tool_room_told: Dict[str, bool] = {} # room_id -> last logged eligibility
+        self._tool_armed: set = set()              # tool rooms armed by the owner's /new
+        self._roster_stale: set = set()            # rooms whose roster refresh failed
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -402,7 +405,14 @@ class KlatalkAdapter(BasePlatformAdapter):
                 from hermes_cli.config import load_config
                 resolve = resolve or _get_platform_tools
                 cfg = dict(cfg if cfg is not None else load_config())
-            except Exception as e:                  # outside the gateway (tests)
+            except Exception as e:
+                # inside the gateway the resolver MUST be reachable: this is
+                # the one control that proves a member turn gets no MCP
+                # server and no hermes-klatalk — skipping it is a refusal
+                if getattr(self, "gateway_runner", None) is not None:
+                    return ["toolset self-check unavailable (%s): this Hermes does not"
+                            " expose hermes_cli.tools_config._get_platform_tools, so a"
+                            " member turn's toolset cannot be proven" % type(e).__name__]
                 logger.warning("[%s] toolset self-check skipped (%s)", PLATFORM, type(e).__name__)
                 return []
         expected = set(self.settings.member_toolsets) - {"no_mcp"}
@@ -497,27 +507,54 @@ class KlatalkAdapter(BasePlatformAdapter):
         return {uid: (_oneline(self.core.clean(nick)).replace("[", "(").replace("]", ")")[:64], ai)
                 for uid, (nick, ai) in who.items()}
 
+    def _label(self, name) -> str:
+        """A room name is member-controlled like a nickname: one clean line,
+        no brackets."""
+        return _oneline(self.core.clean(name or "")).replace("[", "(").replace("]", ")")[:64]
+
+    def _roster_exact(self, room_id: str) -> bool:
+        """Exactly the owner and this seat, nobody else, nobody missing."""
+        ids = set(self._roster(room_id))
+        want = {self.settings.owner_id, self.creds.get("user_id")}
+        return bool(self.settings.owner_id) and ids == want and len(want) == 2
+
+    async def _refresh_room(self, room_id: str) -> None:
+        """The roster a tool verdict rides on must be live (member:* is a
+        non-durable broadcast; a reconnect backfills messages only). A
+        refresh that fails marks the room stale — tool turns fail closed."""
+        try:
+            room = await asyncio.to_thread(self.core.get_room, self.creds, room_id)
+            if room:
+                self._rooms[room_id] = room
+                self._roster_stale.discard(room_id)
+                return
+        except Exception:
+            pass
+        self._roster_stale.add(room_id)
+
     def _tool_room_ok(self, room_id: str) -> bool:
         """A tool room is a room whose session only the owner has ever
         written into — the session IS the room, so a third member's line
         from last week is still in the history the owner's terminal-armed
-        turn reads. Per-turn toolset gating cannot reach history; the
-        roster can: the room must hold the owner and this seat, nobody
-        else. (A member who was removed left their lines behind — /new.)"""
+        turn reads. Per-turn toolset gating cannot reach history, so the
+        room is ARMED only by the owner's own /new (a fresh session) taken
+        while the roster is exactly the owner and this seat, and disarmed
+        by any other member's row or any roster change — a gateway restart
+        starts disarmed."""
         if room_id not in self.settings.tool_rooms:
             return False
-        others = [u for u in self._roster(room_id)
-                  if u not in (self.settings.owner_id, self.creds.get("user_id"))]
-        ok = not others
+        ok = (room_id in self._tool_armed and room_id not in self._roster_stale
+              and self._roster_exact(room_id))
+        if not ok:
+            self._tool_armed.discard(room_id)
         if self._tool_room_told.get(room_id) is not ok:
             self._tool_room_told[room_id] = ok
             if not ok:
-                logger.error("[%s] room %s is in KLATALK_TOOL_ROOMS but has %d member(s)"
-                             " besides you and the seat — their text shares the"
-                             " owner's session; tool turns are off here until the"
-                             " room is the two of you", PLATFORM, _short(room_id), len(others))
+                logger.warning("[%s] room %s: tool turns are off — the owner's /new in a"
+                               " room that holds only the owner and the seat arms them",
+                               PLATFORM, _short(room_id))
             else:
-                logger.info("[%s] room %s: tool room (owner and seat only)",
+                logger.info("[%s] room %s: tool room armed (owner and seat only)",
                             PLATFORM, _short(room_id))
         return ok
 
@@ -547,15 +584,18 @@ class KlatalkAdapter(BasePlatformAdapter):
         if self.settings.owner_id and sender_id == self.settings.owner_id:
             return True
         if self._budget_spent(room_id):
-            day = time.strftime("%Y-%m-%d")
-            if self._budget_told.get(room_id) != day:
-                self._budget_told[room_id] = day
-                logger.warning("[%s] room %s: daily turn budget (%d) spent — members'"
-                               " messages stay unread until tomorrow", PLATFORM,
-                               _short(room_id), self.settings.max_turns_per_day)
+            self._budget_told_once(room_id)
             return False
         self._turns.setdefault(room_id, []).append(time.time())
         return True
+
+    def _budget_told_once(self, room_id: str) -> None:
+        day = time.strftime("%Y-%m-%d")
+        if self._budget_told.get(room_id) != day:
+            self._budget_told[room_id] = day
+            logger.warning("[%s] room %s: daily turn budget (%d) spent — members'"
+                           " messages stay unread until tomorrow", PLATFORM,
+                           _short(room_id), self.settings.max_turns_per_day)
 
     def _remember(self, room_id: str, line: str) -> None:
         """An unwoken row (an AI member not calling our name, a reaction, a
@@ -589,15 +629,6 @@ class KlatalkAdapter(BasePlatformAdapter):
             return build_session_key(source, group_sessions_per_user=False,
                                      thread_sessions_per_user=False,
                                      profile=self._session_key_profile(source))
-        except Exception:
-            return None
-
-    def _session_key_for(self, event: MessageEvent) -> Optional[str]:
-        try:
-            from gateway.session import build_session_key
-            return build_session_key(event.source, group_sessions_per_user=False,
-                                     thread_sessions_per_user=False,
-                                     profile=self._session_key_profile(event.source))
         except Exception:
             return None
 
@@ -644,16 +675,14 @@ class KlatalkAdapter(BasePlatformAdapter):
                     task.cancel()
                 return
             if event.startswith("member:") or event.startswith("room:"):
-                # roster/name changed — refresh the cache off the loop
-                try:
-                    room = await asyncio.to_thread(kt.get_room, self.creds, room_id)
-                    if room:
-                        self._rooms[room_id] = room
-                except Exception:
-                    pass
+                await self._refresh_room(room_id)       # roster/name changed
+            return
+        if kind == "system":
+            if ev.get("sealed"):                        # an MLS membership commit
+                await self._refresh_room(room_id)
             return
         if kind != "message":
-            return                                      # system lines
+            return
         if ev.get("own") or ev.get("sender_id") == self.creds.get("user_id"):
             return
         if ev.get("deleted"):
@@ -669,6 +698,11 @@ class KlatalkAdapter(BasePlatformAdapter):
         seq = ev.get("seq")
         is_owner = bool(self.settings.owner_id) and sender_id == self.settings.owner_id \
             and (ev.get("sender_binding") or "ok") == "ok"
+        if room_id in self.settings.tool_rooms:
+            if not is_owner:
+                self._tool_armed.discard(room_id)      # someone else wrote into this session
+            else:
+                await self._refresh_room(room_id)      # the verdict rides on a live roster
         # the wake filter FIRST: a row that wakes nothing must not cost a
         # download — only the AI-name test needs the body, and only for text
         probe = kt.clean(payload.get("text") or "") if payload.get("type") == "text" else ""
@@ -688,13 +722,16 @@ class KlatalkAdapter(BasePlatformAdapter):
         handed = self._handed.get(room_id)
         busy = bool(key and key in self._active_sessions) or (
             handed is not None and time.time() - handed < TURN_MAX_AGE)
-        if not busy and not is_owner and self._budget_spent(room_id):
+        spent = (not is_owner) and self._budget_spent(room_id)
+        if not busy and spent:
             # a row that cannot open a turn must not cost a download either —
             # refused here, before _render, and still carried as context
-            self._turn_allowed(room_id, "")                   # logs once a day
+            self._budget_told_once(room_id)
             self._remember(room_id, f"{marker} {who}: {_oneline(probe or kt.clean(kt.summarize_payload(payload)))}")
             return
-        text, media_urls, media_types = await self._render(room_id, payload)
+        # busy and spent: the row still merges (it is the conversation) but
+        # buys no download
+        text, media_urls, media_types = await self._render(room_id, payload, allow_media=not spent)
         event = self._event_for(room_id, ev, text, media_urls, media_types)
         if event.metadata.get("klatalk_control"):
             if isinstance(seq, int) and seq <= self._live_from.get(room_id, 0):
@@ -713,6 +750,13 @@ class KlatalkAdapter(BasePlatformAdapter):
             # of handle_message) skips the busy handler that posts "↪
             # Redirected / ⚡ Interrupting / ⏳ Queued" into the chat. One
             # machine, not two (133 r1, additive lens).
+            # The drain IS a turn: the first row into an empty slot is
+            # charged like one (a member could otherwise keep the chain hot
+            # for one charge a day); rows joining a held slot ride free.
+            if key not in self._pending_messages and not self._turn_allowed(
+                    room_id, sender_id if event.metadata.get("klatalk_owner") else ""):
+                self._remember(room_id, f"{marker} {who}: {_oneline(text)}")
+                return
             self._merge_pending(key, event)
             return
         if not self._turn_allowed(room_id, sender_id if event.metadata.get("klatalk_owner") else ""):
@@ -744,14 +788,15 @@ class KlatalkAdapter(BasePlatformAdapter):
             body = "\n".join(context + [f"{marker} {who}: {text}".strip()])
         source = self.build_source(
             chat_id=room_id,
-            chat_name=room.get("name") or room_id,
+            chat_name=self._label(room.get("name")) or room_id,
             chat_type="group",
             user_id=sender_id,
             user_name=who,
             message_id=str(seq) if seq is not None else None,
         )
-        # toolsets_for_source only sees the source — the verdict rides on it
-        source.klatalk_owner_only = is_owner
+        # toolsets_for_source only sees the source — the verdict rides on it;
+        # a turn carrying anyone else's rows as context is not an owner turn
+        source.klatalk_owner_only = is_owner and not context
         reply_seq = ev.get("reply_to_seq")
         return MessageEvent(
             text=text.strip() if control else body,
@@ -770,6 +815,7 @@ class KlatalkAdapter(BasePlatformAdapter):
                       "klatalk_control": control,
                       "klatalk_marker": marker, "klatalk_who": who,
                       "klatalk_body": text,
+                      "klatalk_context": list(context),
                       "klatalk_max_seq": seq if isinstance(seq, int) else 0,
                       "klatalk_merged": 1},
             allow_gateway_control=is_owner,
@@ -790,9 +836,15 @@ class KlatalkAdapter(BasePlatformAdapter):
         # run.py's _enqueue_fifo writes straight into _pending_messages) and
         # those carry no klatalk_* keys — merge, and fail CLOSED on both gates
         foreign = "klatalk_marker" not in emd
+
+        def _row(meta):
+            # the row's own line behind the unwoken rows it carried: the read
+            # mark this turn signs covers those seqs, so they must stay in
+            head = list(meta.get("klatalk_context") or [])
+            return "\n".join(head + [f"{meta['klatalk_marker']} {meta['klatalk_who']}: {meta['klatalk_body']}"])
         if not foreign and emd.get("klatalk_merged", 1) == 1 and not emd.get("klatalk_control"):
-            existing.text = f"{emd['klatalk_marker']} {emd['klatalk_who']}: {emd['klatalk_body']}"
-        event.text = f"{md['klatalk_marker']} {md['klatalk_who']}: {md['klatalk_body']}"
+            existing.text = _row(emd)
+        event.text = _row(md)
         merge_pending_message_event(self._pending_messages, key, event, merge_text=True)
         existing = self._pending_messages.get(key, existing)
         existing.allow_gateway_control = bool(existing.allow_gateway_control
@@ -806,13 +858,15 @@ class KlatalkAdapter(BasePlatformAdapter):
         emd["klatalk_max_seq"] = max(emd.get("klatalk_max_seq", 0), md.get("klatalk_max_seq", 0))
         existing.message_id = event.message_id or existing.message_id
 
-    async def _render(self, room_id: str, payload: dict):
+    async def _render(self, room_id: str, payload: dict, allow_media: bool = True):
         """Payload → (text, media_urls, media_types). Images are fetched
         through the core's capped fetch and cached for the vision tool;
         files are named, never downloaded. Both blocking steps run off the
         loop: listen_core awaits this inline in the socket read loop."""
         kt = self.core
         kind = payload.get("type")
+        if kind == "image" and not allow_media:
+            return "(image — not fetched: daily budget spent)", [], []
         if kind == "image" and isinstance(payload.get("url"), str) and payload["url"]:
             # uploads_path() binds a url to "/uploads/", not to a room: a
             # member's payload naming another room's attachment would have
@@ -875,7 +929,17 @@ class KlatalkAdapter(BasePlatformAdapter):
         self._handed.pop(room_id, None)
         if outcome != ProcessingOutcome.SUCCESS:
             return
-        seq = (event.metadata or {}).get("klatalk_max_seq")
+        md = event.metadata or {}
+        if md.get("klatalk_control") and room_id in self.settings.tool_rooms and re.match(
+                r"^/(?:new|reset)(?:\s|$)", md.get("klatalk_body") or "", re.I):
+            # the owner's own fresh session, taken while the roster is
+            # exactly the two of them: the one thing that arms a tool room
+            await self._refresh_room(room_id)
+            if room_id not in self._roster_stale and self._roster_exact(room_id):
+                self._tool_armed.add(room_id)
+                self._context.pop(room_id, None)
+                self._tool_room_told.pop(room_id, None)
+        seq = md.get("klatalk_max_seq")
         if not seq:
             return
         try:
@@ -998,7 +1062,15 @@ class KlatalkAdapter(BasePlatformAdapter):
                " log, not here) — /approve or /deny")
         if not smart_denied and allow_session:
             ask += " (/approve session" + (", /approve always)" if allow_permanent else ")")
-        return await self.send(chat_id, ask)
+        result = await self.send(chat_id, ask)
+        if not result.success:
+            # a failed result sends run.py to its text fallback — the command
+            # in the room. The prompt is registered and the command is in the
+            # log: report success, say why here.
+            logger.error("[%s] approval notice to %s could not be delivered (%s) — answer"
+                         " /approve or /deny from the log", PLATFORM, _short(chat_id), result.error)
+            return SendResult(success=True, message_id=None)
+        return result
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         room = self._rooms.get(chat_id) or {}
@@ -1207,8 +1279,9 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=["KLATALK_PROFILE", "KLATALK_ROOMS", "KLATALK_OWNER_ID",
                       "KLATALK_ALLOW_ALL_USERS"],
-        install_hint="install the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.4+)"
-                     " and the websockets package",
+        install_hint="install the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.5 — the"
+                     " exact bytes this plugin directory's core.sha256 pins) and the"
+                     " websockets package",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="KLATALK_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,

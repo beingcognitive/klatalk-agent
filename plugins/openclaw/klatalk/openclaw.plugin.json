@@ -3,9 +3,17 @@
   "name": "KLATalk",
   "version": "1.5.0",
   "description": "KLATalk channel: the gateway as the agent's seat in its rooms. Protocol work is done by the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.5+) running as a child process (`klatalk bridge`).",
-  "channels": ["klatalk"],
-  "activation": { "onStartup": false },
-  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} },
+  "channels": [
+    "klatalk"
+  ],
+  "activation": {
+    "onStartup": false
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
   "channelConfigs": {
     "klatalk": {
       "label": "KLATalk",
@@ -13,19 +21,81 @@
       "schema": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["profile", "rooms", "ownerUserId"],
+        "required": [
+          "profile",
+          "rooms",
+          "ownerUserId"
+        ],
         "properties": {
-          "enabled": { "type": "boolean", "description": "Run this channel (default true)." },
-          "profile": { "type": "string", "description": "klatalk CLI profile = the account this seat speaks as." },
-          "rooms": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Room ids to sit in — every room is a deliberate choice (no 'all')." },
-          "ownerUserId": { "type": "string", "description": "Your user_id: the one member whose messages may direct the agent and use gateway commands." },
-          "toolRooms": { "type": "array", "items": { "type": "string" }, "description": "Rooms where the owner's messages keep the agent's full tool policy; everyone else, everywhere, gets the safe set (no exec, no files, no sessions)." },
-          "maxTurnsPerDay": { "type": "integer", "minimum": 1, "description": "Per-room daily wake budget; beyond it messages stay unread." },
-          "cli": { "type": "string", "description": "Path to the klatalk CLI file (default ~/.klatalk-agent/bin/klatalk)." },
-          "python": { "type": "string", "description": "Python 3 interpreter for the bridge (default python3)." },
-          "home": { "type": "string", "description": "KLATALK_HOME for the bridge (default ~/.klatalk-agent)." },
-          "api": { "type": "string", "description": "KLATALK_API for the bridge." },
-          "mlsBin": { "type": "string", "description": "KLATALK_MLS_BIN for sealed rooms." }
+          "enabled": {
+            "type": "boolean",
+            "description": "Run this channel (default true)."
+          },
+          "profile": {
+            "type": "string",
+            "description": "klatalk CLI profile = the account this seat speaks as."
+          },
+          "rooms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "description": "Room ids to sit in — every room is a deliberate choice (no 'all').",
+            "uniqueItems": true
+          },
+          "ownerUserId": {
+            "type": "string",
+            "description": "Your user_id: the one member whose messages may direct the agent and use gateway commands."
+          },
+          "toolRooms": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Rooms where the owner's turns keep the agent's full tool policy — armed by the owner's /new while the room holds only the owner and the seat; everyone else, everywhere, gets the member set.",
+            "uniqueItems": true
+          },
+          "memberTools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true,
+            "description": "OpenClaw tools added to the member set (default: image only). Never '*', 'bundle-mcp', 'group:*' or anything that acts on this machine or leaves the room."
+          },
+          "mediaRoots": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra directories a non-tool turn's reply may upload files from (the seat's own media directory is always allowed)."
+          },
+          "maxTurnsPerDay": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Per-room daily budget of turns members may open (default 200; 0 = unlimited). The owner is never budgeted."
+          },
+          "cli": {
+            "type": "string",
+            "description": "Path to the klatalk CLI file (default ~/.klatalk-agent/bin/klatalk)."
+          },
+          "python": {
+            "type": "string",
+            "description": "Python 3 interpreter for the bridge (default python3)."
+          },
+          "home": {
+            "type": "string",
+            "description": "KLATALK_HOME for the bridge (default ~/.klatalk-agent)."
+          },
+          "api": {
+            "type": "string",
+            "description": "KLATALK_API for the bridge."
+          },
+          "mlsBin": {
+            "type": "string",
+            "description": "KLATALK_MLS_BIN for sealed rooms."
+          }
         }
       }
     }

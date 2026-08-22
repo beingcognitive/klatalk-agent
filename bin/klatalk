@@ -1743,8 +1743,14 @@ PAGE = 200
 
 
 def normalize_plain(m, me=None):
-    content = m.get("content") or {}
-    payload = content.get("payload") or {}
+    content = m.get("content")
+    if not isinstance(content, dict):
+        content = {}
+    payload = content.get("payload")
+    if not isinstance(payload, dict):
+        # the wire is untrusted: a str/list here must not raise out of
+        # every consumer's .get() — it is a row with nothing to show
+        payload = {"type": "invalid"}
     return {"kind": "system" if payload.get("type") == "system" else "message",
             "seq": m.get("seq"), "sender_id": m.get("sender_id"),
             "reply_to_seq": m.get("reply_to_seq"), "payload": payload,
@@ -3874,13 +3880,13 @@ def bridge_line(payload):
         r = payload.get("reaction")
         if isinstance(r, dict):
             return (f"(reaction {clean(str(r.get('action') or ''))} on"
-                    f" #{r.get('target_seq')})")
+                    f" #{clean(r.get('target_seq'))})")
         return clean(payload.get("text") or "")
     if kind == "image":
         return "(image)"
     if kind == "file":
         return (f"(file) {clean(payload.get('name') or '')}"
-                f" {payload.get('size') or ''}").strip()
+                f" {clean(payload.get('size') or '')}").strip()
     return clean(summarize_payload(payload))
 
 
@@ -3897,6 +3903,7 @@ class Bridge:
         self.desync_told = set()
         self.turns = {}                  # room_id -> wake stamps (budget)
         self.read_max = {}               # room_id -> highest seq signed here
+        self.read_locks = {}             # room_id -> Lock (monotonic under concurrent commands)
         self.sends = []
         self.send_lock = asyncio.Lock()
         self.out_lock = asyncio.Lock()
@@ -3951,10 +3958,39 @@ class Bridge:
         return member_who(self.cache.get(room_id) or {})
 
     async def on_event(self, room_id, ev):
+        """Every row ends here: an exception escaping to listen_core would
+        have the same row re-delivered on every reconnect forever (its
+        cursor moves only after on_event returned). Drop the row, say so."""
+        try:
+            await self.on_event_inner(room_id, ev)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await self.emit({"ev": "error", "room": room_id, "seq": ev.get("seq"),
+                             "why": type(e).__name__})
+
+    async def refresh_room(self, room_id):
+        """The roster the tool-room verdict rides on must be live: a
+        refresh that fails drops the cache (room_for re-fetches) rather
+        than keep answering with the pre-change roster."""
+        try:
+            room = await asyncio.to_thread(get_room, self.creds, room_id)
+            if room:
+                self.cache[room_id] = room
+                return
+        except Exception:
+            pass
+        self.cache.pop(room_id, None)
+
+    async def on_event_inner(self, room_id, ev):
         kind = ev.get("kind")
         if kind == "joined":
+            # the live boundary: rows at or below this seq are unjudged
+            # backlog — a host can tell last night's control line from a
+            # live one
             await self.emit({"ev": "joined", "room": room_id,
-                             "sealed": bool(ev.get("sealed"))})
+                             "sealed": bool(ev.get("sealed")),
+                             "last_seq": int((self.cache.get(room_id) or {}).get("last_seq") or 0)})
             return
         if kind == "reconnect":
             await self.emit({"ev": "reconnect", "room": room_id,
@@ -3977,19 +4013,21 @@ class Bridge:
                     task.cancel()
                 return
             if event.startswith("member:") or event.startswith("room:"):
-                try:
-                    room = await asyncio.to_thread(get_room, self.creds, room_id)
-                    if room:
-                        self.cache[room_id] = room
-                except Exception:
-                    pass
+                await self.refresh_room(room_id)
+            return
+        if kind == "system":
+            # a sealed room's membership commits arrive as system rows
+            if ev.get("sealed"):
+                await self.refresh_room(room_id)
             return
         if kind != "message":
             return
         if ev.get("own") or ev.get("sender_id") == self.me_id or ev.get("deleted"):
             return
         sid = ev.get("sender_id") or ""
-        payload = ev.get("payload") or {}
+        payload = ev.get("payload")
+        if not isinstance(payload, dict):
+            return                       # nothing to show, nothing to wake
         nick, ai = self.roster(room_id).get(sid, (sid[:8] or "?", False))
         text = bridge_line(payload)
         binding = ev.get("sender_binding") or "ok"
@@ -4033,11 +4071,14 @@ class Bridge:
                     return
                 await asyncio.sleep(max(0.05, self.sends[0] + window - now))
 
-    async def room_for(self, room_id):
+    async def room_for(self, room_id, fresh=False):
         if not isinstance(room_id, str) or room_id not in self.rooms:
             raise KlatalkUsage("not one of this bridge's rooms")
         room = self.cache.get(room_id)
-        if room is None:
+        if room is None or fresh:
+            # member:* is a non-durable broadcast and a reconnect backfills
+            # messages only — a verdict that arms tools on "nobody else is
+            # here" asks the server
             room = await asyncio.to_thread(get_room, self.creds, room_id)
             if room is None:
                 raise KlatalkMembership("not a member of that room")
@@ -4089,12 +4130,15 @@ class Bridge:
             if not isinstance(seq, int) or seq <= 0:
                 raise KlatalkUsage("read needs a positive seq")
             # a read mark is monotonic: a turn that finished late must not
-            # pull the mark back under a later turn's signature
-            if seq <= self.read_max.get(room_id, 0):
-                return {"last_read_seq": self.read_max[room_id], "skipped": True}
-            confirmed = await do_read(self.creds, room_id, seq)
-            self.read_max[room_id] = seq
-            return {"last_read_seq": confirmed}
+            # pull the mark back under a later turn's signature — and two
+            # commands in flight must not race the check
+            lock = self.read_locks.setdefault(room_id, asyncio.Lock())
+            async with lock:
+                if seq <= self.read_max.get(room_id, 0):
+                    return {"last_read_seq": self.read_max[room_id], "skipped": True}
+                confirmed = await do_read(self.creds, room_id, seq)
+                self.read_max[room_id] = seq
+                return {"last_read_seq": confirmed}
         if cmd == "fetch":
             await self.room_for(room_id)
             out, max_bytes = req.get("out"), req.get("max_bytes")
@@ -4135,7 +4179,7 @@ class Bridge:
                                      reply_to=reply_to, read_through=None)
             return {"seq": seq}
         if cmd == "roster":
-            room = await self.room_for(room_id)
+            room = await self.room_for(room_id, fresh=bool(req.get("fresh")))
             return {"name": clean(room.get("name") or ""), "sealed": is_sealed(room),
                     "members": [{"user_id": uid, "nick": clean(nick), "is_ai": bool(ai)}
                                 for uid, (nick, ai) in member_who(room).items()]}
@@ -4153,9 +4197,9 @@ class Bridge:
             try:
                 for line in sys.stdin:
                     loop.call_soon_threadsafe(queue.put_nowait, line)
-            except (OSError, ValueError):
-                pass
-            loop.call_soon_threadsafe(queue.put_nowait, None)
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+            except (OSError, ValueError, RuntimeError):
+                pass                     # the pipe or the loop is gone — so are we
 
         threading.Thread(target=reader, daemon=True).start()
         return queue
@@ -4206,8 +4250,8 @@ async def bridge_main(args):
                            " under WSL")
     profile = profile_name(args)
     creds = load_creds(profile)
-    rooms = [r.strip() for r in (args.rooms or "").replace(";", ",").split(",")
-             if r.strip()]
+    rooms = list(dict.fromkeys(r.strip() for r in (args.rooms or "").replace(";", ",").split(",")
+                               if r.strip()))           # a room listed twice is one seat
     if not rooms:
         raise KlatalkUsage("bridge needs --rooms R1,R2 (every room is a"
                            " deliberate choice — no 'all')")

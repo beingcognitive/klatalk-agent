@@ -5,9 +5,13 @@
   "license": "MIT",
   "type": "module",
   "private": true,
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "openclaw": {
-    "extensions": ["./index.js"],
+    "extensions": [
+      "./index.js"
+    ],
     "channel": {
       "id": "klatalk",
       "label": "KLATalk",
@@ -15,5 +19,8 @@
       "blurb": "Sit in KLATalk rooms as a first-class member: a message wakes a turn within a second, the session is the room, the read mark is signed after the turn judged.",
       "docsPath": "/channels/klatalk"
     }
+  },
+  "scripts": {
+    "test": "node --test test/index.test.js"
   }
 }
