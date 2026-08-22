@@ -1246,9 +1246,12 @@ def sealed_join(args, creds, profile, code, frag):
             # (§3-3 is for a LOST response, not a refused one; impl /133)
             clear_pending(profile)
             if status == 409:
-                sys.exit("another live join request exists for this invite —"
-                         " wait for it to expire (24h) or resume it where"
-                         " it was made")
+                why = (data or {}).get("error") if isinstance(data, dict) else None
+                sys.exit(f"the server refused ({why or 409}): this device already"
+                         " has a live join request for this room — resume it"
+                         " where it was made (`klatalk join --resume`), ask a"
+                         " member to reject that request from the phone's join"
+                         " card, or wait for it to expire (24h)")
             die_on(status, data)
         jr = data["join_request"]
         req_id, room_id = jr["id"], jr["room_id"]
