@@ -1329,6 +1329,49 @@ class TestServeService(Base):
                                            install=None, uninstall="launchd"))
         self.assertIn("no launchd service", str(cm.exception))
 
+    def test_windows_launcher_quotes_once_and_loops(self):
+        argv = ["C:\\py\\python.exe", "C:\\k\\klatalk", "serve", "R",
+                "--", "cmd", "/c", "echo a & b 100%"]
+        cmd = self.cli.windows_launcher("com.klatalk.serve.R.default", argv,
+                                        {"PATH": "C:\\nvm;C:\\Windows", "KLATALK_HOME": "C:\\h"},
+                                        "C:\\work", "C:\\h\\serve.log")
+        self.assertIn("title com.klatalk.serve.R.default\r\n", cmd)
+        self.assertIn('set "PATH=C:\\nvm;C:\\Windows"\r\n', cmd)
+        self.assertIn('cd /d "C:\\work"\r\n', cmd)
+        # the turn's `&` and `%` survive: quoted once, % doubled for cmd.exe
+        self.assertIn('"echo a & b 100%%"', cmd)
+        self.assertIn('>> "C:\\h\\serve.log" 2>&1\r\n', cmd)
+        self.assertIn(":loop\r\n", cmd)
+        self.assertIn("timeout /t 30 /nobreak >nul\r\ngoto loop\r\n", cmd)
+
+    def test_install_schtasks_registers_and_runs_the_launcher(self):
+        self._write_creds("default", "Hermes")
+        room = {"id": "room-1234-5678", "name": "X", "encryption_mode": "plain",
+                "last_seq": 3, "my_last_read_seq": 3, "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        calls = []
+
+        class R:
+            returncode = 0
+        self.cli.subprocess.run = lambda cmd, **kw: (calls.append(cmd), R())[1]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="room-1234-5678", cmd=["cmd", "/c", "echo"],
+                                           max_turns=None, turn_timeout=600,
+                                           install="schtasks", uninstall=None))
+        launcher = os.path.join(self.home, "serve-room-123-default.cmd")
+        self.assertTrue(os.path.exists(launcher))
+        create = [c for c in calls if c[:2] == ["schtasks", "/Create"]][0]
+        self.assertEqual(create[create.index("/TR") + 1], f'"{launcher}"')
+        self.assertIn("ONLOGON", create)
+        self.assertEqual(calls[-1][:2], ["schtasks", "/Run"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="room-1234-5678", cmd=[],
+                                           max_turns=None, turn_timeout=600,
+                                           install=None, uninstall="schtasks"))
+        self.assertFalse(os.path.exists(launcher))
+        self.assertEqual([c[:2] for c in calls[-3:]],
+                         [["schtasks", "/End"], ["taskkill", "/F"], ["schtasks", "/Delete"]])
+
 
 if __name__ == "__main__":
     unittest.main()

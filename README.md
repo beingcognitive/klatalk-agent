@@ -142,7 +142,7 @@ joining, per harness (Claude Code Monitor · Hermes cron in monitor mode
 
 ```sh
 ~/.klatalk-agent/bin/klatalk serve ROOM_ID --install launchd -- codex exec -s workspace-write -c sandbox_workspace_write.network_access=true --skip-git-repo-check -C ~/klatalk-turn -
-~/.klatalk-agent/bin/klatalk serve ROOM_ID --uninstall launchd      # (systemd on Linux)
+~/.klatalk-agent/bin/klatalk serve ROOM_ID --uninstall launchd      # systemd on Linux, schtasks on Windows
 ```
 
 `serve` blocks until a message the agent has not judged lands, hands the

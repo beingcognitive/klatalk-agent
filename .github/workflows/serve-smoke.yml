@@ -1,0 +1,64 @@
+# The resident loop's service installers, proven on the OS we do not
+# have on a desk: unit tests on all three, and on Windows a real Task
+# Scheduler registration through `klatalk serve --install schtasks`
+# (create → query → launcher present → uninstall → gone).
+name: serve-smoke
+on:
+  workflow_dispatch:
+  push:
+    paths: ["bin/klatalk", "tests/**", ".github/workflows/serve-smoke.yml"]
+
+jobs:
+  unit:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python -m pip install websockets pytest
+      - run: python -m pytest tests -q
+
+  schtasks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python -m pip install websockets
+      - name: Install, query, uninstall a real scheduled task
+        shell: pwsh
+        env:
+          KLATALK_HOME: ${{ runner.temp }}\klatalk-home
+          KLATALK_API: http://127.0.0.1:9
+        run: |
+          $py = @'
+          import importlib.util, importlib.machinery, json, os, sys, argparse
+          spec = importlib.util.spec_from_loader("k", importlib.machinery.SourceFileLoader("k", "bin/klatalk"))
+          k = importlib.util.module_from_spec(spec); spec.loader.exec_module(k)
+          os.makedirs(k.HOME, mode=0o700, exist_ok=True)
+          k.write_private(k.cred_path("default"), lambda f: json.dump({"user_id": "u", "nickname": "ci", "access_token": "T"}, f))
+          room = {"id": "ciroom00000", "name": "ci", "encryption_mode": "plain", "last_seq": 0, "my_last_read_seq": 0, "members": []}
+          k.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+          mode = sys.argv[1]          # "install" or "uninstall"
+          ns = argparse.Namespace(room="ciroom00000", cmd=["cmd", "/c", "echo turn"], max_turns=None, turn_timeout=60,
+                                  install="schtasks" if mode == "install" else None,
+                                  uninstall="schtasks" if mode == "uninstall" else None)
+          k.cmd_serve(ns)
+          '@
+          Set-Content -Path ci.py -Value $py
+          python ci.py install
+          $label = "com.klatalk.serve.ciroom00.default"
+          schtasks /Query /TN $label /V /FO LIST
+          if ($LASTEXITCODE -ne 0) { throw "task not registered" }
+          $launcher = Join-Path $env:KLATALK_HOME "serve-ciroom00-default.cmd"
+          if (-not (Test-Path $launcher)) { throw "launcher missing: $launcher" }
+          Get-Content $launcher
+          Start-Sleep -Seconds 5
+          python ci.py uninstall
+          schtasks /Query /TN $label 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "task still registered after uninstall" }
+          if (Test-Path $launcher) { throw "launcher still present after uninstall" }
+          "schtasks round trip OK"
