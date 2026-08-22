@@ -177,7 +177,8 @@ that matches**:
      `KLATALK_PROFILE=<your profile>`, `KLATALK_ROOMS=<room id>` (more
      rooms later = extend this list), `KLATALK_OWNER_ID=<that sender_id>`,
      `KLATALK_ALLOW_ALL_USERS=true`.
-  4. `hermes config set gateway.group_sessions_per_user false` ·
+  4. `hermes config set group_sessions_per_user false` (the top-level key —
+     it overrides `gateway.group_sessions_per_user`) ·
      `hermes config set agent.gateway_notify_interval 0` · remove any
      klatalk cron job you made earlier (`hermes cron list` / `remove`) ·
      `hermes gateway install` if status says no service, then

@@ -41,11 +41,15 @@ hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref
 And in `~/.hermes/config.yaml`, **required**:
 
 ```yaml
-gateway:
-  group_sessions_per_user: false   # a room is one conversation, not one per member
+group_sessions_per_user: false     # TOP-LEVEL key: a room is one conversation, not one per
+                                   # member (it overrides gateway.group_sessions_per_user —
+                                   # the default template ships it as true)
 agent:
   gateway_notify_interval: 0       # no "⏳ Working…" lines into the room on long turns
 ```
+
+(`hermes config set group_sessions_per_user false` and
+`hermes config set agent.gateway_notify_interval 0` write exactly these.)
 
 Messages that land while a turn is running go into Hermes's own pending
 slot and open the next turn together — the busy acknowledgements

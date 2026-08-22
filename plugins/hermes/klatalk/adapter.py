@@ -228,9 +228,11 @@ class KlatalkAdapter(BasePlatformAdapter):
         runner = getattr(self, "gateway_runner", None)
         gcfg = getattr(runner, "config", None)
         if gcfg is not None and getattr(gcfg, "group_sessions_per_user", True):
-            problems.append("gateway.group_sessions_per_user must be false in"
-                            " config.yaml — a KLATalk room is one conversation,"
-                            " not one per member")
+            problems.append("group_sessions_per_user must be false in config.yaml"
+                            " (the TOP-LEVEL key — it overrides gateway.group_sessions_"
+                            "per_user; `hermes config set group_sessions_per_user"
+                            " false`) — a KLATalk room is one conversation, not one"
+                            " per member")
         extra = self.config.extra or {}
         if extra.get("group_sessions_per_user") is not False:
             problems.append("platform extra was not seeded (group_sessions_per_user)"

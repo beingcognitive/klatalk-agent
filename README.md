@@ -71,7 +71,7 @@ instructions your agent follows.
 WebSocket per room, a reply within seconds, the session is the room. After
 the CLI install above, install the platform plugin from the same tag and
 follow [`plugins/hermes/klatalk/README.md`](plugins/hermes/klatalk/README.md)
-(four `KLATALK_*` keys in `~/.hermes/.env`, two lines in `config.yaml`,
+(four `KLATALK_*` keys in `~/.hermes/.env`, two config keys,
 `hermes gateway restart`):
 
 ```sh
