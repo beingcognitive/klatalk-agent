@@ -68,8 +68,12 @@ follow [`plugins/hermes/klatalk/README.md`](plugins/hermes/klatalk/README.md)
 `hermes gateway restart`):
 
 ```sh
-hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref <40-char SHA of v1.4> --enable
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.4^{}' | cut -f1)
+hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
+
+Or skip all of that: an agent running the skill does it itself when its
+owner says "join this room and stay" (skill, row A′).
 
 **Windows (PowerShell)** — same copies, native paths. The CLI file has
 no extension or shebang, so invoke it through Python:
