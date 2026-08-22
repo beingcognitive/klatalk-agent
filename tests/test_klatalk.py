@@ -2616,6 +2616,258 @@ class TestCoreFixRound(TestCoreLibrary):
 
 
 
+
+class TestBridge(Base):
+    """v1.5 `klatalk bridge` — the core as a child process for hosts that
+    cannot import it (OpenClaw is Node). Events out, commands in, one JSON
+    object per line; the wake rule, the send budget and the read mark's
+    monotonicity live here so every host shares them."""
+
+    def _bridge(self, rooms=("R1",), owner="OWNER", wake_on="humans", budget=0):
+        c = self.cli
+        creds = {"access_token": "tok", "user_id": "ME", "nickname": "Bot"}
+        b = c.Bridge(creds, "p", list(rooms), owner, wake_on, budget)
+        b.out = []
+
+        async def emit(obj):
+            b.out.append(obj)
+        b.emit = emit
+        b.cache["R1"] = {"id": "R1", "name": "Bench", "encryption_mode": "plain",
+                         "members": [{"user_id": "OWNER", "nickname": "Own"},
+                                     {"user_id": "H", "nickname": "Human"},
+                                     {"user_id": "A", "nickname": "Other",
+                                      "bio": "AI member · x"}]}
+        return b
+
+    @staticmethod
+    def _msg(sid, text, **k):
+        ev = {"kind": "message", "seq": k.pop("seq", 1), "sender_id": sid,
+              "payload": {"type": "text", "text": text},
+              "sender_binding": k.pop("binding", "ok"), "inserted_at": "2026-08-23T00:00:00Z"}
+        ev.update(k)
+        return ev
+
+    def test_failure_kinds_are_a_closed_vocabulary(self):
+        c = self.cli
+        cases = [(c.SendRejected("r"), "rejected"), (c.KlatalkMembership("m"), "forbidden"),
+                 (c.KlatalkQuota("q"), "rate_limited"), (c.KlatalkBusy("b"), "transient"),
+                 (c.KlatalkTransient("t"), "transient"), (c.KlatalkDesync("d"), "blocked"),
+                 (c.KlatalkBlocked("x"), "blocked"), (c.KlatalkMls("h"), "mls"),
+                 (c.KlatalkAuth("a"), "auth"), (c.KlatalkUsage("u"), "usage"),
+                 (ValueError("secret detail"), "unknown")]
+        for e, kind in cases:
+            self.assertEqual(c.bridge_kind(e), kind, repr(e))
+
+    def test_line_is_the_text_or_a_marker(self):
+        c = self.cli
+        self.assertNotIn("\x07", c.bridge_line({"type": "text", "text": "hi\x07there"}))
+        self.assertEqual(c.bridge_line({"type": "image", "url": "/uploads/R/x.jpg"}), "(image)")
+        self.assertEqual(c.bridge_line({"type": "file", "name": "a.pdf", "size": 12}),
+                         "(file) a.pdf 12")
+        self.assertEqual(c.bridge_line({"type": "text", "text": "",
+                                        "reaction": {"action": "like", "target_seq": 4}}),
+                         "(reaction like on #4)")
+
+    def test_wake_rule_humans_and_named_ai_only(self):
+        b = self._bridge()
+        run = lambda ev: asyncio.run(b.on_event("R1", ev))
+        run(self._msg("H", "hi"))
+        self.assertEqual((b.out[-1]["ev"], b.out[-1]["wake"], b.out[-1]["owner"],
+                          b.out[-1]["nick"], b.out[-1]["is_ai"]),
+                         ("message", True, False, "Human", False))
+        run(self._msg("A", "hi"))
+        self.assertEqual((b.out[-1]["wake"], b.out[-1]["is_ai"]), (False, True))
+        run(self._msg("A", "Bot, hi"))
+        self.assertTrue(b.out[-1]["wake"])
+        run(self._msg("OWNER", "do it"))
+        self.assertTrue(b.out[-1]["owner"])
+        # the label and the crypto disagree: never the owner's voice
+        run(self._msg("OWNER", "do it", binding="failed"))
+        self.assertEqual((b.out[-1]["owner"], b.out[-1]["sender_binding"]), (False, "failed"))
+        n = len(b.out)
+        run(self._msg("ME", "echo", own=True))
+        run(self._msg("H", "gone", deleted=True))
+        run({"kind": "message", "seq": 9, "sender_id": "H",
+             "payload": {"type": "system", "text": "x"}, "own": False})
+        self.assertEqual(len(b.out), n + 1)       # the system row is data, not a wake
+        self.assertFalse(b.out[-1]["wake"] and False)
+        b2 = self._bridge(wake_on="all")
+        asyncio.run(b2.on_event("R1", self._msg("A", "hi")))
+        self.assertTrue(b2.out[-1]["wake"])
+        # a reaction is the room's quiet register — never a wake, even on "all"
+        ev = self._msg("H", "❤️", seq=7)
+        ev["payload"]["reaction"] = {"action": "like", "target_seq": 3}
+        asyncio.run(b2.on_event("R1", ev))
+        self.assertEqual((b2.out[-1]["wake"], b2.out[-1]["text"]), (False, "(reaction like on #3)"))
+
+    def test_budget_charges_woken_rows_per_room_per_day(self):
+        b = self._bridge(budget=1)
+        run = lambda ev: asyncio.run(b.on_event("R1", ev))
+        run(self._msg("A", "unnamed"))            # no wake, no charge
+        run(self._msg("H", "one"))
+        self.assertEqual((b.out[-1]["wake"], b.out[-1]["budget_spent"]), (True, False))
+        run(self._msg("H", "two"))
+        self.assertEqual((b.out[-1]["wake"], b.out[-1]["budget_spent"]), (False, True))
+        b.turns["R1"] = [time.time() - 86401]     # yesterday's wake has expired
+        run(self._msg("H", "three"))
+        self.assertTrue(b.out[-1]["wake"])
+        # a budget a member can spend never silences the owner
+        run(self._msg("H", "four"))
+        self.assertFalse(b.out[-1]["wake"])
+        run(self._msg("OWNER", "still here"))
+        self.assertEqual((b.out[-1]["wake"], b.out[-1]["owner"], b.out[-1]["budget_spent"]),
+                         (True, True, False))
+
+    def test_lifecycle_events_and_removal_stop_the_room(self):
+        b = self._bridge()
+        run = lambda ev: asyncio.run(b.on_event("R1", ev))
+        run({"kind": "joined", "sealed": True})
+        self.assertEqual(b.out[-1], {"ev": "joined", "room": "R1", "sealed": True})
+        run({"kind": "reconnect", "delay": 4, "raw": "socket closed"})
+        self.assertEqual(b.out[-1]["ev"], "reconnect")
+        run({"kind": "desync"}); run({"kind": "desync"})
+        self.assertEqual([o["ev"] for o in b.out].count("desync"), 1)
+        run({"kind": "frame", "event": "member:removed", "raw": {"user_id": "ME"}})
+        self.assertIn("R1", b.stopped)
+        self.assertEqual(b.out[-1]["ev"], "stopped")
+
+    def test_commands_refuse_foreign_rooms_and_keep_reads_monotonic(self):
+        b = self._bridge()
+        c = self.cli
+        reads = []
+
+        async def do_read(creds, room, seq):
+            reads.append(seq)
+            return seq
+        c.do_read = do_read
+        h = lambda req: asyncio.run(b.handle(json.dumps(req) if isinstance(req, dict) else req))
+        h({"id": "1", "cmd": "send", "room": "R9", "text": "x"})
+        self.assertEqual((b.out[-1]["id"], b.out[-1]["ok"], b.out[-1]["kind"]), ("1", False, "usage"))
+        h({"id": "2", "cmd": "read", "room": "R1", "seq": 5})
+        h({"id": "3", "cmd": "read", "room": "R1", "seq": 3})
+        self.assertEqual(reads, [5])
+        self.assertEqual((b.out[-1]["ok"], b.out[-1]["skipped"], b.out[-1]["last_read_seq"]),
+                         (True, True, 5))
+        h("not json")
+        self.assertEqual(b.out[-1]["kind"], "usage")
+        h({"id": "4", "cmd": "dance", "room": "R1"})
+        self.assertEqual(b.out[-1]["kind"], "usage")
+        h({"id": "5", "cmd": "roster", "room": "R1"})
+        self.assertEqual(b.out[-1]["name"], "Bench")
+        self.assertEqual([m["is_ai"] for m in b.out[-1]["members"]], [False, False, True])
+
+    def test_send_runs_through_the_core_and_maps_failures(self):
+        b = self._bridge()
+        c = self.cli
+        calls = []
+
+        async def send_message(creds, profile, room, payload=None, *, text=None,
+                               reply_to=None, read_through=None):
+            calls.append((room["id"], payload, text, reply_to, read_through))
+            if text == "boom":
+                raise c.KlatalkMembership("kicked")
+            if text == "crash":
+                raise RuntimeError("secret detail")
+            return 42
+        c.send_message = send_message
+        h = lambda req: asyncio.run(b.handle(json.dumps(req)))
+        h({"id": "1", "cmd": "send", "room": "R1", "text": "hi", "reply_to": 7})
+        self.assertEqual(b.out[-1], {"id": "1", "ok": True, "seq": 42})
+        self.assertEqual(calls[-1], ("R1", None, "hi", 7, None))   # never signs read
+        h({"id": "2", "cmd": "send", "room": "R1", "text": "boom"})
+        self.assertEqual((b.out[-1]["kind"], b.out[-1]["why"]), ("forbidden", "kicked"))
+        h({"id": "3", "cmd": "send", "room": "R1", "text": "crash"})
+        self.assertEqual((b.out[-1]["kind"], b.out[-1]["why"]), ("unknown", "RuntimeError"))
+        h({"id": "4", "cmd": "send", "room": "R1"})
+        self.assertEqual(b.out[-1]["kind"], "usage")
+        h({"id": "5", "cmd": "send", "room": "R1", "text": "x", "reply_to": "7"})
+        self.assertEqual(b.out[-1]["kind"], "usage")
+
+    def test_fetch_writes_a_fresh_private_file_only(self):
+        b = self._bridge()
+        c = self.cli
+        c.fetch_upload = lambda creds, path, mb: b"img"
+        out = os.path.join(self.tmp, "m.jpg")
+        h = lambda req: asyncio.run(b.handle(json.dumps(req)))
+        h({"id": "1", "cmd": "fetch", "room": "R1", "url": "/uploads/R1/a.jpg",
+           "max_bytes": 10, "out": out})
+        self.assertEqual((b.out[-1]["ok"], b.out[-1]["bytes"]), (True, 3))
+        self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
+        h({"id": "2", "cmd": "fetch", "room": "R1", "url": "/uploads/R1/a.jpg",
+           "max_bytes": 10, "out": out})
+        self.assertFalse(b.out[-1]["ok"])          # never over an existing file
+        h({"id": "3", "cmd": "fetch", "room": "R1", "url": "/uploads/R1/a.jpg",
+           "max_bytes": 10, "out": "rel.jpg"})
+        self.assertEqual(b.out[-1]["kind"], "usage")
+        # another room's attachment is not this room's to pull (sec audit, 1/6 + verified)
+        h({"id": "4", "cmd": "fetch", "room": "R1", "url": "/uploads/R2/a.jpg",
+           "max_bytes": 10, "out": os.path.join(self.tmp, "n.jpg")})
+        self.assertEqual(b.out[-1]["kind"], "usage")
+        h({"id": "5", "cmd": "fetch", "url": "/uploads/R1/a.jpg", "max_bytes": 10,
+           "out": os.path.join(self.tmp, "o.jpg")})
+        self.assertEqual(b.out[-1]["kind"], "usage")   # no room, no fetch
+
+    def test_stdin_eof_ends_the_bridge_and_auth_loss_exits_2(self):
+        c = self.cli
+
+        async def listen_forever(creds, profile, room_id, on_event, cursor=None):
+            await on_event({"kind": "joined", "sealed": False})
+            await asyncio.Event().wait()
+        c.listen_core = listen_forever
+        c.get_room = lambda creds, rid, strict=True: {"id": rid, "name": "Bench", "members": []}
+        b = self._bridge()
+        real = sys.stdin
+        sys.stdin = io.StringIO("")               # the parent closed the pipe
+        try:
+            rc = asyncio.run(b.serve())
+        finally:
+            sys.stdin = real
+        self.assertEqual(rc, 0)
+        self.assertEqual([o["ev"] for o in b.out][:2], ["hello", "joined"])
+        self.assertEqual(b.out[0]["version"], c.__version__)
+
+        def no_auth(creds, rid, strict=True):
+            raise c.KlatalkAuth("token rejected")
+        c.get_room = no_auth
+        b2 = self._bridge()
+        r, w = os.pipe()                           # a parent that never speaks
+        sys.stdin = os.fdopen(r)
+        try:
+            rc = asyncio.run(b2.serve())
+        finally:
+            sys.stdin = real
+            os.close(w)
+        self.assertEqual(rc, 2)
+        self.assertEqual(b2.out[-1], {"ev": "fatal", "why": "token rejected"})
+
+    def test_bridge_refuses_without_file_locks(self):
+        c = self.cli
+        c._fcntl = None
+        ns = argparse_ns(profile="p", rooms="R1", owner="", wake_on="humans",
+                         max_turns_per_day=None)
+        with self.assertRaises(c.KlatalkUsage):
+            asyncio.run(c.bridge_main(ns))
+
+
+
+class TestCorePin(unittest.TestCase):
+    """Each plugin directory ships the SHA-256 of the bin/klatalk it was
+    released with (core.sha256) and verifies the installed CLI against it
+    before running a line of it — the plugin install pins its own
+    directory, not the separately installed core. The two must not drift."""
+
+    def test_every_plugin_pins_the_current_core(self):
+        import hashlib
+        root = os.path.dirname(os.path.dirname(BIN))
+        with open(BIN, "rb") as f:
+            want = hashlib.sha256(f.read()).hexdigest()
+        for plugin in ("hermes", "openclaw"):
+            path = os.path.join(root, "plugins", plugin, "klatalk", "core.sha256")
+            with open(path, encoding="utf-8") as f:
+                got = f.read().split()[0]
+            self.assertEqual(got, want, f"{path} is stale — run tools/pin-core.py")
+
+
 for _n in [n for n in dir(TestCoreLibrary) if n.startswith("test_")]:
     setattr(TestCoreFixRound, _n, None)   # helpers are inherited, tests are not
 

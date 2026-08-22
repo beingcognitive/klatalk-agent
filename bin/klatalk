@@ -60,7 +60,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 
 # ---- library surface (core-v1.4) ----
@@ -3836,6 +3836,397 @@ def fetch_upload(creds, url, max_bytes):
     return b"".join(chunks)
 
 
+# ---------------------------------------------------------------------------
+# bridge — the core as a child process (stdio, one JSON object per line)
+# ---------------------------------------------------------------------------
+#
+# A harness that cannot import this file (OpenClaw is Node) gets the same
+# core the Hermes adapter imports, over a pipe: stdout carries events,
+# stdin carries commands, stderr is the log. Reception, cursors, the
+# sealed state machine, locks and the wake rule all stay in ONE place —
+# the host layer only speaks its own harness's language. The bridge never
+# signs a read mark by itself and never writes a status line into a room.
+
+BRIDGE_SEND_BUDGET = (60, 60.0)      # the server's per-device ceiling, kept here too
+BRIDGE_ROOM_RETRY = 30               # an unexpected room-loop crash waits this long
+BRIDGE_DEFAULT_BUDGET = 200          # member-woken rows per room per day; the owner is never budgeted
+
+
+def bridge_kind(e):
+    """Failure as a closed token — a KlatalkError's text is allowlisted by
+    construction, a foreign exception contributes only its type."""
+    if isinstance(e, SendRejected):
+        return "rejected"
+    for cls, kind in ((KlatalkMembership, "forbidden"), (KlatalkQuota, "rate_limited"),
+                      (KlatalkTransient, "transient"), (KlatalkDesync, "blocked"),
+                      (KlatalkBlocked, "blocked"), (KlatalkMls, "mls"),
+                      (KlatalkAuth, "auth"), (KlatalkUsage, "usage")):
+        if isinstance(e, cls):
+            return kind
+    return "unknown"
+
+
+def bridge_line(payload):
+    """A row's text surface for a host prompt: the text itself, or a short
+    marker for what is not text (the host fetches bytes on its own terms)."""
+    kind = payload.get("type")
+    if kind == "text":
+        r = payload.get("reaction")
+        if isinstance(r, dict):
+            return (f"(reaction {clean(str(r.get('action') or ''))} on"
+                    f" #{r.get('target_seq')})")
+        return clean(payload.get("text") or "")
+    if kind == "image":
+        return "(image)"
+    if kind == "file":
+        return (f"(file) {clean(payload.get('name') or '')}"
+                f" {payload.get('size') or ''}").strip()
+    return clean(summarize_payload(payload))
+
+
+class Bridge:
+    def __init__(self, creds, profile, rooms, owner, wake_on, budget):
+        self.creds, self.profile = creds, profile
+        self.rooms, self.owner = list(rooms), owner or ""
+        self.wake_on, self.budget = wake_on, budget or 0
+        self.me = clean(creds.get("nickname") or "")
+        self.me_id = creds.get("user_id")
+        self.cache = {}                  # room_id -> room dict
+        self.tasks = {}
+        self.stopped = set()
+        self.desync_told = set()
+        self.turns = {}                  # room_id -> wake stamps (budget)
+        self.read_max = {}               # room_id -> highest seq signed here
+        self.sends = []
+        self.send_lock = asyncio.Lock()
+        self.out_lock = asyncio.Lock()
+        self.fatal = False
+        self.done = asyncio.Event()
+
+    # -- output -------------------------------------------------------------
+
+    async def emit(self, obj):
+        # json escapes every control byte, so one object is always one line
+        line = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        async with self.out_lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    # -- rooms ----------------------------------------------------------------
+
+    async def room_loop(self, room_id):
+        """One socket, one room, for as long as the bridge runs (the Hermes
+        adapter's loop, event for event). A room gone for this account
+        stops for good; auth loss ends the bridge."""
+        while room_id not in self.stopped and not self.fatal:
+            try:
+                room = await asyncio.to_thread(get_room, self.creds, room_id)
+                if room is None:
+                    raise KlatalkMembership("not a member of that room")
+                self.cache[room_id] = room
+                await listen_core(self.creds, self.profile, room_id,
+                                  lambda ev, rid=room_id: self.on_event(rid, ev))
+            except asyncio.CancelledError:
+                raise
+            except KlatalkAuth as e:
+                self.fatal = True
+                await self.emit({"ev": "fatal", "why": str(e)})
+                self.done.set()
+                return
+            except (KlatalkMembership, KlatalkMls, KlatalkUsage) as e:
+                self.stopped.add(room_id)
+                await self.emit({"ev": "stopped", "room": room_id, "why": str(e)})
+                return
+            except SystemExit:
+                self.stopped.add(room_id)
+                await self.emit({"ev": "stopped", "room": room_id,
+                                 "why": "the core tried to exit the process"})
+                return
+            except Exception as e:
+                await self.emit({"ev": "reconnect", "room": room_id,
+                                 "delay": BRIDGE_ROOM_RETRY, "why": type(e).__name__})
+                await asyncio.sleep(BRIDGE_ROOM_RETRY)
+
+    def roster(self, room_id):
+        return member_who(self.cache.get(room_id) or {})
+
+    async def on_event(self, room_id, ev):
+        kind = ev.get("kind")
+        if kind == "joined":
+            await self.emit({"ev": "joined", "room": room_id,
+                             "sealed": bool(ev.get("sealed"))})
+            return
+        if kind == "reconnect":
+            await self.emit({"ev": "reconnect", "room": room_id,
+                             "delay": ev.get("delay"), "why": ev.get("raw")})
+            return
+        if kind == "desync":
+            if room_id not in self.desync_told:
+                self.desync_told.add(room_id)
+                await self.emit({"ev": "desync", "room": room_id})
+            return
+        if kind == "frame":
+            event = ev.get("event") or ""
+            raw = ev.get("raw") or {}
+            if event == "member:removed" and raw.get("user_id") == self.me_id:
+                self.stopped.add(room_id)
+                await self.emit({"ev": "stopped", "room": room_id,
+                                 "why": "removed from the room"})
+                task = self.tasks.get(room_id)
+                if task:
+                    task.cancel()
+                return
+            if event.startswith("member:") or event.startswith("room:"):
+                try:
+                    room = await asyncio.to_thread(get_room, self.creds, room_id)
+                    if room:
+                        self.cache[room_id] = room
+                except Exception:
+                    pass
+            return
+        if kind != "message":
+            return
+        if ev.get("own") or ev.get("sender_id") == self.me_id or ev.get("deleted"):
+            return
+        sid = ev.get("sender_id") or ""
+        payload = ev.get("payload") or {}
+        nick, ai = self.roster(room_id).get(sid, (sid[:8] or "?", False))
+        text = bridge_line(payload)
+        binding = ev.get("sender_binding") or "ok"
+        # the label and the crypto must agree before a row can steer
+        owner = bool(self.owner) and sid == self.owner and binding == "ok"
+        # the seat's wake rule, in one place for every host: humans wake a
+        # turn; an AI member only by calling our name; a reaction never
+        # (the room's quiet register — context for the next turn)
+        reaction = isinstance(payload.get("reaction"), dict)
+        wake = (not reaction) and (self.wake_on == "all" or (not ai)
+                                  or bool(self.me and self.me in text))
+        budget_spent = False
+        if wake and self.budget and not owner:
+            # a budget a member can spend must not silence the owner
+            now = time.time()
+            stamps = [t for t in self.turns.get(room_id, []) if now - t < 86400]
+            if len(stamps) >= self.budget:
+                wake, budget_spent = False, True
+            else:
+                stamps.append(now)
+            self.turns[room_id] = stamps
+        await self.emit({"ev": "message", "room": room_id, "seq": ev.get("seq"),
+                         "sender_id": sid, "nick": clean(nick), "is_ai": bool(ai),
+                         "owner": owner, "sender_binding": binding,
+                         "sealed": bool(ev.get("sealed")),
+                         "reply_to_seq": ev.get("reply_to_seq"),
+                         "inserted_at": ev.get("inserted_at"),
+                         "payload": payload, "text": text,
+                         "wake": wake, "budget_spent": budget_spent})
+
+    # -- commands -------------------------------------------------------------
+
+    async def throttle(self):
+        limit, window = BRIDGE_SEND_BUDGET
+        async with self.send_lock:
+            while True:
+                now = time.time()
+                self.sends = [t for t in self.sends if now - t < window]
+                if len(self.sends) < limit:
+                    self.sends.append(now)
+                    return
+                await asyncio.sleep(max(0.05, self.sends[0] + window - now))
+
+    async def room_for(self, room_id):
+        if not isinstance(room_id, str) or room_id not in self.rooms:
+            raise KlatalkUsage("not one of this bridge's rooms")
+        room = self.cache.get(room_id)
+        if room is None:
+            room = await asyncio.to_thread(get_room, self.creds, room_id)
+            if room is None:
+                raise KlatalkMembership("not a member of that room")
+            self.cache[room_id] = room
+        return room
+
+    async def handle(self, line):
+        try:
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                raise ValueError
+        except ValueError:
+            await self.emit({"id": None, "ok": False, "kind": "usage",
+                             "why": "a command is one JSON object per line"})
+            return
+        rid = req.get("id")
+        try:
+            res = await self.run(req)
+            await self.emit({"id": rid, "ok": True, **res})
+        except SystemExit:
+            await self.emit({"id": rid, "ok": False, "kind": "unknown",
+                             "why": "the core tried to exit the process"})
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            why = str(e) if isinstance(e, KlatalkError) else type(e).__name__
+            await self.emit({"id": rid, "ok": False, "kind": bridge_kind(e), "why": why})
+
+    async def run(self, req):
+        cmd = req.get("cmd")
+        room_id = req.get("room")
+        if cmd == "send":
+            room = await self.room_for(room_id)
+            payload, text = req.get("payload"), req.get("text")
+            if payload is None and not isinstance(text, str):
+                raise KlatalkUsage("send needs text or payload")
+            if payload is not None and not isinstance(payload, dict):
+                raise KlatalkUsage("payload must be an object")
+            reply_to = req.get("reply_to")
+            if reply_to is not None and not isinstance(reply_to, int):
+                raise KlatalkUsage("reply_to must be a seq (integer)")
+            await self.throttle()
+            seq = await send_message(self.creds, self.profile, room, payload,
+                                     text=text, reply_to=reply_to, read_through=None)
+            return {"seq": seq}
+        if cmd == "read":
+            await self.room_for(room_id)
+            seq = req.get("seq")
+            if not isinstance(seq, int) or seq <= 0:
+                raise KlatalkUsage("read needs a positive seq")
+            # a read mark is monotonic: a turn that finished late must not
+            # pull the mark back under a later turn's signature
+            if seq <= self.read_max.get(room_id, 0):
+                return {"last_read_seq": self.read_max[room_id], "skipped": True}
+            confirmed = await do_read(self.creds, room_id, seq)
+            self.read_max[room_id] = seq
+            return {"last_read_seq": confirmed}
+        if cmd == "fetch":
+            await self.room_for(room_id)
+            out, max_bytes = req.get("out"), req.get("max_bytes")
+            if not isinstance(out, str) or not os.path.isabs(out):
+                raise KlatalkUsage("fetch needs an absolute `out` path")
+            if not isinstance(max_bytes, int) or max_bytes <= 0:
+                raise KlatalkUsage("max_bytes must be a positive integer")
+            # an attachment is fetched for the room it was posted in — a
+            # row naming another room's upload must not have the seat pull
+            # it with its own token into this room's turn
+            path = uploads_path(req.get("url"))
+            if not path or not path.startswith(f"/uploads/{room_id}/"):
+                raise KlatalkUsage("fetch: not this room's attachment")
+            data = await asyncio.to_thread(fetch_upload, self.creds, path, max_bytes)
+            # a fresh 0600 file — never over something that already exists
+            fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            return {"path": out, "bytes": len(data)}
+        if cmd == "attach":
+            room = await self.room_for(room_id)
+            path, kind = req.get("path"), req.get("kind")
+            if kind not in ("image", "file") or not isinstance(path, str):
+                raise KlatalkUsage("attach needs path and kind (image|file)")
+            reply_to = req.get("reply_to")
+            if reply_to is not None and not isinstance(reply_to, int):
+                raise KlatalkUsage("reply_to must be a seq (integer)")
+            ctype, ext, data, payload = await asyncio.to_thread(
+                attachment_payload, path, kind)
+            if is_sealed(room):
+                # every refusal before the irreversible upload
+                await asyncio.to_thread(sealed_preflight, self.creds,
+                                        self.profile, room_id)
+            await self.throttle()
+            payload["url"] = await asyncio.to_thread(upload_to_room, self.creds,
+                                                     room_id, ext, ctype, data)
+            seq = await send_message(self.creds, self.profile, room, payload,
+                                     reply_to=reply_to, read_through=None)
+            return {"seq": seq}
+        if cmd == "roster":
+            room = await self.room_for(room_id)
+            return {"name": clean(room.get("name") or ""), "sealed": is_sealed(room),
+                    "members": [{"user_id": uid, "nick": clean(nick), "is_ai": bool(ai)}
+                                for uid, (nick, ai) in member_who(room).items()]}
+        raise KlatalkUsage("unknown command")
+
+    # -- stdin ----------------------------------------------------------------
+
+    def start_stdin(self, loop):
+        """A daemon thread feeds stdin lines to the loop: a blocking read on
+        a worker of the default executor would keep the process alive past
+        the loop (the executor joins its threads at shutdown)."""
+        queue = asyncio.Queue()
+
+        def reader():
+            try:
+                for line in sys.stdin:
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
+            except (OSError, ValueError):
+                pass
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        threading.Thread(target=reader, daemon=True).start()
+        return queue
+
+    async def serve(self):
+        loop = asyncio.get_running_loop()
+        queue = self.start_stdin(loop)
+        for room_id in self.rooms:
+            self.tasks[room_id] = asyncio.create_task(self.room_loop(room_id))
+        await self.emit({"ev": "hello", "version": __version__,
+                         "profile": self.profile, "user_id": self.me_id,
+                         "nickname": self.me, "rooms": self.rooms})
+        pending = set()
+
+        async def commands():
+            while True:
+                line = await queue.get()
+                if line is None:
+                    return                      # parent closed the pipe
+                if line.strip():
+                    t = asyncio.create_task(self.handle(line))
+                    pending.add(t)
+                    t.add_done_callback(pending.discard)
+
+        async def rooms_done():
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+            if not self.fatal:
+                await self.emit({"ev": "exit", "why": "no room left for this account"})
+
+        waiters = [asyncio.create_task(commands()),
+                   asyncio.create_task(rooms_done()),
+                   asyncio.create_task(self.done.wait())]
+        try:
+            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for w in waiters:
+                w.cancel()
+            for t in list(self.tasks.values()) + list(pending):
+                t.cancel()
+            await asyncio.gather(*self.tasks.values(), *pending, *waiters,
+                                 return_exceptions=True)
+        return 2 if self.fatal else 0
+
+
+async def bridge_main(args):
+    if _fcntl is None:
+        raise KlatalkUsage("bridge needs POSIX file locks — on Windows run it"
+                           " under WSL")
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    rooms = [r.strip() for r in (args.rooms or "").replace(";", ",").split(",")
+             if r.strip()]
+    if not rooms:
+        raise KlatalkUsage("bridge needs --rooms R1,R2 (every room is a"
+                           " deliberate choice — no 'all')")
+    budget = getattr(args, "max_turns_per_day", None)
+    if budget is None:
+        budget = BRIDGE_DEFAULT_BUDGET            # 0 = unlimited, explicitly
+    bridge = Bridge(creds, profile, rooms, args.owner,
+                    getattr(args, "wake_on", None) or "humans", budget)
+    return await bridge.serve()
+
+
+def cmd_bridge(args):
+    try:
+        rc = asyncio.run(bridge_main(args))
+    except KeyboardInterrupt:
+        rc = 130
+    sys.exit(rc or 0)
+
+
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     # SUPPRESS — so a subparser does not overwrite the top-level value with
@@ -3973,6 +4364,24 @@ def build_parser():
     s = add("listen", cmd_listen); s.add_argument("room")
     s = add("fetch", cmd_fetch); s.add_argument("url")
     s.add_argument("-o", "--out"); s.add_argument("--force", action="store_true")
+    s = add("bridge", cmd_bridge)
+    s.add_argument("--rooms", required=True,
+                   help="room ids to sit in, comma-separated (no 'all')")
+    s.add_argument("--owner", default="",
+                   help="user_id whose rows are marked owner (the one member"
+                        " who may direct the agent)")
+    s.add_argument("--wake-on", choices=["humans", "all"], default="humans",
+                   dest="wake_on",
+                   help="what marks a row wake=true: humans (and AI members"
+                        " that call your name — default) or all messages")
+    s.add_argument("--max-turns-per-day", type=int, default=None,
+                   dest="max_turns_per_day",
+                   help="per-room budget of member-woken rows per day (default"
+                        f" {BRIDGE_DEFAULT_BUDGET}; 0 = unlimited); beyond it rows"
+                        " carry wake=false (budget_spent=true); the owner is"
+                        " never budgeted")
+    s.epilog = ("stdio host for non-Python harnesses: events on stdout, commands"
+                " on stdin, one JSON object per line — see plugins/openclaw")
     return p
 
 
