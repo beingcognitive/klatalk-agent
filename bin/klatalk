@@ -2386,7 +2386,7 @@ def cmd_read(args):
     asyncio.run(do_read(creds, args.room, seq))
 
 
-def wait_core(creds, profile, room, after, deadline, accept=None):
+def wait_core(creds, profile, room, after, deadline, accept=None, poll_max=15):
     """Block until a message after `after` lands that is not our own (and
     passes `accept(sender_id, line)` when given), and return
     [(seq, line), ...]; None when the deadline passes. The shared engine
@@ -2421,8 +2421,12 @@ def wait_core(creds, profile, room, after, deadline, accept=None):
             after = max(seq for seq, _, _ in got)   # seen, not a wake
         if deadline and time.time() > deadline:
             return None
+        # Fast right after activity, slow when the room is quiet: 2s doubling
+        # to poll_max. wait (one wake) caps at 15s; serve caps at 60s by
+        # default — an owner's "resident" means a reply within a minute,
+        # so the cap is the latency promise, not a shutdown (owner, 2026-08-22)
         time.sleep(delay)
-        delay = min(delay * 2, 15)
+        delay = min(delay * 2, poll_max)
 
 
 def wait_cursor(room):
@@ -2729,6 +2733,8 @@ def cmd_serve(args):
     budget = getattr(args, "max_turns_per_day", None)
     if getattr(args, "install", None):
         extra = ["--wake-on", wake_on]
+        if getattr(args, "poll_max", None) not in (None, 60):
+            extra += ["--poll-max", f"{args.poll_max:g}"]
         if budget:
             extra += ["--max-turns-per-day", str(budget)]
         serve_install(args.install, room["id"], profile, args.turn_timeout,
@@ -2767,7 +2773,8 @@ def cmd_serve(args):
                 time.sleep(60)
                 continue
             day, spent = time.strftime("%Y-%m-%d"), 0
-        lines = wait_core(creds, profile, room, after, None, accept)
+        lines = wait_core(creds, profile, room, after, None, accept,
+                          poll_max=getattr(args, "poll_max", None) or 60)
         if not lines:
             continue
         last = max(s for s, _ in lines)
@@ -2964,6 +2971,9 @@ def build_parser():
                    dest="wake_on",
                    help="what spends a turn: humans (and AI members that"
                         " call your name — default) or all messages")
+    s.add_argument("--poll-max", type=float, default=60, dest="poll_max",
+                   help="idle poll interval cap in seconds (default 60 = the"
+                        " longest a message waits; 2s right after activity)")
     s.add_argument("--max-turns-per-day", type=int, default=None,
                    dest="max_turns_per_day",
                    help="token budget: after N turns in a day, sleep until"

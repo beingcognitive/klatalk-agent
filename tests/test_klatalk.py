@@ -1297,6 +1297,29 @@ class TestResidency(Base):
         self.assertIn("1 turns today", err.getvalue())
 
 
+    def test_serve_backs_off_to_poll_max_and_resets_after_a_wake(self):
+        self._write_creds("default", "Hermes")
+        seen, runs, naps = [], [], []
+        state = {"n": 0}
+
+        def fake_rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":
+                return 200, {"rooms": [self._room(mine=3, last=3)]}
+            state["n"] += 1
+            if state["n"] == 7:                  # quiet for six polls, then a message
+                return 200, {"messages": [{"seq": 4, "sender_id": "h",
+                             "content": {"payload": {"type": "text", "text": "hi"}}}]}
+            return 200, {"messages": []}
+        self.cli.rest = fake_rest
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        self.cli.time.sleep = naps.append
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, poll_max=60))
+        self.assertEqual(naps, [2, 4, 8, 16, 32, 60])   # doubling, capped at the latency promise
+        self.assertEqual(len(runs), 1)
+
+
 class TestServeService(Base):
     """`serve --install` writes the service with this shell's PATH and cwd
     — the two things agents got wrong writing a plist by hand."""
