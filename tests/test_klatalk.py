@@ -1453,6 +1453,7 @@ class TestServeService(Base):
         i = argv.index("--")
         self.assertEqual(argv[i - 4:i], ["--wake-on", "humans", "--max-turns-per-day", "40"])
 
+    @unittest.skipIf(os.name != "posix", "expanduser ignores HOME on Windows; the schtasks CI job covers it")
     def test_serve_list_shows_every_installed_seat_with_its_remove_line(self):
         os.environ["HOME"] = self.tmp
         la = os.path.join(self.tmp, "Library/LaunchAgents"); os.makedirs(la)
@@ -1465,10 +1466,10 @@ class TestServeService(Base):
         with contextlib.redirect_stdout(out):
             self.cli.cmd_serve(argparse_ns(room=None, cmd=[], list_seats=True))
         text = out.getvalue()
-        self.assertIn("launchd  room abcd1234…  profile codex", text)
+        self.assertIn("launchd  room abcd1234...  profile codex", text)
         self.assertIn("[serve] turn 3: seq 9..9", text)
         self.assertIn("--profile codex --uninstall launchd", text)
-        self.assertIn("schtasks room ef567890…  profile default", text)
+        self.assertIn("schtasks room ef567890...  profile default", text)
         self.assertIn("(no log)", text)
 
 

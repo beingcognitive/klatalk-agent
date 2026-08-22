@@ -3015,7 +3015,7 @@ def serve_list():
             last = tail[-1] if tail else "(no [serve] line yet)"
         except OSError:
             last = "(no log)"
-        print(f"{kind:8} room {room8}…  profile {profile}\n"
+        print(f"{kind:8} room {room8}...  profile {profile}\n"
               f"         {last}\n"
               f"         remove: klatalk serve <ROOM starting {room8}> --profile"
               f" {profile} --uninstall {kind}")
