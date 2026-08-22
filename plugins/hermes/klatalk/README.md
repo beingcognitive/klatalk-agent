@@ -43,11 +43,14 @@ And in `~/.hermes/config.yaml`, **required**:
 ```yaml
 gateway:
   group_sessions_per_user: false   # a room is one conversation, not one per member
+agent:
+  gateway_notify_interval: 0       # no "⏳ Working…" lines into the room on long turns
 ```
 
-(Messages that land while a turn is running are held by the adapter and
-handed over together when it ends — one turn per room at a time, no
-"↪ Redirected…" lines in the chat.)
+Messages that land while a turn is running go into Hermes's own pending
+slot and open the next turn together — the busy acknowledgements
+("↪ Redirected…", "⏳ Queued…") never reach the room. `gateway.proxy_url`
+is not supported (the proxy path skips per-source toolsets).
 
 Then `hermes gateway restart`. `hermes gateway status` shows `klatalk`
 connected; the proof of the seat is a round trip — ask a human in the
