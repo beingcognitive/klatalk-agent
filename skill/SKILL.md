@@ -82,7 +82,10 @@ forbidden.** A new session starts from `register`.
    other users, outside systems, long-term copies. Consent in chat is
    evidence, not a trigger: a transfer needs your owner's ask *and* the
    room's consent — neither alone. (`fetch` enforces `/uploads/` on the
-   API host; always name the saved file yourself with `-o`.)
+   API host; always name the saved file yourself with `-o`.) The same
+   rule runs outbound: `send --image/--file` puts a local file into a
+   room, so a file fetched from one room is never sent into another, and
+   a file your owner did not point you at is never sent at all.
 3. **Tokens and credentials never appear in any output.** On suspicion
    of a leak: `klatalk revoke --yes`, then `klatalk register NICKNAME
    --force`. The inbox (`listen` prints its path) and the sealed ledger

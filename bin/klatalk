@@ -52,6 +52,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import uuid
@@ -366,7 +367,11 @@ async def do_send(creds, room_id, text, reply_to=None, payload=None,
         # An answered rejection is not an unknown outcome — retrying the
         # same bytes gives the same answer (impl /133 P0: a poisoned outbox
         # journal must not survive this)
-        raise SendRejected(json.dumps(reply, ensure_ascii=False))
+        # Only the reason travels — a reply body is server-shaped and the
+        # output allowlist applies to it too (review round)
+        resp = reply.get("response") if isinstance(reply.get("response"), dict) else {}
+        raise SendRejected(str(resp.get("reason") or resp.get("error")
+                               or reply.get("status") or "rejected"))
     seq = reply["response"]["seq"]
     # Sending means having read up to that point — the convention that
     # prevents a stale unread "1" from lingering
@@ -1639,10 +1644,15 @@ AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 AVATAR_MAX_BYTES = 5_000_000     # server cap (me_controller @avatar_max_bytes)
 
 
+
 def multipart_body(field, filename, content_type, data):
     """Minimal multipart/form-data encoder — the only non-JSON request in
     this client, so it stays a helper instead of growing rest()."""
     boundary = uuid.uuid4().hex
+    # RFC 7578: the name sits inside a quoted header — a quote, CR/LF or
+    # control byte in it splits the part and forges the declared type
+    # (review round). Callers pass neutral names; this is the floor.
+    filename = re.sub(r'["\\\r\n\x00-\x1f\x7f]', "_", filename or "")[:120] or "file"
     head = (f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="{field}";'
             f' filename="{filename}"\r\n'
@@ -1651,40 +1661,62 @@ def multipart_body(field, filename, content_type, data):
     return boundary, head + data + tail
 
 
+def multipart_post(path, token, filename, ctype, data, timeout=120):
+    """One multipart POST for the two callers that have one (avatar, room
+    upload): request, bearer, error ladder, non-JSON guard — in one place."""
+    boundary, body = multipart_body("file", filename, ctype, data)
+    req = urllib.request.Request(api_url(path), data=body, method="POST")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with OPENER.open(req, timeout=timeout) as resp:
+            raw = resp.read() or b"{}"
+            try:
+                return resp.status, json.loads(raw)
+            except ValueError:
+                sys.exit(f"HTTP {resp.status}: non-JSON response")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.load(e)
+        except Exception:
+            return e.code, {"error": str(e.reason)}
+    except urllib.error.URLError as e:
+        sys.exit(f"could not reach {API}: {e.reason}")
+
+
+def read_capped(path, types, cap, what):
+    """Read a local file the way the server will judge it: a known
+    extension, a regular file (no links, no FIFOs — fetch holds the same
+    line on its output side), nothing from the profile directory, under
+    the cap. Returns (ctype, ext, data)."""
+    ext = os.path.splitext(path)[1].lower()
+    ctype = types.get(ext)
+    if not ctype:
+        sys.exit(f"{what} must be one of {', '.join(sorted(types))}")
+    if os.path.islink(path) or not os.path.isfile(path):
+        sys.exit(f"{path} is not a regular file — refusing to upload it")
+    if os.path.realpath(path).startswith(os.path.realpath(HOME) + os.sep):
+        sys.exit("refusing to upload a file from the profile directory")
+    try:
+        with open(path, "rb") as f:
+            data = f.read(cap + 1)
+    except OSError as e:
+        sys.exit(f"cannot read {path}: {e.strerror}")
+    if len(data) > cap:
+        sys.exit(f"{what} is over the upload ceiling ({cap:,} bytes)")
+    return ctype, ext, data
+
+
+
 def cmd_avatar(args):
     """Set the profile photo — same account surface a human uses (agents are
     members, not bots). Account-wide like bio/rename: every room sees it."""
-    ext = os.path.splitext(args.file)[1].lower()
-    ctype = AVATAR_TYPES.get(ext)
-    if ctype is None:
-        sys.exit(f"unsupported type {ext or '(none)'} — jpeg/png/webp only")
-    try:
-        with open(args.file, "rb") as f:
-            data = f.read(AVATAR_MAX_BYTES + 1)
-    except OSError as e:
-        sys.exit(f"cannot read {args.file}: {e.strerror}")
-    if len(data) > AVATAR_MAX_BYTES:
-        sys.exit(f"{args.file} exceeds the 5MB server cap")
+    ctype, ext, data = read_capped(args.file, AVATAR_TYPES, AVATAR_MAX_BYTES,
+                                   "avatar")
     profile = profile_name(args)
     creds = load_creds(profile)
-    boundary, body = multipart_body(
-        "file", os.path.basename(args.file), ctype, data)
-    req = urllib.request.Request(api_url("/v1/me/avatar"), data=body,
-                                 method="POST")
-    req.add_header("Authorization", f"Bearer {creds['access_token']}")
-    req.add_header("Content-Type",
-                   f"multipart/form-data; boundary={boundary}")
-    try:
-        with OPENER.open(req, timeout=60) as resp:
-            payload = json.loads(resp.read() or b"{}")
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        try:
-            status, payload = e.code, json.load(e)
-        except Exception:
-            status, payload = e.code, {"error": str(e.reason)}
-    except urllib.error.URLError as e:
-        sys.exit(f"could not reach {API}: {e.reason}")
+    status, payload = multipart_post("/v1/me/avatar", creds["access_token"],
+                                     f"avatar{ext}", ctype, data, timeout=60)
     die_on(status, payload)
     user = payload.get("user", {})
     # Same lesson as bio (dd2c69e): keep the local cache in step so whoami
@@ -2247,6 +2279,27 @@ def cmd_approval_consume(args):
     print(json.dumps(data, ensure_ascii=False))
 
 
+def sealed_preflight(creds, profile, room_id):
+    """Every refusal sealed_send can hand back, asked before anything
+    irreversible (an upload). A gate that fires after the bytes left is
+    not a gate — an unverified device would already hold them."""
+    safe_room_id(room_id)
+    if is_desynced(profile, room_id):
+        sys.exit("this room is desynchronized — sending is blocked; nothing"
+                 " was uploaded. Leave and get re-invited to recover.")
+    if os.path.exists(outbox_path(profile, room_id)):
+        sys.exit("a previous message's outcome is still unknown — settle it"
+                 " with a text send in this room first, then resend the"
+                 " attachment (nothing was uploaded)")
+    sealed_pump(creds, profile, room_id)
+    if is_desynced(profile, room_id):
+        sys.exit("this room just desynchronized — sending is blocked;"
+                 " nothing was uploaded")
+    if not verify_roster(creds, profile, room_id):
+        sys.exit("sending is blocked until every device in the room is"
+                 " verified — nothing was uploaded")
+
+
 def sealed_send(args, creds, profile, room_id, payload, reply_to=None):
     safe_room_id(room_id)
     if is_desynced(profile, room_id):
@@ -2294,6 +2347,7 @@ def sealed_send(args, creds, profile, room_id, payload, reply_to=None):
                           [{"seq": seq, "kind": "application", "own": True,
                             "sender_id": creds.get("user_id"),
                             "sender_device": creds.get("device_id"),
+                            "reply_to_seq": stale.get("reply_to"),
                             "payload": stale["payload"]}])
         os.remove(outbox)
         sys.exit("previous send resolved — nothing new was sent yet;"
@@ -2342,6 +2396,7 @@ def sealed_send(args, creds, profile, room_id, payload, reply_to=None):
                       [{"seq": seq, "kind": "application", "own": True,
                         "sender_id": creds.get("user_id"),
                         "sender_device": creds.get("device_id"),
+                        "reply_to_seq": reply_to,
                         "payload": payload}])
     try:
         os.remove(outbox)
@@ -2350,7 +2405,8 @@ def sealed_send(args, creds, profile, room_id, payload, reply_to=None):
 
 
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-               ".webp": "image/webp", ".gif": "image/gif"}
+               ".webp": "image/webp", ".gif": "image/gif",
+               ".heic": "image/heic", ".heif": "image/heic"}
 FILE_TYPES = {".pdf": "application/pdf", ".doc": "application/msword",
               ".docx": "application/vnd.openxmlformats-officedocument"
                        ".wordprocessingml.document",
@@ -2360,18 +2416,55 @@ FILE_TYPES = {".pdf": "application/pdf", ".doc": "application/msword",
               ".ppt": "application/vnd.ms-powerpoint",
               ".pptx": "application/vnd.openxmlformats-officedocument"
                        ".presentationml.presentation",
-              ".txt": "text/plain", ".zip": "application/zip"}
-MAX_UPLOAD = 25_000_000                 # the server's ceiling
+              ".txt": "text/plain", ".csv": "text/csv",
+              ".zip": "application/zip"}          # exactly the server's list
+UPLOAD_CEILING = 25_000_000             # the server's, measured on the body
+MAX_ATTACHMENT = UPLOAD_CEILING - 4096  # the multipart envelope rides inside
+
 
 
 def image_size(data):
-    """(w, h) from the header of a PNG / JPEG / GIF / WebP — the phone
-    sends dimensions with every image so timelines can lay out before the
-    bytes arrive; a CLI image must carry them too. Unknown → (0, 0)."""
-    import struct
-    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+    """(w, h) as the phone would display the image — PNG / JPEG (EXIF
+    orientation applied) / GIF / WebP / HEIC headers. The phone sends
+    dimensions with every image so timelines lay out before the bytes
+    arrive; a CLI image must carry them too. Unknown or truncated →
+    (0, 0), never a traceback, never a guess."""
+    try:
+        return _image_size(data)
+    except (struct.error, IndexError, ValueError):
+        return 0, 0
+
+
+def _jpeg_orientation(data):
+    """EXIF Orientation (1 when absent); 5-8 mean the viewer rotates 90°."""
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if marker in (0xDA, 0xD9):
+            break
+        length = struct.unpack(">H", data[i + 2:i + 4])[0]
+        seg = data[i + 4:i + 2 + length]
+        if marker == 0xE1 and seg[:6] == b"Exif\x00\x00":
+            t = seg[6:]
+            e = ">" if t[:2] == b"MM" else "<"
+            off = struct.unpack(e + "I", t[4:8])[0]
+            n = struct.unpack(e + "H", t[off:off + 2])[0]
+            for k in range(min(n, 64)):
+                q = off + 2 + k * 12
+                if struct.unpack(e + "H", t[q:q + 2])[0] == 0x0112:
+                    return struct.unpack(e + "H", t[q + 8:q + 10])[0]
+            return 1
+        i += 2 + length
+    return 1
+
+
+def _image_size(data):
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR" and len(data) >= 24:
         return struct.unpack(">II", data[16:24])
-    if data[:6] in (b"GIF87a", b"GIF89a"):
+    if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
         return struct.unpack("<HH", data[6:10])
     if data[:2] == b"\xff\xd8":
         i = 2
@@ -2380,117 +2473,155 @@ def image_size(data):
                 i += 1
                 continue
             marker = data[i + 1]
+            if marker == 0xFF:                # fill bytes may precede a marker
+                i += 1
+                continue
             if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
                 i += 2
                 continue
             length = struct.unpack(">H", data[i + 2:i + 4])[0]
             if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
                 h, w = struct.unpack(">HH", data[i + 5:i + 9])
-                return w, h
+                try:
+                    rotated = _jpeg_orientation(data) in (5, 6, 7, 8)
+                except (struct.error, IndexError):
+                    rotated = False
+                return (h, w) if rotated else (w, h)
             i += 2 + length
         return 0, 0
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         chunk = data[12:16]
-        if chunk == b"VP8X":
+        if chunk == b"VP8X" and len(data) >= 30:
             w = int.from_bytes(data[24:27], "little") + 1
             h = int.from_bytes(data[27:30], "little") + 1
             return w, h
-        if chunk == b"VP8L":
+        if chunk == b"VP8L" and len(data) >= 25 and data[20] == 0x2F:
             b = data[21:25]
             w = 1 + (((b[1] & 0x3F) << 8) | b[0])
             h = 1 + (((b[3] & 0x0F) << 10) | (b[2] << 2) | ((b[1] & 0xC0) >> 6))
             return w, h
-        if chunk == b"VP8 ":
+        if chunk == b"VP8 " and len(data) >= 30 and data[23:26] == b"\x9d\x01\x2a":
             w, h = struct.unpack("<HH", data[26:30])
             return w & 0x3FFF, h & 0x3FFF
+        return 0, 0
+    if data[4:8] == b"ftyp" and data[8:12] in (b"heic", b"heix", b"heim",
+                                               b"heis", b"mif1", b"msf1"):
+        j = data.find(b"ispe")                # ISO-BMFF: 'ispe' vflags w h
+        if j >= 0 and len(data) >= j + 16:
+            return struct.unpack(">II", data[j + 8:j + 16])
+        return 0, 0
     return 0, 0
 
 
-def upload_to_room(creds, room_id, path, ctype, data):
+def uploads_path(url):
+    """The one definition of 'a bare /uploads/ path' — the url the server
+    hands back and the url a member pastes into fetch are the same
+    question, so they get the same answer. None = refuse."""
+    parts = urllib.parse.urlsplit(url or "")
+    if parts.scheme or parts.netloc or parts.query or parts.fragment:
+        return None
+    path = urllib.parse.unquote(parts.path)
+    if (path != posixpath.normpath(path)
+            or not path.startswith("/uploads/")
+            or any(c in path for c in ("\\", "\x00", "%"))
+            or _CTRL.search(path)):
+        return None
+    return path
+
+
+
+def upload_to_room(creds, room_id, ext, ctype, data):
     """POST the bytes to the room's upload endpoint (the phone's own
     fallback path — multipart, member-only, server-side quota) and return
-    the /uploads/... url the message will name."""
-    boundary, body = multipart_body("file", os.path.basename(path), ctype, data)
-    req = urllib.request.Request(api_url(room_path(room_id, "/uploads")),
-                                 data=body, method="POST")
-    req.add_header("Authorization", f"Bearer {creds['access_token']}")
-    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-    try:
-        with OPENER.open(req, timeout=120) as resp:
-            payload = json.loads(resp.read() or b"{}")
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        try:
-            status, payload = e.code, json.load(e)
-        except Exception:
-            status, payload = e.code, {"error": str(e.reason)}
-    except urllib.error.URLError as e:
-        sys.exit(f"could not reach {API}: {e.reason}")
+    the /uploads/<room>/... url the message will name. The filename sent
+    is neutral: the server renames to a uuid anyway, and a local name is
+    nobody's business in a sealed room."""
+    status, payload = multipart_post(room_path(room_id, "/uploads"),
+                                     creds["access_token"], f"upload{ext}",
+                                     ctype, data)
     if status == 429 and (payload or {}).get("error") == "upload_quota":
         sys.exit("upload refused: this device's upload quota is used up for now")
+    if status == 413:
+        sys.exit("upload refused: over the server's size ceiling")
     if status == 415:
         sys.exit("upload refused: the server does not accept this file type")
     die_on(status, payload)
-    url = (payload or {}).get("url")
-    if not url or not url.startswith("/uploads/"):
-        sys.exit("upload did not return an /uploads/ url")
+    url = uploads_path((payload or {}).get("url"))
+    if not url or not url.startswith(f"/uploads/{room_id}/"):
+        sys.exit("upload did not return a usable /uploads/ url for this room")
     return url
 
 
+
 def attachment_payload(path, kind):
-    """Read a local file once, validate it the way the server will, and
-    build the phone-compatible payload: image {url,w,h} or file
-    {url,name,size}. The url is filled in after the upload."""
-    ext = os.path.splitext(path)[1].lower()
+    """Validate a local file the way the server will and build the
+    phone-compatible payload: image {url,w,h} or file {url,name,size}.
+    The url is filled in after the upload. Returns (ctype, ext, data, payload)."""
     types = IMAGE_TYPES if kind == "image" else FILE_TYPES
-    ctype = types.get(ext)
-    if not ctype:
-        sys.exit(f"{kind} must be one of {', '.join(sorted(types))}")
-    try:
-        with open(path, "rb") as f:
-            data = f.read(MAX_UPLOAD + 1)
-    except OSError as e:
-        sys.exit(f"cannot read {path}: {e.strerror}")
-    if len(data) > MAX_UPLOAD:
-        sys.exit(f"{kind} is over the 25 MB upload ceiling")
+    ctype, ext, data = read_capped(path, types, MAX_ATTACHMENT, kind)
     if kind == "image":
         w, h = image_size(data)
         if not w or not h:
             sys.exit("could not read the image's dimensions — is it a real"
-                     " PNG/JPEG/GIF/WebP?")
-        return ctype, data, {"type": "image", "url": None, "w": w, "h": h}
-    return ctype, data, {"type": "file", "url": None,
-                         "name": os.path.basename(path), "size": len(data)}
+                     " PNG/JPEG/GIF/WebP/HEIC, and complete?")
+        return ctype, ext, data, {"type": "image", "url": None, "w": w, "h": h}
+    name = os.path.basename(path)
+    # The phone's shape, field for field — the server requires url/name/text
+    # and old clients render `text`
+    return ctype, ext, data, {"type": "file", "url": None, "name": name,
+                              "size": len(data), "mime": ctype,
+                              "text": f"(파일) {name}"}
 
 
 def cmd_send(args):
     profile = profile_name(args)
     creds = load_creds(profile)
     room = get_room(creds, args.room)
-    attach = getattr(args, "image", None) or getattr(args, "file", None)
+    image, doc = getattr(args, "image", None), getattr(args, "file", None)
+    if image and doc:
+        sys.exit("one attachment per message — --image or --file")
+    attach = image or doc
     if attach:
-        kind = "image" if getattr(args, "image", None) else "file"
+        if room is None:
+            sys.exit(f"no room {args.room} in your list — `klatalk rooms`"
+                     " (nothing was uploaded)")
+        kind = "image" if image else "file"
         if args.text is not None or getattr(args, "text_stdin", False):
             sys.exit(f"--{kind} sends the attachment alone — text goes in"
                      " its own message")
-        ctype, data, payload = attachment_payload(attach, kind)
-        if is_sealed(room):
+        ctype, ext, data, payload = attachment_payload(attach, kind)
+        sealed = is_sealed(room)
+        if sealed:
+            # Refusals first, bytes second: an upload is irreversible — on
+            # the server, member-readable, quota spent — so every gate
+            # sealed_send would die on runs BEFORE it (review round P0)
+            sealed_preflight(creds, profile, args.room)
             # The phone does exactly this: the bytes are uploaded as they
             # are and only the message naming them is sealed. Say so —
             # a member may reasonably assume otherwise
             print("note: in a sealed room the attachment's bytes are stored"
                   " on the server as uploaded; only the message naming it is"
                   " sealed (same as the phone app)", file=sys.stderr)
-        payload["url"] = upload_to_room(creds, room["id"], attach, ctype, data)
-        if is_sealed(room):
-            return sealed_send(args, creds, profile, args.room, payload,
-                               reply_to=args.reply)
+            if kind == "file":
+                print("note: the document's name rides argv (ps, history)"
+                      " and is the sealed message's readable content — rename"
+                      " the file first if the name itself is confidential",
+                      file=sys.stderr)
+        payload["url"] = upload_to_room(creds, args.room, ext, ctype, data)
+        # The one fact only this process knows — needed to reference or
+        # fetch what was just sent, and to not upload twice on a retry
+        print(f"uploaded {payload['url']}", file=sys.stderr)
         try:
+            if sealed:
+                return sealed_send(args, creds, profile, args.room, payload,
+                                   reply_to=args.reply)
             asyncio.run(do_send(creds, args.room, None, reply_to=args.reply,
                                 payload=payload))
+            return
         except SendRejected as e:
-            sys.exit(f"send failed: {e}")
-        return
+            sys.exit(f"send failed: {e} — the bytes are already on the server"
+                     f" at {payload['url']} (quota spent); a retry uploads"
+                     " them again")
     if is_sealed(room):
         # §1's argv rule covers every process the plaintext crosses — in a
         # sealed room the message body is exactly what §7 protects
@@ -3027,13 +3158,8 @@ def cmd_fetch(args):
     # anatomy beyond a bare path, decode once, refuse residual escapes
     # (double encoding), backslashes, NUL, and any path that changes
     # under normalization (dot-segments, duplicate slashes).
-    parts = urllib.parse.urlsplit(args.url)
-    if parts.scheme or parts.netloc or parts.query or parts.fragment:
-        sys.exit("fetch accepts only /uploads/ attachment paths")
-    path = urllib.parse.unquote(parts.path)
-    if (path != posixpath.normpath(path)
-            or not path.startswith("/uploads/")
-            or any(c in path for c in ("\\", "\x00", "%"))):
+    path = uploads_path(args.url)
+    if not path:
         sys.exit("fetch accepts only /uploads/ attachment paths")
     # -o is required: a room-chosen basename must never name a local file
     out = args.out
@@ -3146,12 +3272,13 @@ def build_parser():
                         " sealed rooms (argv shows up in ps)")
     s.add_argument("--reply", type=int, metavar="SEQ",
                    help="send as a reply to this seq (quote chip)")
-    s.add_argument("--image", metavar="FILE",
-                   help="send an image (png/jpg/webp/gif, ≤25 MB) as its own"
-                        " message — dimensions are read from the file")
-    s.add_argument("--file", metavar="FILE",
-                   help="send a document (pdf/doc/xls/ppt/txt/zip, ≤25 MB)"
-                        " as its own message")
+    att = s.add_mutually_exclusive_group()   # one attachment = one message
+    att.add_argument("--image", metavar="FILE",
+                     help="send an image (png/jpg/webp/gif/heic, ≤25 MB) as"
+                          " its own message — dimensions are read from the file")
+    att.add_argument("--file", metavar="FILE",
+                     help="send a document (pdf/doc/docx/xls/xlsx/ppt/pptx/"
+                          "txt/csv/zip, ≤25 MB) as its own message")
     s = add("like", cmd_like); s.add_argument("room")
     s.add_argument("seq", type=int)
     s.add_argument("--remove", action="store_true", help="remove the heart")

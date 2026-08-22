@@ -202,13 +202,13 @@ class TestUrlGuard(Base):
         def avatar_args(path):
             return type("A", (), {"file": path, "profile": None})()
 
-        with self.assertRaisesRegex(SystemExit, "jpeg/png/webp"):
+        with self.assertRaisesRegex(SystemExit, "must be one of"):
             self.cli.cmd_avatar(avatar_args("photo.gif"))
 
         big = os.path.join(self.tmp, "big.png")
         with open(big, "wb") as f:
             f.write(b"\x00" * (self.cli.AVATAR_MAX_BYTES + 1))
-        with self.assertRaisesRegex(SystemExit, "5MB"):
+        with self.assertRaisesRegex(SystemExit, "ceiling"):
             self.cli.cmd_avatar(avatar_args(big))
 
         boundary, body = self.cli.multipart_body(
@@ -1500,11 +1500,12 @@ class TestAttachments(Base):
 
     def test_attachment_payload_validates_like_the_server(self):
         png = os.path.join(self.tmp, "a.png"); open(png, "wb").write(self._png(4, 3))
-        ctype, data, payload = self.cli.attachment_payload(png, "image")
-        self.assertEqual((ctype, payload), ("image/png", {"type": "image", "url": None, "w": 4, "h": 3}))
+        ctype, ext, data, payload = self.cli.attachment_payload(png, "image")
+        self.assertEqual((ctype, ext, payload), ("image/png", ".png", {"type": "image", "url": None, "w": 4, "h": 3}))
         doc = os.path.join(self.tmp, "r.pdf"); open(doc, "wb").write(b"%PDF-1.4 x")
-        ctype, data, payload = self.cli.attachment_payload(doc, "file")
-        self.assertEqual(payload, {"type": "file", "url": None, "name": "r.pdf", "size": 10})
+        ctype, ext, data, payload = self.cli.attachment_payload(doc, "file")
+        self.assertEqual(payload, {"type": "file", "url": None, "name": "r.pdf", "size": 10,
+                                   "mime": "application/pdf", "text": "(파일) r.pdf"})
         bad = os.path.join(self.tmp, "x.exe"); open(bad, "wb").write(b"MZ")
         with self.assertRaises(SystemExit) as cm:
             self.cli.attachment_payload(bad, "file")
@@ -1520,15 +1521,15 @@ class TestAttachments(Base):
         room = {"id": "R", "name": "X", "encryption_mode": "plain", "members": []}
         self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
         ups, sends = [], []
-        self.cli.upload_to_room = lambda creds, rid, path, ctype, data: (
-            ups.append((rid, ctype, len(data))), "/uploads/R/x.png")[1]
+        self.cli.upload_to_room = lambda creds, rid, ext, ctype, data: (
+            ups.append((rid, ext, ctype, len(data))), "/uploads/R/x.png")[1]
 
         async def fake_send(creds, room_id, text, reply_to=None, payload=None, **kw):
             sends.append((room_id, text, reply_to, payload)); return 9
         self.cli.do_send = fake_send
         self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=3,
                                       image=png, file=None))
-        self.assertEqual(ups, [("R", "image/png", len(self._png(7, 5)))])
+        self.assertEqual(ups, [("R", ".png", "image/png", len(self._png(7, 5)))])
         self.assertEqual(sends, [("R", None, 3, {"type": "image", "url": "/uploads/R/x.png", "w": 7, "h": 5})])
 
     def test_send_image_in_a_sealed_room_goes_through_sealed_send_with_a_note(self):
@@ -1537,6 +1538,7 @@ class TestAttachments(Base):
         room = {"id": "R", "name": "X", "encryption_mode": "mls10", "members": []}
         self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
         self.cli.upload_to_room = lambda *a: "/uploads/R/y.png"
+        self.cli.sealed_preflight = lambda *a: None
         sealed = []
         self.cli.sealed_send = lambda args, creds, profile, rid, payload, reply_to=None: sealed.append(payload)
         err = io.StringIO()
@@ -1560,9 +1562,6 @@ class TestAttachments(Base):
         self._write_creds("default", "Hermes")
         creds = {"access_token": "T"}
 
-        class Resp(urllib.error.HTTPError):
-            pass
-
         def opener(code, body):
             class O:
                 def open(self, req, timeout=0):
@@ -1576,6 +1575,123 @@ class TestAttachments(Base):
         with self.assertRaises(SystemExit) as cm:
             self.cli.upload_to_room(creds, "R", "a.png", "image/png", b"x")
         self.assertIn("file type", str(cm.exception))
+
+    def _opener(self, code, body):
+        class O:
+            def open(self_, req, timeout=0):
+                if code == 200:
+                    class R(io.BytesIO):
+                        status = 200
+                    return R(body)
+                raise urllib.error.HTTPError(req.full_url, code, "x", {}, io.BytesIO(body))
+        return O()
+
+    def test_truncated_headers_are_unknown_not_a_traceback(self):
+        import struct
+        for name, blob in [
+                ("png", b"\x89PNG\r\n\x1a\n" + struct.pack(">I", 13) + b"IHDR\x00\x00\x00\x04"),
+                ("gif", b"GIF89a\x01\x02"),
+                ("vp8x", b"RIFF" + b"\x00" * 4 + b"WEBP" + b"VP8X" + b"\x00" * 4),
+                ("vp8l", b"RIFF" + b"\x00" * 4 + b"WEBP" + b"VP8L" + b"\x00" * 4 + b"\x2f\x00"),
+                ("vp8", b"RIFF" + b"\x00" * 4 + b"WEBP" + b"VP8 " + b"\x00" * 12),
+                ("jpeg", b"\xff\xd8\xff\xc0\x00")]:
+            with self.subTest(name):
+                self.assertEqual(self.cli.image_size(blob), (0, 0))
+
+    def test_webp_lossless_and_lossy_and_jpeg_fill_and_exif(self):
+        import struct
+        bits = (299) | (199 << 14)
+        vp8l = (b"RIFF" + b"\x00" * 4 + b"WEBP" + b"VP8L" + struct.pack("<I", 5)
+                + b"\x2f" + bits.to_bytes(4, "little"))
+        self.assertEqual(self.cli.image_size(vp8l), (300, 200))
+        vp8 = (b"RIFF" + b"\x00" * 4 + b"WEBP" + b"VP8 " + struct.pack("<I", 20)
+               + b"\x00" * 3 + b"\x9d\x01\x2a" + struct.pack("<HH", 640, 480))
+        self.assertEqual(self.cli.image_size(vp8), (640, 480))
+        sof = (b"\xff\xc0" + struct.pack(">H", 17) + b"\x08"
+               + struct.pack(">HH", 480, 640) + b"\x03" + b"\x00" * 9)
+        app0 = b"\xff\xe0" + struct.pack(">H", 16) + b"JFIF\x00" + b"\x00" * 10
+        self.assertEqual(self.cli.image_size(b"\xff\xd8" + app0 + b"\xff\xff\xff" + sof), (640, 480))
+        # EXIF Orientation 6 → the phone shows it rotated: w/h swap
+        tiff = (b"MM\x00\x2a" + struct.pack(">I", 8) + struct.pack(">H", 1)
+                + struct.pack(">HHI", 0x0112, 3, 1) + struct.pack(">H", 6) + b"\x00\x00"
+                + struct.pack(">I", 0))
+        exif = b"Exif\x00\x00" + tiff
+        app1 = b"\xff\xe1" + struct.pack(">H", len(exif) + 2) + exif
+        self.assertEqual(self.cli.image_size(b"\xff\xd8" + app1 + sof), (480, 640))
+        # HEIC: ftyp + an ispe box
+        heic = (struct.pack(">I", 24) + b"ftypheic" + b"\x00" * 12
+                + struct.pack(">I", 20) + b"ispe" + b"\x00" * 4 + struct.pack(">II", 4032, 3024))
+        self.assertEqual(self.cli.image_size(heic), (4032, 3024))
+
+    def test_size_ceiling_and_special_files(self):
+        big = os.path.join(self.tmp, "big.pdf")
+        with open(big, "wb") as f:
+            f.write(b"\x00" * self.cli.MAX_ATTACHMENT)
+        self.assertEqual(self.cli.attachment_payload(big, "file")[3]["size"], self.cli.MAX_ATTACHMENT)
+        with open(big, "ab") as f:
+            f.write(b"\x00")
+        with self.assertRaises(SystemExit):
+            self.cli.attachment_payload(big, "file")
+        link = os.path.join(self.tmp, "l.pdf"); os.symlink(big, link)
+        with self.assertRaisesRegex(SystemExit, "regular file"):
+            self.cli.attachment_payload(link, "file")
+        os.makedirs(self.home, exist_ok=True)
+        inside = os.path.join(self.home, "creds.txt"); open(inside, "wb").write(b"x")
+        with self.assertRaisesRegex(SystemExit, "profile directory"):
+            self.cli.attachment_payload(inside, "file")
+        self.assertEqual(self.cli.FILE_TYPES[".csv"], "text/csv")
+        self.assertEqual(self.cli.IMAGE_TYPES[".heic"], "image/heic")
+
+    def test_upload_goes_to_the_room_endpoint_and_refuses_foreign_urls(self):
+        seen = {}
+
+        class O:
+            def open(self_, req, timeout=0):
+                seen["url"] = req.full_url; seen["auth"] = req.get_header("Authorization")
+                seen["body"] = req.data
+                class R(io.BytesIO):
+                    status = 200
+                return R(b'{"url": "/uploads/R/x.png"}')
+        self.cli.OPENER = O()
+        url = self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"bytes")
+        self.assertEqual(url, "/uploads/R/x.png")
+        self.assertTrue(seen["url"].endswith("/v1/rooms/R/uploads"))
+        self.assertEqual(seen["auth"], "Bearer T")
+        self.assertIn(b'name="file"; filename="upload.png"', seen["body"])   # neutral name
+        self.assertNotIn(b"SECRET", seen["body"])
+        for bad in (b'{"url": "/uploads/../v1/me"}', b'{"url": "https://evil/uploads/R/x"}',
+                    b'{"url": "/uploads/OTHER/x.png"}', b'{"url": "/uploads/R/x.png?next=1"}'):
+            self.cli.OPENER = self._opener(200, bad)
+            with self.assertRaises(SystemExit):
+                self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"x")
+        self.cli.OPENER = self._opener(200, b"<html>oops</html>")
+        with self.assertRaisesRegex(SystemExit, "non-JSON"):
+            self.cli.upload_to_room({"access_token": "T"}, "R", ".png", "image/png", b"x")
+
+    def test_blocked_sealed_room_uploads_nothing_and_unknown_room_is_named(self):
+        self._write_creds("default", "Hermes")
+        png = os.path.join(self.tmp, "a.png"); open(png, "wb").write(self._png(2, 2))
+        room = {"id": "R", "name": "X", "encryption_mode": "mls10", "members": []}
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        ups = []
+        self.cli.upload_to_room = lambda *a: ups.append(a) or "/uploads/R/x.png"
+        self.cli.mark_desync("default", "R", "test")
+        with self.assertRaisesRegex(SystemExit, "nothing was uploaded"), contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=None,
+                                          image=png, file=None))
+        self.assertEqual(ups, [])
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": []})
+        with self.assertRaisesRegex(SystemExit, "no room"):
+            self.cli.cmd_send(argparse_ns(room="NOPE", text=None, text_stdin=False, reply=None,
+                                          image=png, file=None))
+        with self.assertRaisesRegex(SystemExit, "one attachment"):
+            self.cli.cmd_send(argparse_ns(room="R", text=None, text_stdin=False, reply=None,
+                                          image=png, file=png))
+
+    def test_multipart_filename_cannot_inject_headers(self):
+        _, body = self.cli.multipart_body("file", 'a"\r\nContent-Type: x\r\n\r\nP.txt', "text/plain", b"real")
+        self.assertEqual(body.count(b"\r\nContent-Type:"), 1)     # one header line, ours
+        self.assertEqual(body.count(b"\r\n\r\n"), 1)              # exactly one header/body break
 
 
 if __name__ == "__main__":
