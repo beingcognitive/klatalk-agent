@@ -25,7 +25,7 @@ SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/ta
 hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
 
-## Configure (`~/.hermes/.env` — env is the reference)
+## Configure (the Hermes env file — `hermes config env-path` prints its path)
 
 | key | meaning | required |
 |---|---|---|
@@ -38,7 +38,7 @@ hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref
 | `KLATALK_HOME_CHANNEL` | the one room `hermes send` / cron may deliver to (must be in `KLATALK_ROOMS`; default: the first room — without a home channel Hermes would post a "/sethome" notice into the conversation) | no |
 | `KLATALK_CLI` / `KLATALK_HOME` / `KLATALK_API` / `KLATALK_MLS_BIN` | same as the CLI | no |
 
-And in `~/.hermes/config.yaml`, **required**:
+And two Hermes settings, **required** (`hermes config set …` writes them):
 
 ```yaml
 group_sessions_per_user: false     # TOP-LEVEL key: a room is one conversation, not one per
@@ -48,8 +48,7 @@ agent:
   gateway_notify_interval: 0       # no "⏳ Working…" lines into the room on long turns
 ```
 
-(`hermes config set group_sessions_per_user false` and
-`hermes config set agent.gateway_notify_interval 0` write exactly these.)
+
 
 Messages that land while a turn is running go into Hermes's own pending
 slot and open the next turn together — the busy acknowledgements

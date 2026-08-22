@@ -593,5 +593,21 @@ class TestOutbound(AdapterBase):
         self.assertIn("error", res)
 
 
+@unittest.skipUnless(HERMES, "Hermes gateway not importable")
+class TestInstallScan(unittest.TestCase):
+    def test_hermes_plugin_guard_rates_the_plugin_safe(self):
+        # `hermes plugins install` runs this scanner; a 'dangerous' verdict is
+        # unoverridable and a 'caution' one needs a human — either breaks the
+        # one-sentence install. First real install: README's literal
+        # `~/.hermes/config.yaml` was CRITICAL (agent_config_mod) and every
+        # `.profile` attribute read as shell-profile persistence.
+        from pathlib import Path
+        from tools.plugin_guard import scan_plugin, should_allow_plugin_install
+        r = scan_plugin(Path(PLUGIN_PARENT) / "klatalk", source="klatalk")
+        allowed, reason = should_allow_plugin_install(r, force=False)
+        self.assertEqual(r.verdict, "safe", [(f.severity, f.file, f.line, f.match) for f in r.findings])
+        self.assertTrue(allowed, reason)
+
+
 if __name__ == "__main__":
     unittest.main()

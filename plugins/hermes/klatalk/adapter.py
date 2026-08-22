@@ -114,7 +114,7 @@ class Settings:
         self.api = extra.get("api") or _env("KLATALK_API")
         self.home = extra.get("home") or _env("KLATALK_HOME")
         self.mls_bin = extra.get("mls_bin") or _env("KLATALK_MLS_BIN")
-        self.profile = extra.get("profile") or _env("KLATALK_PROFILE")
+        self.account = extra.get("profile") or _env("KLATALK_PROFILE")
         rooms = extra.get("rooms") or _env("KLATALK_ROOMS")
         if isinstance(rooms, str):
             rooms = [r.strip() for r in rooms.replace(";", ",").split(",") if r.strip()]
@@ -136,7 +136,7 @@ class Settings:
 
     def problems(self) -> List[str]:
         out = []
-        if not self.profile:
+        if not self.account:
             out.append("KLATALK_PROFILE is required (the CLI profile = the account)")
         if not self.rooms:
             out.append("KLATALK_ROOMS is required (room ids, comma-separated — no 'all')")
@@ -184,7 +184,7 @@ def load_core(settings: Optional[Settings] = None):
             f" than {'.'.join(map(str, CORE_MIN_VERSION))} — install the CLI"
             " and this plugin from the same release tag")
     mod.configure(mod.ClientConfig(api=settings.api or None, home=settings.home or None,
-                                   profile=settings.profile or None,
+                                   profile=settings.account or None,
                                    mls_bin=settings.mls_bin or None))
     # the core's one stderr outlet becomes a log line — the terminal that
     # owns stderr is not ours
@@ -255,7 +255,7 @@ class KlatalkAdapter(BasePlatformAdapter):
             return False
         try:
             self.core = load_core(self.settings)
-            self.creds = await asyncio.to_thread(self.core.load_creds, self.settings.profile)
+            self.creds = await asyncio.to_thread(self.core.load_creds, self.settings.account)
         except Exception as e:                      # KlatalkAuth, missing CLI, old CLI
             self._set_fatal_error("auth", str(e), retryable=False)
             logger.error("[%s] %s", PLATFORM, e)
@@ -333,7 +333,7 @@ class KlatalkAdapter(BasePlatformAdapter):
                 # read mark): they still wake a turn, but a control line
                 # among them (/stop from last night) is stale — not replayed
                 self._live_from.setdefault(room_id, int(room.get("last_seq") or 0))
-                await kt.listen_core(self.creds, self.settings.profile, room_id,
+                await kt.listen_core(self.creds, self.settings.account, room_id,
                                      lambda ev, rid=room_id: self._on_event(rid, ev))
             except asyncio.CancelledError:
                 raise
@@ -684,7 +684,7 @@ class KlatalkAdapter(BasePlatformAdapter):
                 for attempt in range(3):
                     await self._throttle()
                     try:
-                        seq = await kt.send_message(self.creds, self.settings.profile, room,
+                        seq = await kt.send_message(self.creds, self.settings.account, room,
                                                     text=chunk, reply_to=reply_seq,
                                                     read_through=None)
                         break
@@ -749,12 +749,12 @@ class KlatalkAdapter(BasePlatformAdapter):
                 # refusals before the irreversible upload (and the bytes are
                 # stored as uploaded — only the message naming them is sealed)
                 await asyncio.to_thread(kt.sealed_preflight, self.creds,
-                                        self.settings.profile, chat_id)
+                                        self.settings.account, chat_id)
             await self._throttle()
             payload["url"] = await asyncio.to_thread(kt.upload_to_room, self.creds,
                                                      chat_id, ext, ctype, data)
             rs = int(reply_to) if reply_to is not None and str(reply_to).isdigit() else None
-            seq = await kt.send_message(self.creds, self.settings.profile, room, payload,
+            seq = await kt.send_message(self.creds, self.settings.account, room, payload,
                                         reply_to=rs, read_through=None)
             if caption:
                 await self.send(chat_id, caption)
@@ -821,7 +821,7 @@ def validate_config(config: PlatformConfig) -> bool:
 
 def is_connected(config: PlatformConfig) -> bool:
     s = Settings(getattr(config, "extra", None))
-    return bool(s.profile and s.rooms)
+    return bool(s.account and s.rooms)
 
 
 def _env_enablement() -> Optional[dict]:
@@ -829,10 +829,10 @@ def _env_enablement() -> Optional[dict]:
     keys are the adapter's guard that seeding happened (the real session
     shape is the global gateway.group_sessions_per_user — README)."""
     s = Settings()
-    if not (s.profile and s.rooms):
+    if not (s.account and s.rooms):
         return None
     seed: dict = {
-        "profile": s.profile,
+        "profile": s.account,
         "rooms": s.rooms,
         "owner_id": s.owner_id,
         "tool_rooms": sorted(s.tool_rooms),
@@ -890,13 +890,13 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *,
         return {"error": "klatalk: standalone delivery is text only"}
     try:
         kt = load_core(s)
-        creds = await asyncio.to_thread(kt.load_creds, s.profile)
+        creds = await asyncio.to_thread(kt.load_creds, s.account)
         room = await asyncio.to_thread(kt.get_room, creds, target)
         if room is None:
             return {"error": "klatalk: not a member of the home channel"}
         seq = None
         for chunk in BasePlatformAdapter.truncate_message(message, MAX_MESSAGE_LENGTH):
-            seq = await kt.send_message(creds, s.profile, room, text=chunk, read_through=None)
+            seq = await kt.send_message(creds, s.account, room, text=chunk, read_through=None)
         return {"success": True, "platform": PLATFORM, "chat_id": target,
                 "message_id": str(seq)}
     except Exception as e:
@@ -925,7 +925,7 @@ def register(ctx) -> None:
         required_env=["KLATALK_PROFILE", "KLATALK_ROOMS", "KLATALK_OWNER_ID",
                       "KLATALK_ALLOW_ALL_USERS"],
         install_hint="install the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.4+)"
-                     " and `pip install websockets`",
+                     " and the websockets package",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="KLATALK_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send,
