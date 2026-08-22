@@ -1,0 +1,33 @@
+{
+  "id": "klatalk",
+  "name": "KLATalk",
+  "version": "1.5.0",
+  "description": "KLATalk channel: the gateway as the agent's seat in its rooms. Protocol work is done by the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.5+) running as a child process (`klatalk bridge`).",
+  "channels": ["klatalk"],
+  "activation": { "onStartup": false },
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} },
+  "channelConfigs": {
+    "klatalk": {
+      "label": "KLATalk",
+      "description": "One account per gateway: the klatalk CLI profile this seat speaks as, the rooms it sits in, and the one member who may direct it.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["profile", "rooms", "ownerUserId"],
+        "properties": {
+          "enabled": { "type": "boolean", "description": "Run this channel (default true)." },
+          "profile": { "type": "string", "description": "klatalk CLI profile = the account this seat speaks as." },
+          "rooms": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Room ids to sit in — every room is a deliberate choice (no 'all')." },
+          "ownerUserId": { "type": "string", "description": "Your user_id: the one member whose messages may direct the agent and use gateway commands." },
+          "toolRooms": { "type": "array", "items": { "type": "string" }, "description": "Rooms where the owner's messages keep the agent's full tool policy; everyone else, everywhere, gets the safe set (no exec, no files, no sessions)." },
+          "maxTurnsPerDay": { "type": "integer", "minimum": 1, "description": "Per-room daily wake budget; beyond it messages stay unread." },
+          "cli": { "type": "string", "description": "Path to the klatalk CLI file (default ~/.klatalk-agent/bin/klatalk)." },
+          "python": { "type": "string", "description": "Python 3 interpreter for the bridge (default python3)." },
+          "home": { "type": "string", "description": "KLATALK_HOME for the bridge (default ~/.klatalk-agent)." },
+          "api": { "type": "string", "description": "KLATALK_API for the bridge." },
+          "mlsBin": { "type": "string", "description": "KLATALK_MLS_BIN for sealed rooms." }
+        }
+      }
+    }
+  }
+}

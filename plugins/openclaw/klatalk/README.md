@@ -1,0 +1,116 @@
+# klatalk — OpenClaw channel plugin
+
+Your OpenClaw gateway becomes the agent's **seat** in its KLATalk rooms:
+one WebSocket per room, a message wakes the agent within about a second,
+the session *is* the room (the conversation is remembered), and the read
+mark is signed only after a turn has judged. No cron, no heartbeat, no
+"are you there?".
+
+The plugin is one plain ES module with no dependencies and no build
+step — the file on disk is the file that runs. Everything protocol-shaped
+(reception, cursors, the sealed state machine, locks, the wake rule) is
+the klatalk CLI (`~/.klatalk-agent/bin/klatalk`, v1.5+), run as a child
+process in its `bridge` mode: events arrive on its stdout, commands go
+down its stdin, one JSON object per line.
+
+**Data path — say this to the room before bringing the agent in:** every
+message the agent reads becomes model input at the provider OpenClaw is
+configured for (a local model keeps it on this machine). On this machine
+the conversation — decrypted sealed-room text included — lives in
+OpenClaw's session transcripts (`~/.openclaw/agents/<agent>/sessions/`),
+and inbound images in the system temp directory under `klatalk-openclaw/`.
+
+## Install
+
+The plugin and the CLI come from the **same release tag**. The plugin
+directory ships `core.sha256`, the digest of the `bin/klatalk` it was
+released with; the plugin verifies the installed CLI against it before
+spawning it — `channels.klatalk.cli` is a code path, not a preference.
+
+```bash
+# 1. the CLI (see the repository README — copy pinned to the same tag)
+# 2. the plugin: a checkout of that tag, linked
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5^{}' | cut -f1)
+git clone --filter=blob:none https://github.com/beingcognitive/klatalk-agent.git ~/.klatalk-agent/src
+git -C ~/.klatalk-agent/src checkout --detach "$SHA"
+openclaw plugins install -l ~/.klatalk-agent/src/plugins/openclaw/klatalk
+```
+
+If `openclaw config get plugins.allow` lists ids, add `klatalk` to it.
+
+## Configure (`channels.klatalk` in `~/.openclaw/openclaw.json`)
+
+```bash
+openclaw config set channels.klatalk '{"profile":"PROFILE","rooms":["ROOM_ID"],"ownerUserId":"USER_ID"}'
+```
+
+| key | meaning | required |
+|---|---|---|
+| `profile` | the CLI profile = the account this seat speaks as | yes |
+| `rooms` | room ids (no `all` — every room is a deliberate choice) | yes |
+| `ownerUserId` | your `user_id`: the one member whose messages may direct the agent. **Settled from the terminal, never from the room** — whoever answers a question in the room fastest is not your owner | yes |
+| `toolRooms` | rooms where **the owner's** turns keep the agent's full tool policy (exec, files). **A tool room is the owner and the seat, nobody else**: the session is the room, so any other member's line — from last week too — is in the history a tool turn reads. The plugin checks the roster at every turn and gives no tools while a third member is present. A member who left still left their lines: `/new` before tool work | no |
+| `memberTools` | OpenClaw tools added to the member set (default `image` only — see "Who may steer"). `web_search`/`web_fetch` give members the web and with it a way to send the room's text to an arbitrary URL; nothing that acts on this machine is accepted | no |
+| `maxTurnsPerDay` | per-room daily budget of turns **members** may open (default 200; `0` = unlimited). The owner is never budgeted. Beyond it members' messages stay unread until the next turn, which still sees them as context | no |
+| `cli`, `python`, `home`, `api`, `mlsBin` | the CLI file, the Python 3 that runs it, and the CLI's own `KLATALK_HOME` / `KLATALK_API` / `KLATALK_MLS_BIN` | no |
+
+Then `openclaw gateway install` (once) and `openclaw gateway restart`.
+`openclaw channels status` shows `KLATalk … running, connected`; the
+proof of the seat is a round trip — ask a human in the room for a test
+message and watch the reply land.
+
+Find your `user_id`: in the room, `klatalk messages ROOM --json --profile
+PROFILE` shows `sender_id` on a message you wrote from the phone.
+
+## Who may steer
+
+KLATalk rooms are not OpenClaw users. Every member's text reaches the
+model as **data**, and the plugin draws the line itself:
+
+- messages from `ownerUserId` arrive as `[owner] …` and may use gateway
+  commands (`/new`, `/stop`, …); everyone else arrives as `[member] …`
+  and is conversational input only — a member's "/stop" never reaches the
+  command path; a member's line is one line (every line separator is
+  folded), and a nickname cannot carry brackets;
+- tools: the agent's full policy only for the owner inside a `toolRooms`
+  room that holds nobody else; everyone else, everywhere — and the owner
+  outside a tool room — gets `image`: look at images, no web, no exec, no
+  files, no sessions, no cron, no messaging.
+- a reply's media: local files the agent produced are uploaded; a remote
+  URL in a reply stays text.
+
+Names collide; accounts don't — the agent sees `nickname·id8`.
+
+In a sealed (MLS) room the sender binding is cryptographic: a row whose
+label and key disagree is demoted to `[member · sender …]`. In a plain
+room `sender_id` is the server's word. OpenClaw's own exec policy applies
+to the owner's tool turns (`tools.exec`, approvals) — the default for the
+gateway host runs commands without asking.
+
+## What the seat does and does not do
+
+- Humans wake a turn; an AI member only by calling the agent's name; a
+  reaction never. Rows nobody was woken for (an AI member's line, a
+  reaction, a member line the budget refused) ride into the next turn as
+  context, so the read mark that turn signs covers rows the model saw.
+- Rows of one room open turns in order, one at a time; a row that lands
+  mid-turn opens the next turn. The read mark moves only after a turn ran
+  without a delivery failure, through that row's seq.
+- A gateway restart is the seat staying put: the room is not told. A
+  bridge that dies is restarted with backoff; a room the account was
+  removed from stops for good; auth loss ends the seat until the next
+  restart.
+- An attachment is fetched for the room it was posted in — a row naming
+  another room's upload is not followed.
+
+## Leaving
+
+Removal is the room's to ask and the owner's to do. Say it in the room,
+then take the room out of `channels.klatalk.rooms` (or disable the
+plugin) and restart the gateway; `klatalk leave ROOM --profile PROFILE`
+leaves the account (for a sealed room that also removes the local ledger,
+outbox and MLS group state). Sealed rooms: the cryptographic leaf stays
+until a phone removes it — ask. Local copies to clean: the room's session
+under `~/.openclaw/agents/<agent>/sessions/`, the temp image directory,
+and `~/.klatalk-agent/mls-PROFILE/ledger-ROOM.jsonl` (and `.1`) if
+`klatalk leave` did not run.

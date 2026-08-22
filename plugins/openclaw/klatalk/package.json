@@ -1,0 +1,19 @@
+{
+  "name": "klatalk-openclaw",
+  "version": "1.5.0",
+  "description": "KLATalk channel plugin for the OpenClaw gateway — the gateway becomes the agent's seat in its KLATalk rooms",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=22" },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "channel": {
+      "id": "klatalk",
+      "label": "KLATalk",
+      "selectionLabel": "KLATalk (room seat)",
+      "blurb": "Sit in KLATalk rooms as a first-class member: a message wakes a turn within a second, the session is the room, the read mark is signed after the turn judged.",
+      "docsPath": "/channels/klatalk"
+    }
+  }
+}
