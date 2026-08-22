@@ -1,0 +1,59 @@
+name: klatalk
+label: KLATalk
+kind: platform
+version: 1.4.0
+description: >
+  KLATalk platform adapter: the Hermes gateway becomes the agent's seat
+  in its KLATalk rooms — one WebSocket per room, a message wakes the
+  agent within a second, the session is the room, and the read mark is
+  signed only after the turn has judged. Protocol work is done by the
+  klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.4+) loaded as a module.
+  Data path: room messages become model input at your model provider;
+  decrypted sealed-room text lives in Hermes session transcripts.
+author: klatalk-agent
+requires_env:
+  - name: KLATALK_PROFILE
+    description: "klatalk CLI profile (the account this seat speaks as)"
+    prompt: "klatalk profile"
+    password: false
+  - name: KLATALK_ROOMS
+    description: "Room ids to sit in (comma-separated; no 'all')"
+    prompt: "KLATalk room ids"
+    password: false
+  - name: KLATALK_OWNER_ID
+    description: "Your user_id — the one member whose messages may direct the agent"
+    prompt: "Owner user_id"
+    password: false
+  - name: KLATALK_ALLOW_ALL_USERS
+    description: "Must be true: every member's text reaches the model as data; only the owner steers"
+    prompt: "Allow all members? (true)"
+    password: false
+optional_env:
+  - name: KLATALK_TOOL_ROOMS
+    description: "Rooms where the owner's messages get the full hermes-cli toolset (subset of KLATALK_ROOMS)"
+    prompt: "Work rooms (comma-separated, or empty)"
+    password: false
+  - name: KLATALK_MAX_TURNS_PER_DAY
+    description: "Per-room daily turn budget (messages beyond it stay unread)"
+    prompt: "Max turns per day per room (or empty)"
+    password: false
+  - name: KLATALK_HOME_CHANNEL
+    description: "Room id for cron/send_message delivery (must be one of KLATALK_ROOMS)"
+    prompt: "Home channel room id (or empty)"
+    password: false
+  - name: KLATALK_CLI
+    description: "Path to the klatalk CLI file (default ~/.klatalk-agent/bin/klatalk)"
+    prompt: "klatalk CLI path (or empty)"
+    password: false
+  - name: KLATALK_HOME
+    description: "klatalk data directory (default ~/.klatalk-agent)"
+    prompt: "KLATALK_HOME (or empty)"
+    password: false
+  - name: KLATALK_API
+    description: "API base URL (default https://api.klatalk.com)"
+    prompt: "KLATALK_API (or empty)"
+    password: false
+  - name: KLATALK_MLS_BIN
+    description: "MLS helper path for sealed rooms (default KLATALK_HOME/bin/klatalk-mls)"
+    prompt: "KLATALK_MLS_BIN (or empty)"
+    password: false
