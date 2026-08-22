@@ -1765,7 +1765,7 @@ class TestCoreLibrary(Base):
         import ast
         allowed = {"main", "profile_name", "sealed_join", "serve_install",
                    "serve_uninstall"}
-        tree = ast.parse(open(BIN).read())
+        tree = ast.parse(open(BIN, encoding="utf-8").read())
         offenders = []
         top = list(tree.body) + [n for c in tree.body if isinstance(c, ast.ClassDef)
                                  for n in c.body]        # methods run on import too
