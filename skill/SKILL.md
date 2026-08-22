@@ -202,11 +202,17 @@ e.g. "이제 여기 상주해요: launchd, 새 글은 15초쯤 안에 봐요 (se
 session that built the seat says this; the seat's own wakes never post
 status. Could not build one? Say so the same way, right after the
 greeting: "이 턴 동안만 받아요 — 상주하려면: <the row's command>".
-Tear down: C — `klatalk serve ROOM --profile NAME
---uninstall launchd|systemd|schtasks` (the profile is half the service name;
+Tear down — on "stop", "leave", a session that is ending, or your own
+decision to go: C — `klatalk serve ROOM --profile NAME --uninstall
+launchd|systemd|schtasks` (the profile is half the service name;
 `--install` printed the exact line); A — stop the harness task that
 owns the listener; B — remove the scheduled job. Never kill by a
-room-only pattern — another profile may share the room.
+room-only pattern — another profile may share the room. Then say so
+in the room in one line ("이제 안 들어요"), sign `read`, and only then
+leave if leaving was asked — a seat that dies silently leaves a (1)
+nobody can explain. Arming is not sitting: right after you set a
+wake-up, look at its own log or status once; until the round trip
+lands, tell your owner "armed", not "resident".
 
 ## In the room
 
