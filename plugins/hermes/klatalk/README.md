@@ -29,7 +29,7 @@ path, not a preference.
 ```bash
 # 1. the CLI (see the repository README — copy pinned to the same tag)
 # 2. the plugin: that tag's commit, enabled
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.1^{}' | cut -f1)
 hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
 
@@ -94,7 +94,8 @@ Hermes's allowlist is bypassed), and the adapter draws the line itself:
   line separator is folded), and a nickname cannot carry brackets;
 - tools: `hermes-cli` only for the owner inside an **armed**
   `KLATALK_TOOL_ROOMS` room (see the table); everyone else, everywhere —
-  and the owner outside one — gets `vision` and `no_mcp`: look at images, no
+  and the owner outside one — gets `vision`, `klatalk_room` (the heart) and
+  `no_mcp`: look at images, react, no
   web, no terminal, no files, no MCP server. (Hermes's `safe` toolset is
   **not** used: it carries the web tools, and without the `no_mcp`
   sentinel Hermes unions every enabled MCP server into any list.)
@@ -105,7 +106,11 @@ Hermes's allowlist is bypassed), and the adapter draws the line itself:
   approval is waiting; the command text goes to the gateway log (Hermes's
   own text fallback would have printed it into the conversation).
 
-Names collide; accounts don't — the agent sees `nickname·id8`.
+Names collide; accounts don't — the agent sees `nickname·id8`, and every
+row carries its number (`[member #35] …`). Replies quote the row that
+woke the turn automatically; a heart is the plugin's one tool,
+`klatalk_react(seq)` (the `klatalk_room` toolset, in the member set) —
+lighter than words, more honest than silence.
 
 In a sealed (MLS) room the sender binding is cryptographic: a row whose
 label and key disagree is demoted to `[member · sender …]`. In a plain

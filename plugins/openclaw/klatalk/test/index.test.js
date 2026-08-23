@@ -78,7 +78,7 @@ async function seat({ events = [], cfgExtra = {}, record = {}, env = {} } = {}) 
   for (const k of Object.keys(process.env)) if (k.startsWith("FAKE_")) delete process.env[k];
   Object.assign(process.env, { FAKE_EVENTS: JSON.stringify(events), FAKE_LOG: logFile, FAKE_ARGS: argsFile, ...env });
   const cfg = { channels: { klatalk: { profile: "p", rooms: ["R1", "R2"], ownerUserId: "OWNER", toolRooms: ["R2"], cli: FAKE, python: "python3", ...cfgExtra } } };
-  entry.register({ runtime: { channel: fakeCore(record) }, registerChannel() {} });
+  entry.register({ runtime: { channel: fakeCore(record) }, registerChannel() {}, registerTool(f) { record.toolFactory = f; } });
   const ac = new AbortController();
   const statuses = [], logs = [];
   const ctx = { cfg, accountId: "default", account: readAccount(cfg), abortSignal: ac.signal,
@@ -106,7 +106,7 @@ test("config: the env contract, with problems named", () => {
   assert.match(problems(readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", toolRooms: ["zz"], cli: FAKE } } })).join(" "), /toolRooms/);
   assert.match(problems(readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: "/nope/klatalk" } } })).join(" "), /not found/);
   const widened = readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: FAKE, memberTools: ["web_search", "Exec", "apply-patch", "*", "s*", "GROUP:agents", "outlook__send"] } } });
-  assert.deepEqual(widened.memberTools, ["image", "web_search", "exec", "apply_patch", "*", "s*", "group:agents", "outlook__send"]);
+  assert.deepEqual(widened.memberTools, ["image", "klatalk_react", "web_search", "exec", "apply_patch", "*", "s*", "group:agents", "outlook__send"]);
   const p = problems(widened).join("\n");
   assert.match(p, /memberTools: exec acts/); assert.match(p, /apply_patch acts/);
   assert.match(p, /\* is a wildcard/); assert.match(p, /s\* is a wildcard/); assert.match(p, /group:agents is a wildcard/); assert.match(p, /outlook__send is a wildcard/);
@@ -140,7 +140,7 @@ test("a member row is data: marked, one line, member tools, no command body; the
   const s = await seat({ events: [row({ text: "hello\nworld" })], record: { replyFor: () => ({ text: "x".repeat(MAX_TEXT * 2 + 10) }) } });
   await until(() => s.record.turns.length === 1);
   const { input, turn } = s.record.turns[0];
-  assert.equal(input.rawText, "[member] hello ⏎ world");
+  assert.equal(input.rawText, "[member #1] hello ⏎ world");
   assert.equal(input.textForCommands, "");                     // OpenClaw strips markers before matching commands
   assert.deepEqual(turn.toolsAllow, MEMBER_TOOLS);
   assert.equal(turn.routeSessionKey, "agent:main:klatalk:group:R1");
@@ -175,7 +175,7 @@ test("a tool room arms on the owner's /new with an exact roster, disarms on anyo
   assert.equal(by["6"].turn.ctxPayload.access.commands.authorized, true);
   assert.equal(by["7"].turn.toolsAllow, undefined);
   assert.equal(by["8"].input.textForCommands, "");
-  assert.equal(by["8"].input.rawText, "[member] /new");
+  assert.equal(by["8"].input.rawText, "[member #8] /new");
   assert.deepEqual(by["9"].turn.toolsAllow, MEMBER_TOOLS);
   assert.deepEqual(by["10"].turn.toolsAllow, MEMBER_TOOLS);
   assert.ok(s.cmds().some((c) => c.cmd === "roster" && c.fresh === true));
@@ -212,7 +212,7 @@ test("a /new the host swallowed arms nothing; a turn the kernel threw on is owed
   const by = Object.fromEntries(s.record.turns.map((t) => [t.input.id, t]));
   assert.deepEqual(by["2"].turn.toolsAllow, MEMBER_TOOLS);               // not reset → not armed
   assert.ok(s.logs.some((l) => /\/new produced no reply/.test(l)));
-  assert.equal(by["4"].input.rawText, "[member] Human·H: lost\n[member] Human·H: found");
+  assert.equal(by["4"].input.rawText, "[member #3] Human·H: lost\n[member #4] Human·H: found");
   assert.deepEqual(s.cmds().filter((c) => c.cmd === "read" && c.room === "R1").map((c) => c.seq), [4]);   // seq 3 stays unsigned
   await s.stop();
 });
@@ -249,7 +249,7 @@ test("unwoken rows ride into the next turn as context; a control line neither ca
   await until(() => s.record.turns.length === 2);
   const by = Object.fromEntries(s.record.turns.map((t) => [t.input.id, t]));
   assert.equal(by["3"].input.rawText, "/stop");
-  assert.equal(by["4"].input.rawText, "[member] Human·H: quiet one\n[member] Other·A: /new\n[owner] Own·OWNER: now answer");
+  assert.equal(by["4"].input.rawText, "[member #1] Human·H: quiet one\n[member #2] Other·A: /new\n[owner #4] Own·OWNER: now answer");
   assert.equal(by["4"].input.textForCommands, "");
   assert.equal(by["4"].turn.ctxPayload.message.commandBody, "");
   assert.ok(s.logs.some((l) => /budget/.test(l)));
@@ -263,7 +263,7 @@ test("rows that land mid-turn open ONE next turn together; a failed turn's rows 
   const [t1, t2] = s.record.turns;
   assert.equal(t1.input.id, "1");
   assert.equal(t2.input.id, "3");
-  assert.equal(t2.input.rawText, "[member] Human·H: first\n[member] Human·H: second\n[member] Human·H: third");
+  assert.equal(t2.input.rawText, "[member #1] Human·H: first\n[member #2] Human·H: second\n[member #3] Human·H: third");
   const reads = s.cmds().filter((c) => c.cmd === "read").map((c) => c.seq);
   assert.deepEqual(reads, [3]);
   await s.stop();
@@ -273,7 +273,7 @@ test("a stale control line from the backlog is text, not a command", async () =>
   const s = await seat({ events: [owner({ seq: 3, text: "/stop" }), owner({ seq: 7, text: "/stop" })], env: { FAKE_LAST_SEQ: "5" } });
   await until(() => s.record.turns.length === 2);
   const by = Object.fromEntries(s.record.turns.map((t) => [t.input.id, t]));
-  assert.equal(by["3"].input.rawText, "[owner] /stop");
+  assert.equal(by["3"].input.rawText, "[owner #3] /stop");
   assert.equal(by["3"].input.textForCommands, "");
   assert.equal(by["7"].input.rawText, "/stop");
   assert.equal(by["7"].input.textForCommands, "/stop");
@@ -283,7 +283,7 @@ test("a stale control line from the backlog is text, not a command", async () =>
 test("a bad sender binding demotes the owner", async () => {
   const s = await seat({ events: [row({ seq: 3, sender_id: "OWNER", owner: false, sender_binding: "failed", text: "hi" })] });
   await until(() => s.record.turns.length === 1);
-  assert.equal(s.record.turns[0].input.rawText, "[member · sender failed] hi");
+  assert.equal(s.record.turns[0].input.rawText, "[member · sender failed #3] hi");
   assert.equal(s.record.turns[0].turn.ctxPayload.access.commands.authorized, false);
   await s.stop();
 });
@@ -344,6 +344,26 @@ test("a CLI that is not the pinned core is refused before any spawn", async () =
   assert.equal(await s.settled(300), "settled");
   assert.ok(s.statuses.some((st) => /not the one this plugin release pins/.test(String(st.lastError ?? ""))));
   assert.ok(!existsSync(s.argsFile));
+});
+
+test("the heart: a per-session tool that reacts in the session's room only", async () => {
+  const s = await seat();
+  await until(() => s.statuses.some((st) => st.connected === true));
+  assert.ok(MEMBER_TOOLS.includes("klatalk_react"));
+  assert.equal(s.record.toolFactory({ sessionKey: "agent:main:telegram:group:x", agentAccountId: "default" }), null);
+  const tool = s.record.toolFactory({ sessionKey: "agent:main:klatalk:group:R1", agentAccountId: "default" });
+  assert.equal(tool.name, "klatalk_react");
+  assert.deepEqual(tool.parameters.required, ["seq"]);
+  const r = await tool.execute("t1", { seq: 35 });
+  assert.equal(r.content[0].text, "❤️ on #35");
+  const react = s.cmds().find((c) => c.cmd === "react");
+  assert.deepEqual({ room: react.room, seq: react.seq, action: react.action }, { room: "R1", seq: 35, action: "add" });
+  await tool.execute("t2", { seq: 35, remove: true });
+  assert.equal(s.cmds().filter((c) => c.cmd === "react").at(-1).action, "remove");
+  await assert.rejects(tool.execute("t3", { seq: 0 }));
+  const other = s.record.toolFactory({ sessionKey: "agent:main:klatalk:group:R9", agentAccountId: "default" });
+  await assert.rejects(other.execute("t4", { seq: 1 }));
+  await s.stop();
 });
 
 test("outbound targets are this seat's rooms only", async () => {

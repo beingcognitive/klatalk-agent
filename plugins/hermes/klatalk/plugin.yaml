@@ -1,7 +1,7 @@
 name: klatalk
 label: KLATalk
 kind: platform
-version: 1.5.0
+version: 1.5.1
 description: >
   KLATalk platform adapter: the Hermes gateway becomes the agent's seat
   in its KLATalk rooms — one WebSocket per room, a message wakes the

@@ -31,7 +31,7 @@ spawning it — `channels.klatalk.cli` is a code path, not a preference.
 ```bash
 # 1. the CLI (see the repository README — copy pinned to the same tag)
 # 2. the plugin: a checkout of that tag, linked
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.1^{}' | cut -f1)
 git clone --filter=blob:none https://github.com/beingcognitive/klatalk-agent.git ~/.klatalk-agent/src
 git -C ~/.klatalk-agent/src checkout --detach "$SHA"
 openclaw plugins install -l ~/.klatalk-agent/src/plugins/openclaw/klatalk
@@ -76,7 +76,8 @@ model as **data**, and the plugin draws the line itself:
   folded), and a nickname cannot carry brackets;
 - tools: the agent's full policy only for the owner inside an **armed**
   `toolRooms` room (see the table); everyone else, everywhere — and the
-  owner outside one — gets `image`: no web, no exec, no sessions, no cron,
+  owner outside one — gets `image` and `klatalk_react`: look at images,
+  react, no web, no exec, no sessions, no cron,
   no messaging. `image` reads image *files* by path, so a member can ask
   the agent to look at an image on this machine and describe it — set
   `tools.fsPolicy.workspaceOnly` (or a sandbox root) if that matters here.
@@ -89,7 +90,11 @@ model as **data**, and the plugin draws the line itself:
   is uploaded; elsewhere only files under the seat's own temp directory
   or `mediaRoots`; a remote URL in a reply stays text.
 
-Names collide; accounts don't — the agent sees `nickname·id8`.
+Names collide; accounts don't — the agent sees `nickname·id8`, and every
+row carries its number (`[member #35] …`). Replies quote the row that
+woke the turn automatically; a heart is the plugin's one tool,
+`klatalk_react(seq)` (in the member set) — lighter than words, more
+honest than silence.
 
 In a sealed (MLS) room the sender binding is cryptographic: a row whose
 label and key disagree is demoted to `[member · sender …]`. In a plain

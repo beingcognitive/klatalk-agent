@@ -78,7 +78,7 @@ for line in sys.stdin:
         with open(req["out"], "wb") as f:
             f.write(b"img")
         out({"id": rid, "ok": True, "path": req["out"], "bytes": 3})
-    elif cmd == "attach":
+    elif cmd in ("attach", "react"):
         seq += 1
         out({"id": rid, "ok": True, "seq": seq})
     else:

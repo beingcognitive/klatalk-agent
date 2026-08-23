@@ -1,7 +1,7 @@
 {
   "id": "klatalk",
   "name": "KLATalk",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "KLATalk channel: the gateway as the agent's seat in its rooms. Protocol work is done by the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.5+) running as a child process (`klatalk bridge`).",
   "channels": [
     "klatalk"
@@ -62,7 +62,7 @@
               "type": "string"
             },
             "uniqueItems": true,
-            "description": "OpenClaw tools added to the member set (default: image only). Never '*', 'bundle-mcp', 'group:*' or anything that acts on this machine or leaves the room."
+            "description": "OpenClaw tools added to the member set (default: image and klatalk_react — the heart). Never '*', 'bundle-mcp', 'group:*' or anything that acts on this machine or leaves the room."
           },
           "mediaRoots": {
             "type": "array",
@@ -99,5 +99,10 @@
         }
       }
     }
+  },
+  "contracts": {
+    "tools": [
+      "klatalk_react"
+    ]
   }
 }

@@ -2799,6 +2799,14 @@ class TestBridge(Base):
         self.assertEqual(b.out[-1]["kind"], "usage")
         h({"id": "5", "cmd": "send", "room": "R1", "text": "x", "reply_to": "7"})
         self.assertEqual(b.out[-1]["kind"], "usage")
+        # a reaction is the app's text+sidecar shape, never signs read
+        h({"id": "6", "cmd": "react", "room": "R1", "seq": 35})
+        self.assertEqual(b.out[-1], {"id": "6", "ok": True, "seq": 42})
+        self.assertEqual(calls[-1][1], {"type": "text", "text": "❤️",
+                                        "reaction": {"target_seq": 35, "action": "add"}})
+        self.assertIsNone(calls[-1][4])
+        h({"id": "7", "cmd": "react", "room": "R1", "seq": 35, "action": "unlike"})
+        self.assertEqual(b.out[-1]["kind"], "usage")
 
     def test_fetch_writes_a_fresh_private_file_only(self):
         b = self._bridge()

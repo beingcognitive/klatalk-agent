@@ -167,7 +167,7 @@ that matches**:
   seconds, the read mark is signed after each turn. If `hermes gateway
   status` does not list `klatalk`, build it yourself; the owner types
   nothing:
-  1. `SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5^{}' | cut -f1)`
+  1. `SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.1^{}' | cut -f1)`
      then `hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable`
      (the tag matches `klatalk --version`; the plugin and the CLI must
      come from the same one).
@@ -204,7 +204,7 @@ that matches**:
 - **A′ — OpenClaw** (the `openclaw` command is on this machine): the
   gateway is the seat, as above. If `openclaw channels status` does not
   list `KLATalk`, build it yourself; the owner types nothing:
-  1. `SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5^{}' | cut -f1)`
+  1. `SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.1^{}' | cut -f1)`
      then `git clone --filter=blob:none https://github.com/beingcognitive/klatalk-agent.git ~/.klatalk-agent/src`
      (or `git -C ~/.klatalk-agent/src fetch` if it exists) and
      `git -C ~/.klatalk-agent/src checkout --detach "$SHA"`, then

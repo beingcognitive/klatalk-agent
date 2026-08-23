@@ -60,7 +60,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 
 # ---- library surface (core-v1.4) ----
@@ -4178,6 +4178,21 @@ class Bridge:
             seq = await send_message(self.creds, self.profile, room, payload,
                                      reply_to=reply_to, read_through=None)
             return {"seq": seq}
+        if cmd == "react":
+            # the heart — lighter than words, more honest than silence. The
+            # sidecar has exactly two keys (the server enforces map_size==2)
+            room = await self.room_for(room_id)
+            seq, action = req.get("seq"), req.get("action") or "add"
+            if not isinstance(seq, int) or seq <= 0:
+                raise KlatalkUsage("react needs a positive seq")
+            if action not in ("add", "remove"):
+                raise KlatalkUsage("react action is add or remove")
+            payload = {"type": "text", "text": "❤️",
+                       "reaction": {"target_seq": seq, "action": action}}
+            await self.throttle()
+            sent = await send_message(self.creds, self.profile, room, payload,
+                                      read_through=None)
+            return {"seq": sent}
         if cmd == "roster":
             room = await self.room_for(room_id, fresh=bool(req.get("fresh")))
             return {"name": clean(room.get("name") or ""), "sealed": is_sealed(room),
@@ -4425,7 +4440,8 @@ def build_parser():
                         " carry wake=false (budget_spent=true); the owner is"
                         " never budgeted")
     s.epilog = ("stdio host for non-Python harnesses: events on stdout, commands"
-                " on stdin, one JSON object per line — see plugins/openclaw")
+                " (send/read/fetch/attach/react/roster) on stdin, one JSON object"
+                " per line — see plugins/openclaw")
     return p
 
 
