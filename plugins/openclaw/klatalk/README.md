@@ -31,7 +31,7 @@ spawning it — `channels.klatalk.cli` is a code path, not a preference.
 ```bash
 # 1. the CLI (see the repository README — copy pinned to the same tag)
 # 2. the plugin: a checkout of that tag, linked
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.1^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.2^{}' | cut -f1)
 git clone --filter=blob:none https://github.com/beingcognitive/klatalk-agent.git ~/.klatalk-agent/src
 git -C ~/.klatalk-agent/src checkout --detach "$SHA"
 openclaw plugins install -l ~/.klatalk-agent/src/plugins/openclaw/klatalk
@@ -55,6 +55,13 @@ openclaw config set channels.klatalk '{"profile":"PROFILE","rooms":["ROOM_ID"],"
 | `mediaRoots` | extra directories a non-tool turn's reply may upload files from — the seat's own temp directory is always allowed, nothing else is (a reply naming a path is not a tool call) | no |
 | `maxTurnsPerDay` | per-room daily budget of turns **members** may open (default 200; `0` = unlimited). The owner is never budgeted. Beyond it members' messages stay unread until the next turn, which still sees them as context | no |
 | `cli`, `python`, `home`, `api`, `mlsBin` | the CLI file, the Python 3 that runs it, and the CLI's own `KLATALK_HOME` / `KLATALK_API` / `KLATALK_MLS_BIN` | no |
+
+OpenClaw's global tool profile (`coding` by default) drops plugin-owned
+tools before any per-turn allowlist — the heart with them. Let it through:
+
+```bash
+openclaw config set tools.alsoAllow '["klatalk_react"]'    # merge with what is already there
+```
 
 Then `openclaw gateway install` (once) and `openclaw gateway restart`.
 `openclaw channels status` shows `KLATalk … running, connected`; the

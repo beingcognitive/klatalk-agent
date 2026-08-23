@@ -16,14 +16,14 @@ const FAKE = path.join(here, "fake-bridge.py");
 // The plugin verifies the CLI's bytes against the core.sha256 shipped next
 // to it before spawning — the suite runs a copy of index.js whose digest
 // file names the fake bridge (the real one names bin/klatalk).
-let entry, readAccount, problems, plugin, _internal, MEMBER_TOOLS, MAX_TEXT;
+let entry, readAccount, problems, plugin, _internal, MEMBER_TOOLS, MAX_TEXT, toolPolicyProblem;
 before(async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "kt-plugin-"));
   copyFileSync(path.join(here, "..", "index.js"), path.join(dir, "index.js"));
   const digest = createHash("sha256").update(readFileSync(FAKE)).digest("hex");
   writeFileSync(path.join(dir, "core.sha256"), `${digest}  fake-bridge.py\n`);
   const m = await import(path.join(dir, "index.js"));
-  entry = m.default; readAccount = m.readAccount; problems = m.problems; plugin = m.plugin; _internal = m._internal;
+  entry = m.default; readAccount = m.readAccount; problems = m.problems; plugin = m.plugin; _internal = m._internal; toolPolicyProblem = m.toolPolicyProblem;
   MEMBER_TOOLS = _internal.MEMBER_TOOLS; MAX_TEXT = _internal.MAX_TEXT;
 });
 
@@ -111,6 +111,15 @@ test("config: the env contract, with problems named", () => {
   assert.match(p, /memberTools: exec acts/); assert.match(p, /apply_patch acts/);
   assert.match(p, /\* is a wildcard/); assert.match(p, /s\* is a wildcard/); assert.match(p, /group:agents is a wildcard/); assert.match(p, /outlook__send is a wildcard/);
   assert.ok(!/web_search/.test(p));
+});
+
+test("the global tool profile must let the heart through", () => {
+  assert.equal(toolPolicyProblem({}), null);                                   // no profile, no allow: everything
+  assert.equal(toolPolicyProblem({ tools: { profile: "full" } }), null);
+  assert.match(toolPolicyProblem({ tools: { profile: "coding" } }) ?? "", /alsoAllow/);
+  assert.equal(toolPolicyProblem({ tools: { profile: "coding", alsoAllow: ["klatalk_react"] } }), null);
+  assert.equal(toolPolicyProblem({ tools: { profile: "coding", alsoAllow: ["group:plugins"] } }), null);
+  assert.match(toolPolicyProblem({ tools: { allow: ["read"] } }) ?? "", /alsoAllow/);
 });
 
 test("helpers: one line, labels, room refs, local media, versions, the core pin", () => {

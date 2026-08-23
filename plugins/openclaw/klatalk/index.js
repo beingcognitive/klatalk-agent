@@ -156,6 +156,17 @@ export function problems(a) {
   return out;
 }
 
+/** OpenClaw's global tool profile ("coding" by default) drops plugin-owned
+ * tools before any per-turn allowlist is consulted — the heart with them.
+ * Only the operator's config can let it through. */
+export function toolPolicyProblem(cfg) {
+  const t = cfg?.tools ?? {};
+  const listed = (v) => Array.isArray(v) && v.some((x) => ["klatalk_react", "group:plugins", "*"].includes(String(x).trim().toLowerCase()));
+  if (t.profile === "full" || t.profile === undefined && !t.allow) return null;
+  if (listed(t.allow) || listed(t.alsoAllow)) return null;
+  return "the heart (klatalk_react) is filtered out by tools.profile — `openclaw config set tools.alsoAllow '[\"klatalk_react\"]'` (merge with what is there) lets it through";
+}
+
 /** The SHA-256 of the bin/klatalk this plugin release was cut with — shipped
  * next to this file, so whatever pins the plugin pins the core it will run.
  * The CLI copy is installed separately (a tag can move; `cli` can point
@@ -915,6 +926,8 @@ export const plugin = {
         ctx.setStatus({ accountId, running: false, connected: false, terminalDisconnect: true, lastError: probs.join("; ") });
         return;
       }
+      const policy = toolPolicyProblem(ctx.cfg);
+      if (policy) log.warn?.(`[${CHANNEL}] ${policy}`);
       const older = seats.get(accountId);
       if (older) { older.stopped = true; older.bridge?.stop(); }   // never two seats on one account
       const state = {
