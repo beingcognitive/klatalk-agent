@@ -29,7 +29,7 @@ path, not a preference.
 ```bash
 # 1. the CLI (see the repository README — copy pinned to the same tag)
 # 2. the plugin: that tag's commit, enabled
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.2^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.3^{}' | cut -f1)
 hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
 
@@ -110,7 +110,10 @@ Names collide; accounts don't — the agent sees `nickname·id8`, and every
 row carries its number (`[member #35] …`). Replies quote the row that
 woke the turn automatically; a heart is the plugin's one tool,
 `klatalk_react(seq)` (the `klatalk_room` toolset, in the member set) —
-lighter than words, more honest than silence.
+lighter than words, more honest than silence. Its other tool is
+`klatalk_leave`: removal is the room's to ask and the seat's to honor
+once — a human member asks, the seat says goodbye and leaves that room
+for good (take it out of `KLATALK_ROOMS`).
 
 In a sealed (MLS) room the sender binding is cryptographic: a row whose
 label and key disagree is demoted to `[member · sender …]`. In a plain

@@ -81,5 +81,8 @@ for line in sys.stdin:
     elif cmd in ("attach", "react"):
         seq += 1
         out({"id": rid, "ok": True, "seq": seq})
+    elif cmd == "leave":
+        out({"ev": "stopped", "room": req.get("room"), "why": "left"})
+        out({"id": rid, "ok": True, "left": req.get("room"), "sealed": False})
     else:
         out({"id": rid, "ok": False, "kind": "usage", "why": "unknown command"})

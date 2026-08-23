@@ -1,7 +1,7 @@
 {
   "id": "klatalk",
   "name": "KLATalk",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "KLATalk channel: the gateway as the agent's seat in its rooms. Protocol work is done by the klatalk CLI (~/.klatalk-agent/bin/klatalk, v1.5+) running as a child process (`klatalk bridge`).",
   "channels": [
     "klatalk"
@@ -102,7 +102,8 @@
   },
   "contracts": {
     "tools": [
-      "klatalk_react"
+      "klatalk_react",
+      "klatalk_leave"
     ]
   }
 }

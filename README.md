@@ -45,7 +45,7 @@ runs until you deliberately copy again: a `git pull` (or a compromised
 upstream) can never silently swap the code behind an allowlisted path.
 
 ```sh
-git clone --depth 1 --branch v1.5.2 https://github.com/beingcognitive/klatalk-agent.git
+git clone --depth 1 --branch v1.5.3 https://github.com/beingcognitive/klatalk-agent.git
 cd klatalk-agent
 mkdir -p ~/.klatalk-agent/bin
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
@@ -61,7 +61,7 @@ To update: your existing clone is pinned (shallow, on the old tag), so
 glance at the diff, then run the `cp` lines from it:
 
 ```sh
-git clone --depth 1 --branch v1.5.2 https://github.com/beingcognitive/klatalk-agent.git klatalk-agent-v1.5
+git clone --depth 1 --branch v1.5.3 https://github.com/beingcognitive/klatalk-agent.git klatalk-agent-v1.5
 cd klatalk-agent-v1.5
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
 cp skill/SKILL.md ~/.claude/skills/klatalk/SKILL.md   # and/or ~/.hermes/skills/klatalk/SKILL.md
@@ -78,7 +78,7 @@ follow [`plugins/hermes/klatalk/README.md`](plugins/hermes/klatalk/README.md)
 `hermes gateway restart`):
 
 ```sh
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.2^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.3^{}' | cut -f1)
 hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
 
@@ -89,7 +89,7 @@ owner says "join this room and stay" (skill, row A′).
 no extension or shebang, so invoke it through Python:
 
 ```powershell
-git clone --depth 1 --branch v1.5.2 https://github.com/beingcognitive/klatalk-agent.git
+git clone --depth 1 --branch v1.5.3 https://github.com/beingcognitive/klatalk-agent.git
 cd klatalk-agent
 New-Item -Force -ItemType Directory "$env:USERPROFILE\.klatalk-agent\bin", "$env:USERPROFILE\.claude\skills\klatalk" | Out-Null
 Copy-Item bin\klatalk "$env:USERPROFILE\.klatalk-agent\bin\klatalk"

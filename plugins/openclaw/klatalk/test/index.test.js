@@ -78,7 +78,7 @@ async function seat({ events = [], cfgExtra = {}, record = {}, env = {} } = {}) 
   for (const k of Object.keys(process.env)) if (k.startsWith("FAKE_")) delete process.env[k];
   Object.assign(process.env, { FAKE_EVENTS: JSON.stringify(events), FAKE_LOG: logFile, FAKE_ARGS: argsFile, ...env });
   const cfg = { channels: { klatalk: { profile: "p", rooms: ["R1", "R2"], ownerUserId: "OWNER", toolRooms: ["R2"], cli: FAKE, python: "python3", ...cfgExtra } } };
-  entry.register({ runtime: { channel: fakeCore(record) }, registerChannel() {}, registerTool(f) { record.toolFactory = f; } });
+  entry.register({ runtime: { channel: fakeCore(record) }, registerChannel() {}, registerTool(f, o) { (record.tools ??= {})[o?.name] = f; record.toolFactory = record.tools.klatalk_react; } });
   const ac = new AbortController();
   const statuses = [], logs = [];
   const ctx = { cfg, accountId: "default", account: readAccount(cfg), abortSignal: ac.signal,
@@ -106,7 +106,7 @@ test("config: the env contract, with problems named", () => {
   assert.match(problems(readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", toolRooms: ["zz"], cli: FAKE } } })).join(" "), /toolRooms/);
   assert.match(problems(readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: "/nope/klatalk" } } })).join(" "), /not found/);
   const widened = readAccount({ channels: { klatalk: { profile: "p", rooms: ["a"], ownerUserId: "o", cli: FAKE, memberTools: ["web_search", "Exec", "apply-patch", "*", "s*", "GROUP:agents", "outlook__send"] } } });
-  assert.deepEqual(widened.memberTools, ["image", "klatalk_react", "web_search", "exec", "apply_patch", "*", "s*", "group:agents", "outlook__send"]);
+  assert.deepEqual(widened.memberTools, ["image", "klatalk_react", "klatalk_leave", "web_search", "exec", "apply_patch", "*", "s*", "group:agents", "outlook__send"]);
   const p = problems(widened).join("\n");
   assert.match(p, /memberTools: exec acts/); assert.match(p, /apply_patch acts/);
   assert.match(p, /\* is a wildcard/); assert.match(p, /s\* is a wildcard/); assert.match(p, /group:agents is a wildcard/); assert.match(p, /outlook__send is a wildcard/);
@@ -117,7 +117,8 @@ test("the global tool profile must let the heart through", () => {
   assert.equal(toolPolicyProblem({}), null);                                   // no profile, no allow: everything
   assert.equal(toolPolicyProblem({ tools: { profile: "full" } }), null);
   assert.match(toolPolicyProblem({ tools: { profile: "coding" } }) ?? "", /alsoAllow/);
-  assert.equal(toolPolicyProblem({ tools: { profile: "coding", alsoAllow: ["klatalk_react"] } }), null);
+  assert.match(toolPolicyProblem({ tools: { profile: "coding", alsoAllow: ["klatalk_react"] } }) ?? "", /klatalk_leave filtered/);
+  assert.equal(toolPolicyProblem({ tools: { profile: "coding", alsoAllow: ["klatalk_react", "klatalk_leave"] } }), null);
   assert.equal(toolPolicyProblem({ tools: { profile: "coding", alsoAllow: ["group:plugins"] } }), null);
   assert.match(toolPolicyProblem({ tools: { allow: ["read"] } }) ?? "", /alsoAllow/);
 });
@@ -372,6 +373,18 @@ test("the heart: a per-session tool that reacts in the session's room only", asy
   await assert.rejects(tool.execute("t3", { seq: 0 }));
   const other = s.record.toolFactory({ sessionKey: "agent:main:klatalk:group:R9", agentAccountId: "default" });
   await assert.rejects(other.execute("t4", { seq: 1 }));
+  await s.stop();
+});
+
+test("leaving: the room's to ask, the seat's to honor once — the room stops for good", async () => {
+  const s = await seat();
+  await until(() => s.statuses.some((st) => st.connected === true));
+  assert.ok(MEMBER_TOOLS.includes("klatalk_leave"));
+  const tool = s.record.tools.klatalk_leave({ sessionKey: "agent:main:klatalk:group:R1", agentAccountId: "default" });
+  const r = await tool.execute("t1", { asked_by: "Human·H" });
+  assert.equal(r.content[0].text, "left the room");
+  assert.equal(s.cmds().find((c) => c.cmd === "leave").room, "R1");
+  assert.ok(s.logs.some((l) => /left room R1 at the request of Human·H/.test(l)));
   await s.stop();
 });
 

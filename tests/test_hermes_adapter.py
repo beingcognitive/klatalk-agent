@@ -848,6 +848,21 @@ class TestHeart(AdapterBase):
         self.assertIn("only inside a KLATalk", self.run_async(self.A._react_tool({"seq": 1})))
         self.assertEqual(len(sent), 2)
 
+    def test_leaving_is_the_rooms_to_ask_and_stops_the_room_for_good(self):
+        self.assertIn("klatalk_leave", [t["name"] for t in FakeCtx.tools])
+        left = []
+        self.core.leave_room = lambda creds, profile, rid: left.append(rid) or True
+        env = {"HERMES_SESSION_PLATFORM": "klatalk", "HERMES_SESSION_CHAT_ID": self.ROOM}
+        self.A._session_env = lambda name, default="": env.get(name, default)
+        with self.assertLogs("klatalk.adapter", level="WARNING"):
+            out = self.run_async(self.A._leave_tool({"asked_by": "Guest·other-us"}))
+        self.assertIn("left the room", out)
+        self.assertIn("leaf stays", out)
+        self.assertEqual(left, [self.ROOM])
+        self.assertIn(self.ROOM, self.adapter._stopped)
+        env["HERMES_SESSION_CHAT_ID"] = "elsewhere"
+        self.assertIn("not one of this seat's rooms", self.run_async(self.A._leave_tool({"asked_by": "x"})))
+
 
 class TestSecurityAudit(AdapterBase):
     """2026-08-23 open-source security audit (Codex ×3 + Opus ×3): every

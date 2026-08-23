@@ -2807,6 +2807,14 @@ class TestBridge(Base):
         self.assertIsNone(calls[-1][4])
         h({"id": "7", "cmd": "react", "room": "R1", "seq": 35, "action": "unlike"})
         self.assertEqual(b.out[-1]["kind"], "usage")
+        # leaving stops the room for good and says so
+        left = []
+        c.leave_room = lambda creds, profile, rid: left.append(rid) or False
+        h({"id": "8", "cmd": "leave", "room": "R1"})
+        self.assertEqual(left, ["R1"])
+        self.assertIn("R1", b.stopped)
+        self.assertEqual(b.out[-2], {"ev": "stopped", "room": "R1", "why": "left"})
+        self.assertEqual(b.out[-1], {"id": "8", "ok": True, "left": "R1", "sealed": False})
 
     def test_fetch_writes_a_fresh_private_file_only(self):
         b = self._bridge()

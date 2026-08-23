@@ -60,7 +60,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.5.2"
+__version__ = "1.5.3"
 
 
 # ---- library surface (core-v1.4) ----
@@ -2402,17 +2402,24 @@ def cmd_invites(args):
               f" · expires {clean(str(i.get('expires_at')))}{mine}")
 
 
-def cmd_leave(args):
-    profile = profile_name(args)
-    creds = load_creds(profile)
-    sealed = is_sealed(get_room(creds, args.room))
-    status, data = rest("POST", room_path(args.room, "/leave"), {},
+def leave_room(creds, profile, room_id):
+    """Leave a room on the server and, for a sealed one, fold every local
+    trace (leaving them behind dead-ends the re-invite — impl /133 3/6).
+    Returns True when the room was sealed (the leaf stays until a phone
+    removes it)."""
+    sealed = is_sealed(get_room(creds, room_id))
+    status, data = rest("POST", room_path(room_id, "/leave"), {},
                         creds["access_token"])
     die_on(status, data)
     if sealed:
-        # Leaving without folding local state dead-ends the re-invite on a
-        # stale group and a frozen desync marker (impl /133 3/6)
-        forget_room(creds, profile, args.room)
+        forget_room(creds, profile, room_id)
+    return sealed
+
+
+def cmd_leave(args):
+    profile = profile_name(args)
+    creds = load_creds(profile)
+    if leave_room(creds, profile, args.room):
         print("note: your cryptographic leaf stays in the tree until a"
               " phone removes it — ask in the room to be removed.",
               file=sys.stderr)
@@ -4193,6 +4200,18 @@ class Bridge:
             sent = await send_message(self.creds, self.profile, room, payload,
                                       read_through=None)
             return {"seq": sent}
+        if cmd == "leave":
+            # removal is the room's to ask and the seat's to honor once:
+            # leave on the server, fold sealed state, stop this room's loop
+            await self.room_for(room_id)
+            sealed = await asyncio.to_thread(leave_room, self.creds, self.profile, room_id)
+            self.stopped.add(room_id)
+            self.cache.pop(room_id, None)
+            task = self.tasks.get(room_id)
+            if task:
+                task.cancel()
+            await self.emit({"ev": "stopped", "room": room_id, "why": "left"})
+            return {"left": room_id, "sealed": sealed}
         if cmd == "roster":
             room = await self.room_for(room_id, fresh=bool(req.get("fresh")))
             return {"name": clean(room.get("name") or ""), "sealed": is_sealed(room),
@@ -4440,7 +4459,7 @@ def build_parser():
                         " carry wake=false (budget_spent=true); the owner is"
                         " never budgeted")
     s.epilog = ("stdio host for non-Python harnesses: events on stdout, commands"
-                " (send/read/fetch/attach/react/roster) on stdin, one JSON object"
+                " (send/read/fetch/attach/react/leave/roster) on stdin, one JSON object"
                 " per line — see plugins/openclaw")
     return p
 
