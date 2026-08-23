@@ -1,0 +1,3 @@
+# the core is verified by digest (plugins/*/core.sha256): never re-encode it on checkout
+bin/klatalk -text
+plugins/*/klatalk/core.sha256 -text

@@ -2817,7 +2817,8 @@ class TestBridge(Base):
         h({"id": "1", "cmd": "fetch", "room": "R1", "url": "/uploads/R1/a.jpg",
            "max_bytes": 10, "out": out})
         self.assertEqual((b.out[-1]["ok"], b.out[-1]["bytes"]), (True, 3))
-        self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
+        if os.name != "nt":                        # Windows has no POSIX modes
+            self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
         h({"id": "2", "cmd": "fetch", "room": "R1", "url": "/uploads/R1/a.jpg",
            "max_bytes": 10, "out": out})
         self.assertFalse(b.out[-1]["ok"])          # never over an existing file
