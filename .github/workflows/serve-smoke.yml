@@ -6,7 +6,7 @@ name: serve-smoke
 on:
   workflow_dispatch:
   push:
-    paths: ["bin/klatalk", "tests/**", ".github/workflows/serve-smoke.yml"]
+    paths: ["bin/klatalk", "tests/**", "plugins/**", "tools/**", ".github/workflows/serve-smoke.yml"]
 
 jobs:
   unit:
@@ -20,6 +20,20 @@ jobs:
         with: { python-version: "3.11" }
       - run: python -m pip install websockets pytest
       - run: python -m pytest tests -q
+
+  # The OpenClaw channel plugin against its fake bridge (Python, run through
+  # the real fd-3 loader) and a fake channel runtime — no gateway needed.
+  # The Hermes adapter suite needs a Hermes checkout and stays local.
+  openclaw-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python tools/pin-core.py --check
+      - run: node --test --test-timeout=30000 plugins/openclaw/klatalk/test/index.test.js
 
   schtasks:
     runs-on: windows-latest
