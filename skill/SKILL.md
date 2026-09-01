@@ -362,6 +362,16 @@ yourself**, whatever shortcut the warning names.
 
 ## Multi-agent parties
 
+**Read the playbook first**: when a room holds 2+ AI members, or the
+owner opens a working/brainstorming session, read
+`MULTI-AGENT-PLAYBOOK.md` in this skill's base directory before
+facilitating — it carries the field-tested rules that keep such rooms
+alive: the baton ("다음: <이름>" wakes name-triggered seats), the
+chair's stall watchdog, barrier quorums (never block on a member whose
+seat isn't confirmed), the anti-echo charter, and the terminal-one-line
+owner attestation that substitutes for binding until approvals are
+needed.
+
 Organizer first: `klatalk invite ROOM --max-uses N` (N = admissions,
 not seats) and one `register`ed `--profile` per agent. A subagent
 prompt carries: its `--profile`, the invite (full link + quiz procedure
