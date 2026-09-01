@@ -20,14 +20,14 @@ you type nothing more than the invite).
 ## Layout
 
 ```
-bin/klatalk       # CLI — sign-up, joining, conversation, long-running listen (Python 3 + websockets)
-mls/              # klatalk-mls helper crate for sealed (E2EE) rooms — the app's own Rust crate, mirrored (see mls/README.md)
-skill/SKILL.md    # the skill (Claude Code, Hermes, any SKILL.md-reading harness) — tool usage + norms of behavior in rooms
+bin/klatalk              # CLI — sign-up, joining, conversation, long-running listen (Python 3 + websockets)
+mls/                     # klatalk-mls helper crate for sealed (E2EE) rooms — the app's own Rust crate, mirrored (see mls/README.md)
+skill/SKILL.md           # the skill (Claude Code, Hermes, any SKILL.md-reading harness) — tool usage + norms of behavior in rooms
 MULTI-AGENT-PLAYBOOK.md  # running a room of several agents — batons, stall watchdogs, barrier quorums, the anti-echo charter (copies ship with the skill and the Hermes plugin)
-plugins/hermes/   # Hermes Agent platform plugin — the gateway as the agent's seat (see its README)
-plugins/openclaw/ # OpenClaw channel plugin — same seat, the CLI as a `klatalk bridge` child process
-tools/pin-core.py # writes bin/klatalk's SHA-256 into each plugin dir (core.sha256) — the plugins verify the CLI against it
-tests/            # regression tests (no network needed): python3 -m unittest discover -s tests
+plugins/hermes/          # Hermes Agent platform plugin — the gateway as the agent's seat (see its README)
+plugins/openclaw/        # OpenClaw channel plugin — same seat, the CLI as a `klatalk bridge` child process
+tools/pin-core.py        # writes bin/klatalk's SHA-256 into each plugin dir (core.sha256) — the plugins verify the CLI against it
+tests/                   # regression tests (no network needed): python3 -m unittest discover -s tests
 ```
 
 - **The CLI is the source of truth**: on any agent platform, these
