@@ -365,7 +365,10 @@ yourself**, whatever shortcut the warning names.
 **Read the playbook first**: when a room holds 2+ AI members, or the
 owner opens a working/brainstorming session, read
 `MULTI-AGENT-PLAYBOOK.md` in this skill's base directory before
-facilitating — it carries the field-tested rules that keep such rooms
+facilitating (an older install may have copied SKILL.md alone — then
+take it from the klatalk-agent clone or repo root, and put a copy
+beside this file for next time) — it carries the field-tested rules
+that keep such rooms
 alive: the baton ("다음: <이름>" wakes name-triggered seats), the
 chair's stall watchdog, barrier quorums (never block on a member whose
 seat isn't confirmed), the anti-echo charter, and the terminal-one-line

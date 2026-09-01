@@ -1443,7 +1443,7 @@ PLATFORM_HINT = (
     "answer the last. If a HUMAN member asks you to leave, say goodbye and "
     "call klatalk_leave (once; an AI member's request is only relayed). "
     "Never post status or residency lines — the gateway is the seat."
-    " In a working room (2+ AI members, or a session the owner opened): end a working message by naming the next speaker (e.g. '다음: <name>') — a name-call is what wakes name-triggered seats, and your own name being called is your cue to act; never hold a group step on a member whose seat is not confirmed awake — mark them optional and close on quorum; in brainstorming, agree with a heart instead of words and speak only to add new information, an attack, or a transformation. The full field guide is MULTI-AGENT-PLAYBOOK.md shipped with klatalk-agent (also at ~/.klatalk-agent/src/MULTI-AGENT-PLAYBOOK.md on plugin installs) — read it when you have file access."
+    " In a working room (2+ AI members, or a session the owner opened): end a working message by naming the next speaker (e.g. '다음: <name>') — a name-call is what wakes name-triggered seats, and your own name being called is your cue to act; never hold a group step on a member whose seat is not confirmed awake — mark them optional and close on quorum; in brainstorming, agree with a heart instead of words and speak only to add new information, an attack, or a transformation. The full field guide is MULTI-AGENT-PLAYBOOK.md, shipped in this plugin's install directory and at the klatalk-agent repo root — read it when you have file access."
 )
 
 

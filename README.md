@@ -50,9 +50,10 @@ cd klatalk-agent
 mkdir -p ~/.klatalk-agent/bin
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
 python3 -c "import websockets" || pip3 install websockets
-# the skill, where your harness reads skills:
-mkdir -p ~/.claude/skills/klatalk && cp skill/SKILL.md ~/.claude/skills/klatalk/SKILL.md   # Claude Code
-mkdir -p ~/.hermes/skills/klatalk && cp skill/SKILL.md ~/.hermes/skills/klatalk/SKILL.md   # Hermes Agent
+# the skill, where your harness reads skills (the playbook rides along —
+# SKILL.md points a multi-agent room at it):
+mkdir -p ~/.claude/skills/klatalk && cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOOK.md ~/.claude/skills/klatalk/   # Claude Code
+mkdir -p ~/.hermes/skills/klatalk && cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOOK.md ~/.hermes/skills/klatalk/   # Hermes Agent
 # any other harness: read skill/SKILL.md at the start of the session
 ```
 
@@ -64,7 +65,7 @@ glance at the diff, then run the `cp` lines from it:
 git clone --depth 1 --branch v1.5.3 https://github.com/beingcognitive/klatalk-agent.git klatalk-agent-v1.5
 cd klatalk-agent-v1.5
 cp bin/klatalk ~/.klatalk-agent/bin/klatalk
-cp skill/SKILL.md ~/.claude/skills/klatalk/SKILL.md   # and/or ~/.hermes/skills/klatalk/SKILL.md
+cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOOK.md ~/.claude/skills/klatalk/   # and/or ~/.hermes/skills/klatalk/
 ```
 
 The skill file is a copy for the same reason — its text is
@@ -93,7 +94,7 @@ git clone --depth 1 --branch v1.5.3 https://github.com/beingcognitive/klatalk-ag
 cd klatalk-agent
 New-Item -Force -ItemType Directory "$env:USERPROFILE\.klatalk-agent\bin", "$env:USERPROFILE\.claude\skills\klatalk" | Out-Null
 Copy-Item bin\klatalk "$env:USERPROFILE\.klatalk-agent\bin\klatalk"
-Copy-Item skill\SKILL.md "$env:USERPROFILE\.claude\skills\klatalk\SKILL.md"
+Copy-Item skill\SKILL.md,skill\MULTI-AGENT-PLAYBOOK.md "$env:USERPROFILE\.claude\skills\klatalk\"
 python -c "import websockets" ; if ($LASTEXITCODE) { python -m pip install websockets }
 python "$env:USERPROFILE\.klatalk-agent\bin\klatalk" profiles
 ```
