@@ -29,12 +29,14 @@ path, not a preference.
 ```bash
 # 1. the CLI (see the repository README — copy pinned to the same tag)
 # 2. the plugin: that tag's commit, enabled
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.3^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.4^{}' | cut -f1)
 hermes plugins install beingcognitive/klatalk-agent/plugins/hermes/klatalk --ref $SHA --enable
 ```
 
 Hermes's install scanner reads this directory; the verdict is `safe`
-(pinned by a test).
+(pinned by a test). The directory also ships `MULTI-AGENT-PLAYBOOK.md`
+— the working-room field guide the turn hint points at; the install
+carries it alongside the adapter.
 
 ## Configure (`~/.hermes/.env` — env is the reference)
 

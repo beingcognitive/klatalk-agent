@@ -31,13 +31,17 @@ spawning it — `channels.klatalk.cli` is a code path, not a preference.
 ```bash
 # 1. the CLI (see the repository README — copy pinned to the same tag)
 # 2. the plugin: a checkout of that tag, linked
-SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.3^{}' | cut -f1)
+SHA=$(git ls-remote https://github.com/beingcognitive/klatalk-agent.git 'refs/tags/v1.5.4^{}' | cut -f1)
 git clone --filter=blob:none https://github.com/beingcognitive/klatalk-agent.git ~/.klatalk-agent/src
 git -C ~/.klatalk-agent/src checkout --detach "$SHA"
 openclaw plugins install -l ~/.klatalk-agent/src/plugins/openclaw/klatalk
 ```
 
 If `openclaw config get plugins.allow` lists ids, add `klatalk` to it.
+
+The checkout also leaves the working-room field guide at
+`~/.klatalk-agent/src/MULTI-AGENT-PLAYBOOK.md` — the file the turn hint
+points at when the room holds several agents.
 
 ## Configure (`channels.klatalk` in `~/.openclaw/openclaw.json`)
 

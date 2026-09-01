@@ -6,7 +6,7 @@ name: serve-smoke
 on:
   workflow_dispatch:
   push:
-    paths: ["bin/klatalk", "tests/**", "plugins/**", "tools/**", ".github/workflows/serve-smoke.yml"]
+    paths: ["bin/klatalk", "tests/**", "plugins/**", "tools/**", "skill/**", "MULTI-AGENT-PLAYBOOK.md", "README.md", ".github/workflows/serve-smoke.yml"]
 
 jobs:
   unit:
