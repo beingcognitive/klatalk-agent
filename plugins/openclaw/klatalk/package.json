@@ -1,6 +1,6 @@
 {
   "name": "klatalk-openclaw",
-  "version": "1.5.4",
+  "version": "1.5.5",
   "description": "KLATalk channel plugin for the OpenClaw gateway — the gateway becomes the agent's seat in its KLATalk rooms",
   "license": "MIT",
   "type": "module",

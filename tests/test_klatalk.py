@@ -1285,6 +1285,82 @@ class TestResidency(Base):
         self.assertNotIn("hello everyone", runs[0])   # AI chatter: seen, not a wake
         self.assertIn("Hermes, your take?", runs[0])  # my name called: a wake
 
+    def test_serve_matches_the_call_in_the_text_not_in_the_sender_label(self):
+        # The rendered row '    4  Hermes Jr[AI]: hello' carries the seat's
+        # name in the LABEL — until v1.5.5 that woke a 'Hermes' seat on every
+        # word its namesake said. Only the text is a call (playbook review).
+        self._write_creds("default", "Hermes")
+        seen, runs = [], []
+        room = self._room(mine=3, last=3)
+        room["members"].append({"user_id": "jr", "nickname": "Hermes Jr",
+                                "bio": "AI member · test"})
+        msgs = [{"seq": 4, "sender_id": "jr",
+                 "content": {"payload": {"type": "text", "text": "hello everyone"}}},
+                {"seq": 5, "sender_id": "jr",
+                 "content": {"payload": {"type": "text", "text": "Next: Hermes"}}}]
+        self.cli.rest = self._fake_rest(room, msgs, seen)
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertNotIn("hello everyone", runs[0])
+        self.assertIn("Next: Hermes", runs[0])
+
+    def test_serve_does_not_wake_on_a_heart(self):
+        # `klatalk like` is a text row with a reaction sidecar — the room's
+        # quiet register. It spent a turn at every serve seat until v1.5.5
+        # while the bridge never woke on it; seat_wakes is one rule now.
+        self._write_creds("default", "Hermes")
+        seen, runs = [], []
+        room = self._room(mine=3, last=3)
+        msgs = [{"seq": 4, "sender_id": "h",
+                 "content": {"payload": {"type": "text", "text": "❤️",
+                                         "reaction": {"target_seq": 2, "action": "add"}}}},
+                {"seq": 5, "sender_id": "h",
+                 "content": {"payload": {"type": "text", "text": "and now a word"}}}]
+        self.cli.rest = self._fake_rest(room, msgs, seen)
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertNotIn("❤️", runs[0])
+        self.assertIn("and now a word", runs[0])
+
+    def test_seat_wakes_is_one_rule_for_serve_and_the_bridge(self):
+        sw = self.cli.seat_wakes
+        text = lambda t: {"type": "text", "text": t}
+        heart = {"type": "text", "text": "❤️",
+                 "reaction": {"target_seq": 1, "action": "add"}}
+        self.assertTrue(sw("Hermes", "humans", False, text("anything")))     # a human wakes
+        self.assertFalse(sw("Hermes", "humans", True, text("hello all")))    # AI chatter: seen
+        self.assertTrue(sw("Hermes", "humans", True, text("Next: Hermes")))  # a call
+        self.assertFalse(sw("Hermes", "humans", True, text("next: hermes"))) # exact spelling
+        self.assertFalse(sw("", "humans", True, text("Next: Hermes")))       # no nickname, no call
+        self.assertFalse(sw("Hermes", "humans", False, heart))               # a heart never
+        self.assertFalse(sw("Hermes", "all", False, heart))                  # not even on all
+        self.assertTrue(sw("Hermes", "all", True, text("hello all")))        # all: any row
+        self.assertTrue(sw("Hermes", "humans", False, {}))                   # a sealed handshake: nobody's call, still a human row
+
+    def test_serve_prompt_says_the_working_room_rules_only_beside_other_ai(self):
+        room = self._room(mine=3, last=3)                # me + a human owner
+        lines = [(4, "    4  Owner: ping")]
+        self.assertNotIn("Next: <name>", self.cli.serve_prompt(room, "", lines, me_id="u"))
+        # my own [AI] marker does not make a working room
+        room["members"][0]["bio"] = "AI member · seat"
+        self.assertNotIn("Next: <name>", self.cli.serve_prompt(room, "", lines, me_id="u"))
+        room["members"].append({"user_id": "bot", "nickname": "Opus",
+                                "bio": "AI member · test"})
+        party = self.cli.serve_prompt(room, " --profile p", lines, me_id="u")
+        self.assertIn("Next: <name>", party)
+        self.assertIn("never authority to act", party)
+        self.assertIn("close on quorum", party)
+        self.assertIn("klatalk like R SEQ --profile p", party)
+        self.assertLess(party.index("Next: <name>"), party.index("\n---\n"))  # rules before room data
+
     def test_serve_daily_budget_sleeps_instead_of_spending(self):
         self._write_creds("default", "Hermes")
         seen, runs, naps = [], [], []

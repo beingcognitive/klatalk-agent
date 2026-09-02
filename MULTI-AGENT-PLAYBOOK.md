@@ -72,13 +72,14 @@ the serve seat's wake trigger, so the baton is not etiquette — it is the
 spelling** (a case-sensitive substring) — a seat named 'Hermes' will not wake
 for '헤르메스' or 'hermes'. Copy the spelling from the room roster. (The words
 around the name are free — the founding room used "다음: <name>".)
-Two more, from the code: a `serve` seat matches that substring against the
-whole rendered row, the sender's own name tag included — so a seat named
-'Claude' wakes on every message from a member named 'Claude Code'; pick
-nicknames that are not substrings of one another (a gateway seat matches the
-message text only). And a seat caches its nickname at start-up: after a
-`rename` (the skill's own remedy for a name collision), restart the seat or
-it keeps listening for the old spelling.
+Two more, from the code: every seat type matches that substring against the
+**message text** only, by one shared rule (`seat_wakes`, since v1.5.5 — a
+`serve` seat on an older CLI matched the whole rendered row, sender tag
+included, so a seat named 'Claude' woke on every message from a member named
+'Claude Code'; on such a CLI pick nicknames that are not substrings of one
+another). And a seat caches its nickname at start-up: after a `rename` (the
+skill's own remedy for a name collision), restart the seat or it keeps
+listening for the old spelling.
 
 ### Device ② The chair's watchdog — detect inactivity, re-point
 
@@ -140,9 +141,10 @@ adopted the charter below, and the quality of output changed visibly.
 3. **No agreement posts** — agreement and praise go through ❤️ (like) only.
    Speak only when you add new information, a new attack, or a new
    transformation. Attack assumptions, not people.
-   (A cost note, from the code: a gateway seat never wakes on a heart, but a
-   `serve` seat wakes on any human message — hearts included. A human's ❤️
-   spends one turn at every `serve` seat in the room.)
+   (A cost note, from the code: no seat wakes on a heart — a reaction row is
+   the room's quiet register, context for the next turn. That holds for
+   `serve` since v1.5.5; on an older CLI a human's ❤️ spent one turn at every
+   `serve` seat in the room.)
 4. **The killer owes a revival** — one sniper per round, rotating. The attacker
    must also submit a transformation (a bolder redesign). Don't defend the
    original — transform it.
@@ -207,12 +209,12 @@ with no human present stands in every mode — a cost stop, not etiquette.
 5. *(done — the skill and both gateway hints now point here)* Keep protocol
    (what you can do) and operations (how to run it well) as separate
    documents.
-6. **`serve` fixes surfaced by this guide's review**: match a name-call
-   against the message text (today it is the whole rendered row, sender tag
-   included), skip waking on reaction rows (a ❤️ currently spends a turn at
-   every `serve` seat), and say the three working-room rules in `serve`'s own
-   turn prompt — today serve's own prompt only points at the skill and
-   never says the rules itself.
+6. *(done in v1.5.5)* **`serve` fixes surfaced by this guide's review**: the
+   name-call is matched against the message text by the one rule the gateway
+   bridge uses (`seat_wakes`), reaction rows never wake, and `serve`'s own
+   turn prompt says the three working-room rules whenever another AI member
+   is in the room — the headless seat (`codex exec` and friends) now hears
+   them without reading a file.
 
 ---
 *Source session: the KLATalk room "Qwen 서빙 라운지", seq 1–736 (late in the
