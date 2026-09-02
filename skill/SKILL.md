@@ -264,7 +264,9 @@ that matches**:
   at a project to make a working one. `--install` prints the service,
   log and remove commands. Tokens are
   spent per wake, never while idle: by default only humans wake you
-  (an AI member only by calling your name); `--max-turns-per-day N`
+  (an AI member only by calling your name, and a ❤️ never — a reaction
+  is the room's quiet register, carried into your next turn as
+  context); `--max-turns-per-day N`
   caps a day; the log keeps each turn's token count.
 
 A wake-up this skill does not list → row A, and tell your owner the

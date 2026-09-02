@@ -69,7 +69,35 @@ def _js_hint():
     return "".join(parts)
 
 
+def _serve_rules():
+    """The working-room clause serve_prompt splices in (bin/klatalk) — the
+    third host of the same rules, worded for a seat that can only run the
+    CLI."""
+    m = re.search(r'working = \("" if not others_ai else\n([\s\S]*?)\)\n',
+                  _read("bin/klatalk"))
+    assert m, "the serve working-room clause moved — teach this test"
+    return "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)))
+
+
+# What every host must say, whatever its wording: the baton by exact
+# nickname, a call is a cue (not authority), the ownerless stop, quorum
+# over an unconfirmed seat, hearts for agreement, speak only to add.
+WORKING_ROOM_RULES = (
+    "exact roster nickname", "Next: <name>", "your owner", "cue to",
+    "five turns", "close on quorum", "agree with a heart",
+    "new information, an attack, or a transformation",
+)
+
+
 class TestPlaybookSync(unittest.TestCase):
+    def test_serve_says_the_same_working_room_rules_as_the_gateways(self):
+        # three hosts, one rule set — serve's prose is its own (it names the
+        # CLI command and cannot point at a file), but no rule may go missing
+        serve, hint = _serve_rules(), _py_hint()
+        for rule in WORKING_ROOM_RULES:
+            self.assertIn(rule, serve, f"serve's paragraph lost: {rule}")
+            self.assertIn(rule, hint, f"the gateway hint lost: {rule}")
+
     def test_every_shipped_playbook_copy_is_byte_identical(self):
         found = _found_copies()
         self.assertEqual(found, EXPECTED_COPIES,

@@ -1308,10 +1308,13 @@ class TestResidency(Base):
         self.assertNotIn("hello everyone", runs[0])
         self.assertIn("Next: Hermes", runs[0])
 
-    def test_serve_does_not_wake_on_a_heart(self):
+    def test_serve_does_not_wake_on_a_heart_but_the_turn_still_sees_it(self):
         # `klatalk like` is a text row with a reaction sidecar — the room's
         # quiet register. It spent a turn at every serve seat until v1.5.5
-        # while the bridge never woke on it; seat_wakes is one rule now.
+        # while the bridge never woke on it; seat_wakes is one rule now. And
+        # like the gateway, the row rides into the next woken turn as
+        # context — dropped, the agreement channel the prompt hands the seat
+        # would be unreadable and the read mark would cover an unseen row.
         self._write_creds("default", "Hermes")
         seen, runs = [], []
         room = self._room(mine=3, last=3)
@@ -1326,9 +1329,91 @@ class TestResidency(Base):
             self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
                                            turn_timeout=1, wake_on="humans",
                                            max_turns_per_day=None))
-        self.assertEqual(len(runs), 1)
-        self.assertNotIn("❤️", runs[0])
+        self.assertEqual(len(runs), 1)                 # the heart opened no turn of its own
+        self.assertIn("❤️", runs[0])                   # …but rides along as context
         self.assertIn("and now a word", runs[0])
+        self.assertLess(runs[0].index("❤️"), runs[0].index("and now a word"))
+        self.assertIn("klatalk read R 5", runs[0])     # the mark covers what was seen
+
+    def test_serve_on_all_still_does_not_spend_a_turn_on_a_heart(self):
+        # the intended change: a reaction never wakes, under either mode —
+        # end to end through accept, not only the seat_wakes unit
+        self._write_creds("default", "Hermes")
+        seen, runs = [], []
+        room = self._room(mine=3, last=3)
+        msgs = [{"seq": 4, "sender_id": "h",
+                 "content": {"payload": {"type": "text", "text": "❤️",
+                                         "reaction": {"target_seq": 2, "action": "add"}}}},
+                {"seq": 5, "sender_id": "h",
+                 "content": {"payload": {"type": "text", "text": "a word"}}}]
+        self.cli.rest = self._fake_rest(room, msgs, seen)
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="all",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertIn("❤️", runs[0])                   # context, not a wake
+
+    def test_serve_in_a_sealed_room_survives_a_handshake_and_a_bad_plaintext(self):
+        # a handshake ledger record has no payload at all; a peer's sealed
+        # plaintext is JSON the SENDER chose — json.loads hands back a str
+        # without raising, and one such row used to kill every reader of the
+        # room for good (review round, 4 of 7)
+        self._write_creds("default", "Hermes")
+        room = self._room(mine=3, last=7)
+        room["encryption_mode"] = "mls10"
+        room["members"].append({"user_id": "bot", "nickname": "Opus",
+                                "bio": "AI member · test"})
+        self.cli.rest = lambda m, p, body=None, token=None: (200, {"rooms": [room]})
+        self.cli.sealed_pump = lambda creds, profile, rid: []
+        self.cli.ledger_read = lambda profile, rid: [
+            {"seq": 4, "kind": "handshake", "sender_id": "h", "added": ["dev1"], "removed": []},
+            {"seq": 5, "kind": "handshake", "sender_id": "bot", "added": ["dev2"], "removed": []},
+            {"seq": 6, "kind": "application", "sender_id": "bot",
+             "payload": {"type": "text", "text": "hi all"}},
+            {"seq": 7, "kind": "application", "sender_id": "h", "payload": "just a string"}]
+        runs = []
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertIn("membership change dev1", runs[0])     # a human's row: a wake
+        self.assertNotIn("membership change dev2", runs[0])  # a bot's: seen only
+        self.assertNotIn("hi all", runs[0])                  # AI chatter: seen only
+        self.assertIn("[unreadable payload]", runs[0])       # a human's bad row: no crash
+        self.assertIn("Next: <name>", runs[0])               # Opus[AI] in the roster
+
+    def test_serve_reads_the_roster_at_the_wake_not_at_the_last_turn(self):
+        # a member who joined while the seat blocked, and spoke first, is
+        # exactly the member the working-room rules exist for
+        self._write_creds("default", "Hermes")
+        seen, runs = [], []
+        stale = self._room(mine=3, last=3)
+        fresh = self._room(mine=3, last=3)
+        fresh["members"].append({"user_id": "bot", "nickname": "Opus",
+                                 "bio": "AI member · test"})
+        calls = {"rooms": 0}
+        msgs = [{"seq": 4, "sender_id": "bot",
+                 "content": {"payload": {"type": "text", "text": "Idea X. Next: Hermes"}}}]
+        inner = self._fake_rest(fresh, msgs, seen)
+
+        def rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":
+                calls["rooms"] += 1
+                return 200, {"rooms": [stale if calls["rooms"] == 1 else fresh]}
+            return inner(method, path, body, token)
+        self.cli.rest = rest
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertIn("Opus[AI] (bot)", runs[0])        # the roster the turn sees is live
+        self.assertIn("Next: <name>", runs[0])          # …and so is the working-room verdict
 
     def test_seat_wakes_is_one_rule_for_serve_and_the_bridge(self):
         sw = self.cli.seat_wakes
@@ -1352,6 +1437,11 @@ class TestResidency(Base):
         # my own [AI] marker does not make a working room
         room["members"][0]["bio"] = "AI member · seat"
         self.assertNotIn("Next: <name>", self.cli.serve_prompt(room, "", lines, me_id="u"))
+        # a caller that cannot name the seat gets no paragraph by mistaking
+        # the seat's own marker for company — the id is not optional
+        with self.assertRaises(TypeError):
+            self.cli.serve_prompt(room, "", lines)
+        self.assertNotIn("Next: <name>", self.cli.serve_prompt(room, "", lines, me_id=None))
         room["members"].append({"user_id": "bot", "nickname": "Opus",
                                 "bio": "AI member · test"})
         party = self.cli.serve_prompt(room, " --profile p", lines, me_id="u")
@@ -2765,8 +2855,8 @@ class TestBridge(Base):
         run(self._msg("H", "gone", deleted=True))
         run({"kind": "message", "seq": 9, "sender_id": "H",
              "payload": {"type": "system", "text": "x"}, "own": False})
-        self.assertEqual(len(b.out), n + 1)       # the system row is data, not a wake
-        self.assertFalse(b.out[-1]["wake"] and False)
+        self.assertEqual(len(b.out), n + 1)       # own and deleted rows emit nothing
+        self.assertTrue(b.out[-1]["wake"])         # a human's system row wakes like any human row
         b2 = self._bridge(wake_on="all")
         asyncio.run(b2.on_event("R1", self._msg("A", "hi")))
         self.assertTrue(b2.out[-1]["wake"])

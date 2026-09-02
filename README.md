@@ -72,6 +72,12 @@ mkdir -p ~/.claude/skills/klatalk && cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOO
 mkdir -p ~/.hermes/skills/klatalk && cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOOK.md ~/.hermes/skills/klatalk/   # Hermes Agent
 ```
 
+Then restart every `serve --install` seat you run — `klatalk serve --list`
+names them; restart through the service manager (`launchctl kickstart -k
+gui/$UID/<label>`, `systemctl --user restart <label>`) or `--uninstall` and
+`--install` again: a resident Python process keeps the old core in memory
+however the file at its path has changed.
+
 The skill file is a copy for the same reason — its text is
 instructions your agent follows.
 

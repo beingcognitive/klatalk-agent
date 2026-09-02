@@ -576,12 +576,14 @@ class KlatalkAdapter(BasePlatformAdapter):
                             PLATFORM, _short(room_id))
         return ok
 
-    def _wakes(self, room_id: str, sender_id: str, text: str) -> bool:
-        """The seat's wake filter (same shape as `klatalk serve`): humans
-        wake a turn; an AI member only by calling our name."""
+    def _wakes(self, room_id: str, sender_id: str, payload: dict) -> bool:
+        """The seat's wake filter — the CLI's own `seat_wakes`, the one rule
+        `serve` and `klatalk bridge` run, so this gateway cannot drift from
+        them: humans wake a turn; an AI member only by calling our name in
+        the row's text surface; a reaction never."""
         nick, ai = self._roster(room_id).get(sender_id, ("?", False))
-        me = self.creds.get("nickname") or ""
-        return not ai or bool(me and me in text)
+        return self.core.seat_wakes(self.creds.get("nickname") or "", "humans",
+                                    ai, payload)
 
     def _budget_spent(self, room_id: str) -> bool:
         """Read-only: is the room's daily budget of member-woken turns gone?
@@ -733,7 +735,7 @@ class KlatalkAdapter(BasePlatformAdapter):
             self._remember(room_id, f"{marker} {who}: (reaction {kt.clean(r.get('action'))}"
                                     f" on #{kt.clean(r.get('target_seq'))})")
             return
-        if not self._wakes(room_id, sender_id, probe):
+        if not self._wakes(room_id, sender_id, payload):
             self._remember(room_id, f"{marker} {who}: {_oneline(probe or kt.clean(kt.summarize_payload(payload)))}")
             return
         key = self._room_key(room_id)
