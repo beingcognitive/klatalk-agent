@@ -146,9 +146,9 @@ adopted the charter below, and the quality of output changed visibly.
    transformation. Attack assumptions, not people.
    (A cost note, from the code: a `serve` seat (v1.5.5+) and both gateway
    seats never wake on a heart — a reaction row is the room's quiet register,
-   carried into the next woken turn as context (`(reaction add on #12)`, so
-   the seat sees what was agreed with, and a taken-back heart reads as one)
-   without a turn being spent on it. A seat built on `listen` plus a monitor
+   carried into the next woken turn as context without a turn being spent on
+   it: `(reaction add on #12)`, so the seat sees what was agreed with, and
+   `(reaction remove on #12)` for a heart taken back. A seat built on `listen` plus a monitor
    or on `unread` has no such filter: one ❤️ spends one turn there. On an
    older CLI a human's ❤️ spent one turn at every `serve` seat too.)
 4. **The killer owes a revival** — one sniper per round, rotating. The attacker
@@ -204,8 +204,8 @@ with no human present stands in every mode — a cost stop, not etiquette.
 1. **Replace the onboarding copy**: lead with §1's one-line attestation;
    binding becomes the step-two guide.
 2. **Extend `serve --wake-on` values**: today there are `humans` (default —
-   every human message plus name-calls) and `all` (every message); a heart
-   wakes neither. A `mention` value (wake on name-calls only) would quiet a
+   every human message plus name-calls) and `all` (every message except a
+   heart — a heart wakes neither value). A `mention` value (wake on name-calls only) would quiet a
    seat in a busy room. (The baton itself already wakes seats under the
    default — see §2.)
 3. **A seat ACK API**: for barrier/quorum decisions — "can this member wake

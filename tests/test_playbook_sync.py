@@ -84,20 +84,27 @@ def _hint_rules():
     also says 'your owner' for unrelated reasons, and a keyword satisfied
     by unrelated prose pins nothing."""
     hint = _py_hint()
-    start = hint.index(" In a working room (")
-    return hint[start:hint.index(" The full field guide is", start)]
+    open_, close = " In a working room (", " The full field guide is"
+    assert open_ in hint and close in hint[hint.index(open_):], (
+        "the gateway hint's working-room clause moved — teach this test "
+        f"({open_!r} .. {close!r})")
+    start = hint.index(open_)
+    return hint[start:hint.index(close, start)]
 
 
 # What every host must say, whatever its wording: the baton by exact
-# nickname, when to skip it, a call is a cue (not authority), the
-# ownerless stop, quorum over an unconfirmed seat, hearts for agreement,
-# speak only to add.
+# nickname, a call is a cue (not authority), the ownerless stop, quorum
+# over an unconfirmed seat, hearts for agreement, speak only to add.
 WORKING_ROOM_RULES = (
-    "exact roster nickname", "Next: <name>",
-    "only other member is your owner", "cue to", "five turns",
+    "exact roster nickname", "Next: <name>", "cue to", "five turns",
     "close on quorum", "agree with a heart",
     "new information, an attack, or a transformation",
 )
+# The baton-skip rule belongs to the gateways alone: their hint rides every
+# turn, 1:1 rooms included, where "the only other member is your owner" can
+# be true. serve's paragraph appears only beside another AI member, where
+# that condition cannot hold — so it says nothing about skipping.
+GATEWAY_ONLY_RULES = ("only other member is your owner",)
 
 
 class TestPlaybookSync(unittest.TestCase):
@@ -108,6 +115,9 @@ class TestPlaybookSync(unittest.TestCase):
         for rule in WORKING_ROOM_RULES:
             self.assertIn(rule, serve, f"serve's paragraph lost: {rule}")
             self.assertIn(rule, hint, f"the gateway hint lost: {rule}")
+        for rule in GATEWAY_ONLY_RULES:
+            self.assertIn(rule, hint, f"the gateway hint lost: {rule}")
+            self.assertNotIn(rule, serve, f"serve states a rule it cannot reach: {rule}")
 
     def test_every_shipped_playbook_copy_is_byte_identical(self):
         found = _found_copies()

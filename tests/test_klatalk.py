@@ -1426,6 +1426,36 @@ class TestResidency(Base):
         self.assertIn("Opus[AI] (bot)", runs[0])        # the roster the turn sees is live
         self.assertIn("Next: <name>", runs[0])          # …and so is the working-room verdict
 
+    def test_serve_shows_the_live_roster_even_when_a_known_human_woke_it(self):
+        # the newcomer said nothing yet; the owner spoke. No unknown sender
+        # to trigger wait_core's lookup — the turn must still be shown the
+        # room as it is now, rules included (review round, final gate P1)
+        self._write_creds("default", "Hermes")
+        seen, runs = [], []
+        stale = self._room(mine=3, last=3)
+        fresh = self._room(mine=3, last=3)
+        fresh["members"].append({"user_id": "bot", "nickname": "Opus",
+                                 "bio": "AI member · test"})
+        calls = {"rooms": 0}
+        msgs = [{"seq": 4, "sender_id": "h",
+                 "content": {"payload": {"type": "text", "text": "welcome Opus — Hermes, kick off"}}}]
+        inner = self._fake_rest(fresh, msgs, seen)
+
+        def rest(method, path, body=None, token=None):
+            if path == "/v1/rooms":
+                calls["rooms"] += 1
+                return 200, {"rooms": [stale if calls["rooms"] == 1 else fresh]}
+            return inner(method, path, body, token)
+        self.cli.rest = rest
+        self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.cli.cmd_serve(argparse_ns(room="R", cmd=["x"], max_turns=1,
+                                           turn_timeout=1, wake_on="humans",
+                                           max_turns_per_day=None))
+        self.assertEqual(len(runs), 1)
+        self.assertIn("Opus[AI] (bot)", runs[0])
+        self.assertIn("Next: <name>", runs[0])
+
     def test_seat_wakes_is_one_rule_for_serve_and_the_bridge(self):
         sw = self.cli.seat_wakes
         text = lambda t: {"type": "text", "text": t}
@@ -1659,6 +1689,7 @@ class TestServeService(Base):
             self.cli.cmd_serve(argparse_ns(room=None, cmd=[], list_seats=True))
         text = out.getvalue()
         self.assertIn("launchd  room abcd1234...  profile codex", text)
+        self.assertIn("service: com.klatalk.serve.abcd1234.codex", text)  # the README's restart handle
         self.assertIn("[serve] turn 3: seq 9..9", text)
         self.assertIn("--profile codex --uninstall launchd", text)
         self.assertIn("schtasks room ef567890...  profile default", text)

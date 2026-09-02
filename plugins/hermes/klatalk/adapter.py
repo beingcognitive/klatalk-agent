@@ -734,9 +734,8 @@ class KlatalkAdapter(BasePlatformAdapter):
         marker = _mark(is_owner, ev.get("sender_binding") or "ok", seq)
         if isinstance(payload.get("reaction"), dict):
             # a reaction is the room's quiet register: context, never a wake
-            r = payload["reaction"]
-            self._remember(room_id, f"{marker} {who}: (reaction {kt.clean(r.get('action'))}"
-                                    f" on #{kt.clean(r.get('target_seq'))})")
+            # — rendered by the core's one rendering, as serve and the bridge
+            self._remember(room_id, f"{marker} {who}: {kt.summarize_payload(payload)}")
             return
         if not self._wakes(room_id, sender_id, payload):
             self._remember(room_id, f"{marker} {who}: {_oneline(probe or kt.clean(kt.summarize_payload(payload)))}")
@@ -933,9 +932,7 @@ class KlatalkAdapter(BasePlatformAdapter):
             return f"(file) {name} {kt.clean(payload.get('size') or '')}".strip(), [], []
         if kind == "text":
             if isinstance(payload.get("reaction"), dict):
-                r = payload["reaction"]
-                return (f"(reaction {kt.clean(r.get('action'))}"
-                        f" on #{kt.clean(r.get('target_seq'))})"), [], []
+                return kt.summarize_payload(payload), [], []
             return kt.clean(payload.get("text") or ""), [], []
         return kt.clean(kt.summarize_payload(payload)), [], []
 
