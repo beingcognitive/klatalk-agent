@@ -1478,6 +1478,9 @@ class TestResidency(Base):
         self.assertFalse(sw("Hermes", "humans", True, {"type": "system", "text": "Hermes joined"}))
         self.assertFalse(sw("Hermes", "humans", True, {"type": "card", "Hermes": {"note": "x"}}))
         self.assertFalse(sw("Hermes", "humans", True, {"type": "image", "url": "/uploads/Hermes.png"}))
+        # a TEXT row whose `text` is not a str: its keys/items are not a haystack
+        self.assertFalse(sw("Hermes", "humans", True, {"type": "text", "text": {"Hermes": 1}}))
+        self.assertFalse(sw("Hermes", "humans", True, {"type": "text", "text": ["Next: Hermes"]}))
 
     def test_serve_prompt_says_the_working_room_rules_only_beside_other_ai(self):
         room = self._room(mine=3, last=3)                # me + a human owner

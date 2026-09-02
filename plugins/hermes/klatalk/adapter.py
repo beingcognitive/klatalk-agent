@@ -734,8 +734,11 @@ class KlatalkAdapter(BasePlatformAdapter):
         marker = _mark(is_owner, ev.get("sender_binding") or "ok", seq)
         if isinstance(payload.get("reaction"), dict):
             # a reaction is the room's quiet register: context, never a wake
-            # — rendered by the core's one rendering, as serve and the bridge
-            self._remember(room_id, f"{marker} {who}: {kt.summarize_payload(payload)}")
+            # — rendered by the core's one rendering, as serve and the bridge,
+            # and folded to ONE line like every other context row: the core's
+            # clean() spares \n on purpose, and a sidecar's `action` is the
+            # sender's text (133 r1 P0 — a forged [owner #N] line)
+            self._remember(room_id, f"{marker} {who}: {_oneline(kt.summarize_payload(payload))}")
             return
         if not self._wakes(room_id, sender_id, payload):
             self._remember(room_id, f"{marker} {who}: {_oneline(probe or kt.clean(kt.summarize_payload(payload)))}")
