@@ -1330,9 +1330,11 @@ class TestResidency(Base):
                                            turn_timeout=1, wake_on="humans",
                                            max_turns_per_day=None))
         self.assertEqual(len(runs), 1)                 # the heart opened no turn of its own
-        self.assertIn("❤️", runs[0])                   # …but rides along as context
+        # …but rides along as context, saying WHAT it landed on and whether
+        # it was given or taken back — a bare ❤️ would read the same for both
+        self.assertIn("Owner: (reaction add on #2)", runs[0])
         self.assertIn("and now a word", runs[0])
-        self.assertLess(runs[0].index("❤️"), runs[0].index("and now a word"))
+        self.assertLess(runs[0].index("(reaction add on #2)"), runs[0].index("and now a word"))
         self.assertIn("klatalk read R 5", runs[0])     # the mark covers what was seen
 
     def test_serve_on_all_still_does_not_spend_a_turn_on_a_heart(self):
@@ -1353,7 +1355,7 @@ class TestResidency(Base):
                                            turn_timeout=1, wake_on="all",
                                            max_turns_per_day=None))
         self.assertEqual(len(runs), 1)
-        self.assertIn("❤️", runs[0])                   # context, not a wake
+        self.assertIn("(reaction add on #2)", runs[0])  # context, not a wake
 
     def test_serve_in_a_sealed_room_survives_a_handshake_and_a_bad_plaintext(self):
         # a handshake ledger record has no payload at all; a peer's sealed
@@ -1372,7 +1374,9 @@ class TestResidency(Base):
             {"seq": 5, "kind": "handshake", "sender_id": "bot", "added": ["dev2"], "removed": []},
             {"seq": 6, "kind": "application", "sender_id": "bot",
              "payload": {"type": "text", "text": "hi all"}},
-            {"seq": 7, "kind": "application", "sender_id": "h", "payload": "just a string"}]
+            {"seq": 7, "kind": "rejected_external_join", "sender_id": "h"},
+            {"seq": 8, "kind": "application", "sender_id": "h", "payload": "just a string"}]
+        room["last_seq"] = 8
         runs = []
         self.cli.run_turn = lambda cmd, prompt, timeout: (runs.append(prompt), 0)[1]
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1383,7 +1387,8 @@ class TestResidency(Base):
         self.assertIn("membership change dev1", runs[0])     # a human's row: a wake
         self.assertNotIn("membership change dev2", runs[0])  # a bot's: seen only
         self.assertNotIn("hi all", runs[0])                  # AI chatter: seen only
-        self.assertIn("[unreadable payload]", runs[0])       # a human's bad row: no crash
+        self.assertIn("7  [rejected_external_join]", runs[0])  # an event, not a broken message
+        self.assertIn("Owner: [unreadable payload]", runs[0])  # a human's bad row: no crash
         self.assertIn("Next: <name>", runs[0])               # Opus[AI] in the roster
 
     def test_serve_reads_the_roster_at_the_wake_not_at_the_last_turn(self):
@@ -1397,6 +1402,8 @@ class TestResidency(Base):
                                  "bio": "AI member · test"})
         calls = {"rooms": 0}
         msgs = [{"seq": 4, "sender_id": "bot",
+                 "content": {"payload": {"type": "text", "text": "hello everyone"}}},
+                {"seq": 5, "sender_id": "bot",
                  "content": {"payload": {"type": "text", "text": "Idea X. Next: Hermes"}}}]
         inner = self._fake_rest(fresh, msgs, seen)
 
@@ -1412,6 +1419,10 @@ class TestResidency(Base):
                                            turn_timeout=1, wake_on="humans",
                                            max_turns_per_day=None))
         self.assertEqual(len(runs), 1)
+        # the unknown sender was looked up BEFORE the rows were judged: the
+        # newcomer's chatter is an AI's (seen, no turn), its call is a call
+        self.assertNotIn("hello everyone", runs[0])
+        self.assertIn("Opus[AI]: Idea X. Next: Hermes", runs[0])  # the row wears the live label
         self.assertIn("Opus[AI] (bot)", runs[0])        # the roster the turn sees is live
         self.assertIn("Next: <name>", runs[0])          # …and so is the working-room verdict
 
@@ -1429,6 +1440,14 @@ class TestResidency(Base):
         self.assertFalse(sw("Hermes", "all", False, heart))                  # not even on all
         self.assertTrue(sw("Hermes", "all", True, text("hello all")))        # all: any row
         self.assertTrue(sw("Hermes", "humans", False, {}))                   # a sealed handshake: nobody's call, still a human row
+        self.assertTrue(sw("Hermes", "humans", False, "not a dict"))         # an unreadable row from a human: still a human row
+        # only a TEXT row's text is a call — a file's name, a system line, a
+        # payload's keys or its JSON dump are not (the Hermes gateway always
+        # matched this way; the bridge and serve now agree)
+        self.assertFalse(sw("Hermes", "humans", True, {"type": "file", "name": "Hermes-notes.pdf", "size": 3}))
+        self.assertFalse(sw("Hermes", "humans", True, {"type": "system", "text": "Hermes joined"}))
+        self.assertFalse(sw("Hermes", "humans", True, {"type": "card", "Hermes": {"note": "x"}}))
+        self.assertFalse(sw("Hermes", "humans", True, {"type": "image", "url": "/uploads/Hermes.png"}))
 
     def test_serve_prompt_says_the_working_room_rules_only_beside_other_ai(self):
         room = self._room(mine=3, last=3)                # me + a human owner
@@ -2853,10 +2872,9 @@ class TestBridge(Base):
         n = len(b.out)
         run(self._msg("ME", "echo", own=True))
         run(self._msg("H", "gone", deleted=True))
-        run({"kind": "message", "seq": 9, "sender_id": "H",
-             "payload": {"type": "system", "text": "x"}, "own": False})
-        self.assertEqual(len(b.out), n + 1)       # own and deleted rows emit nothing
-        self.assertTrue(b.out[-1]["wake"])         # a human's system row wakes like any human row
+        run(self.cli.normalize_plain({"seq": 9, "sender_id": "H",
+                                      "content": {"payload": {"type": "system", "text": "x"}}}))
+        self.assertEqual(len(b.out), n)           # own, deleted and system rows emit nothing
         b2 = self._bridge(wake_on="all")
         asyncio.run(b2.on_event("R1", self._msg("A", "hi")))
         self.assertTrue(b2.out[-1]["wake"])

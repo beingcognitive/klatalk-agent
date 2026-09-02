@@ -79,12 +79,23 @@ def _serve_rules():
     return "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1)))
 
 
+def _hint_rules():
+    """Only the working-room clause of the gateway hint — the whole hint
+    also says 'your owner' for unrelated reasons, and a keyword satisfied
+    by unrelated prose pins nothing."""
+    hint = _py_hint()
+    start = hint.index(" In a working room (")
+    return hint[start:hint.index(" The full field guide is", start)]
+
+
 # What every host must say, whatever its wording: the baton by exact
-# nickname, a call is a cue (not authority), the ownerless stop, quorum
-# over an unconfirmed seat, hearts for agreement, speak only to add.
+# nickname, when to skip it, a call is a cue (not authority), the
+# ownerless stop, quorum over an unconfirmed seat, hearts for agreement,
+# speak only to add.
 WORKING_ROOM_RULES = (
-    "exact roster nickname", "Next: <name>", "your owner", "cue to",
-    "five turns", "close on quorum", "agree with a heart",
+    "exact roster nickname", "Next: <name>",
+    "only other member is your owner", "cue to", "five turns",
+    "close on quorum", "agree with a heart",
     "new information, an attack, or a transformation",
 )
 
@@ -93,7 +104,7 @@ class TestPlaybookSync(unittest.TestCase):
     def test_serve_says_the_same_working_room_rules_as_the_gateways(self):
         # three hosts, one rule set — serve's prose is its own (it names the
         # CLI command and cannot point at a file), but no rule may go missing
-        serve, hint = _serve_rules(), _py_hint()
+        serve, hint = _serve_rules(), _hint_rules()
         for rule in WORKING_ROOM_RULES:
             self.assertIn(rule, serve, f"serve's paragraph lost: {rule}")
             self.assertIn(rule, hint, f"the gateway hint lost: {rule}")

@@ -582,8 +582,10 @@ class KlatalkAdapter(BasePlatformAdapter):
         them: humans wake a turn; an AI member only by calling our name in
         the row's text surface; a reaction never."""
         nick, ai = self._roster(room_id).get(sender_id, ("?", False))
-        return self.core.seat_wakes(self.creds.get("nickname") or "", "humans",
-                                    ai, payload)
+        # a cleaned needle against a cleaned haystack, as serve and the
+        # bridge match — a raw nickname would drift on control characters
+        return self.core.seat_wakes(
+            self.core.clean(self.creds.get("nickname") or ""), "humans", ai, payload)
 
     def _budget_spent(self, room_id: str) -> bool:
         """Read-only: is the room's daily budget of member-woken turns gone?
@@ -724,7 +726,8 @@ class KlatalkAdapter(BasePlatformAdapter):
             elif room_id in self._tool_armed:
                 await self._refresh_room(room_id)      # an armed verdict rides on a live roster
         # the wake filter FIRST: a row that wakes nothing must not cost a
-        # download — only the AI-name test needs the body, and only for text
+        # download — seat_wakes reads a text row's text and nothing else,
+        # never fetched bytes; `probe` below is for the context line
         probe = kt.clean(payload.get("text") or "") if payload.get("type") == "text" else ""
         nick, _ai = self._roster(room_id).get(sender_id, (_short(sender_id), False))
         who = f"{nick}·{_short(sender_id)}"

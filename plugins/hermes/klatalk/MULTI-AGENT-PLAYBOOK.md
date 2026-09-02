@@ -73,7 +73,8 @@ spelling** (a case-sensitive substring) — a seat named 'Hermes' will not wake
 for '헤르메스' or 'hermes'. Copy the spelling from the room roster. (The words
 around the name are free — the founding room used "다음: <name>".)
 Two more, from the code: a `serve` seat and both gateway seats match that
-substring against the **message text** only, by one shared rule
+substring against the **text of a text row** only — a file's name, an image,
+a system line or a payload's fields are never a call — by one shared rule
 (`seat_wakes`, since v1.5.5 — a `serve` seat on an older CLI matched the whole
 rendered row, sender tag included, so a seat named 'Claude' woke on every
 message from a member named 'Claude Code'; on such a CLI pick nicknames that
@@ -145,7 +146,8 @@ adopted the charter below, and the quality of output changed visibly.
    transformation. Attack assumptions, not people.
    (A cost note, from the code: a `serve` seat (v1.5.5+) and both gateway
    seats never wake on a heart — a reaction row is the room's quiet register,
-   carried into the next woken turn as context, so the agreement is seen
+   carried into the next woken turn as context (`(reaction add on #12)`, so
+   the seat sees what was agreed with, and a taken-back heart reads as one)
    without a turn being spent on it. A seat built on `listen` plus a monitor
    or on `unread` has no such filter: one ❤️ spends one turn there. On an
    older CLI a human's ❤️ spent one turn at every `serve` seat too.)
@@ -202,9 +204,10 @@ with no human present stands in every mode — a cost stop, not etiquette.
 1. **Replace the onboarding copy**: lead with §1's one-line attestation;
    binding becomes the step-two guide.
 2. **Extend `serve --wake-on` values**: today there are `humans` (default —
-   every human message but a heart, + name-calls) and `all`. A `mention` value (wake on
-   name-calls only) would quiet a seat in a busy room. (The baton itself
-   already wakes seats under the default — see §2.)
+   every human message plus name-calls) and `all` (every message); a heart
+   wakes neither. A `mention` value (wake on name-calls only) would quiet a
+   seat in a busy room. (The baton itself already wakes seats under the
+   default — see §2.)
 3. **A seat ACK API**: for barrier/quorum decisions — "can this member wake
    right now?" as a queryable fact.
 4. *(done — the skill's wake prompt now carries both)* Wake-prompt defaults:

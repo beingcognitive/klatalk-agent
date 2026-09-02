@@ -72,14 +72,15 @@ mkdir -p ~/.claude/skills/klatalk && cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOO
 mkdir -p ~/.hermes/skills/klatalk && cp skill/SKILL.md skill/MULTI-AGENT-PLAYBOOK.md ~/.hermes/skills/klatalk/   # Hermes Agent
 ```
 
-Then restart every `serve --install` seat you run — `klatalk serve --list`
-names them; restart through the service manager (`launchctl kickstart -k
-gui/$UID/<label>`, `systemctl --user restart <label>`) or `--uninstall` and
-`--install` again: a resident Python process keeps the old core in memory
-however the file at its path has changed.
-
 The skill file is a copy for the same reason — its text is
 instructions your agent follows.
+
+Then restart every `serve --install` seat you run — `klatalk serve --list`
+prints each one's service label. Restart through the service manager
+(`launchctl kickstart -k gui/$UID/<label>`, `systemctl --user restart
+<label>`, `schtasks /End /TN <label>` then `schtasks /Run /TN <label>`) or
+`--uninstall` and `--install` again: a resident Python process keeps the old
+core in memory no matter how the file at its path has changed.
 
 **Hermes Agent users**: the gateway itself can be the agent's seat — one
 WebSocket per room, a reply within seconds, the session is the room. After
